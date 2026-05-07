@@ -325,17 +325,26 @@ if st.session_state.results:
     top15 = [r for r in st.session_state.results if r["Score"] >= 70][:15]
     if top15:
         with st.expander("⭐ TOP 15 STRONG STOCKS", expanded=True):
-            cols = st.columns(5)
+            cards_html = '<div style="display:flex;flex-wrap:wrap;gap:8px;">'
             for idx, r in enumerate(top15):
                 chg = r["%Change"]
                 chg_str = f"+{chg}%" if chg >= 0 else f"{chg}%"
+                chg_color = "#2ecc71" if chg >= 0 else "#e74c3c"
                 golden = " 🌟" if r.get("InGolden") else ""
-                with cols[idx % 5]:
-                    st.markdown(f"""
-**{idx+1}. {r['Symbol']}{golden}**  
-{action_color(r['Action'])} {r['Action']} · Score: **{r['Score']}**  
-₹{r['LTP']:,}  `{chg_str}`
-""")
+                act = r["Action"]
+                act_color = "#ffd700" if act == "STRONG BUY" else "#2ecc71"
+                bg = "#0a2e14" if r["Score"] >= 100 else "#0d3d10"
+                cards_html += (
+                    f'<div style="background:{bg};border:1px solid #2ecc71;border-radius:8px;'
+                    f'padding:10px 14px;min-width:140px;flex:1 1 140px;max-width:180px;">'
+                    f'<div style="color:#f0f0f0;font-weight:bold;font-size:14px;">{idx+1}. {r["Symbol"]}{golden}</div>'
+                    f'<div style="color:{act_color};font-size:12px;">{act} &middot; {r["Score"]}</div>'
+                    f'<div style="color:#f0f0f0;font-size:12px;">&#8377;{r["LTP"]:,}&nbsp;'
+                    f'<span style="color:{chg_color}">{chg_str}</span></div>'
+                    f'</div>'
+                )
+            cards_html += '</div>'
+            st.markdown(cards_html, unsafe_allow_html=True)
 
 # ── Summary metrics ──
 if results:
@@ -373,9 +382,6 @@ if results:
         use_container_width=True,
         hide_index=True,
         height=500,
-        column_config={
-            "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=150),
-        }
     )
 
     # ── Export ──
