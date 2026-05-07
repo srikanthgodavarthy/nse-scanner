@@ -20,6 +20,20 @@ logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 warnings.filterwarnings("ignore")
 
 NIFTY500 = list(dict.fromkeys([s.strip().upper().replace(".NS", "") for s in nse500_symbols]))
+
+NIFTY50 = [
+    "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
+    "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BPCL", "BHARTIARTL",
+    "BRITANNIA", "CIPLA", "COALINDIA", "DRREDDY", "EICHERMOT",
+    "ETERNAL", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
+    "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDUSINDBK",
+    "INFY", "ITC", "JIOFIN", "JSWSTEEL", "KOTAKBANK",
+    "LT", "LTIM", "M&M", "MARUTI", "NESTLEIND",
+    "NTPC", "ONGC", "POWERGRID", "RELIANCE", "SBILIFE",
+    "SHRIRAMFIN", "SBIN", "SUNPHARMA", "TATACONSUM", "TATAMOTORS",
+    "TATASTEEL", "TCS", "TECHM", "TITAN", "ULTRACEMCO",
+]
+
 SCANNER_MODE = "Swing"
 
 _ATR_SL_MULT = {"Intraday": 1.5, "Swing": 2.5, "Positional": 3.5}
@@ -279,30 +293,37 @@ if "rejected" not in st.session_state:
     st.session_state.rejected = 0
 
 # ── Top controls ──
-col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
+col1, col2, col3, col4, col5 = st.columns([2, 2, 2, 2, 2])
 with col1:
-    scan_btn = st.button("🔍 SCAN NSE 500", type="primary", use_container_width=True)
+    index_opt = st.selectbox(
+        "Index",
+        ["Nifty 500", "Nifty 50"],
+        label_visibility="collapsed"
+    )
 with col2:
+    scan_btn = st.button(f"🔍 SCAN {index_opt.upper()}", type="primary", use_container_width=True)
+with col3:
     filter_opt = st.selectbox(
         "Show",
         ["BUY + STRONG BUY", "STRONG BUY only", "WATCH + BUY", "All Results"],
         label_visibility="collapsed"
     )
-with col3:
-    search_q = st.text_input("Search symbol", placeholder="e.g. RELIANCE", label_visibility="collapsed")
 with col4:
+    search_q = st.text_input("Search symbol", placeholder="e.g. RELIANCE", label_visibility="collapsed")
+with col5:
     if st.session_state.scan_time:
         st.markdown(f"**Last scan:** {st.session_state.scan_time}  |  **Rejected:** {st.session_state.rejected}")
 
 # ── Scan ──
 if scan_btn:
+    symbols = NIFTY50 if index_opt == "Nifty 50" else NIFTY500
     prog_bar   = st.progress(0)
     status_txt = st.empty()
-    with st.spinner("Scanning NSE 500... this takes a few minutes on cloud ☁️"):
-        results, rejected = run_scan(NIFTY500, prog_bar, status_txt)
+    with st.spinner(f"Scanning {index_opt}... {'~1 min' if index_opt == 'Nifty 50' else '3–5 mins'} on cloud ☁️"):
+        results, rejected = run_scan(symbols, prog_bar, status_txt)
     st.session_state.results  = results
     st.session_state.rejected = rejected
-    st.session_state.scan_time = datetime.now().strftime("%H:%M:%S")
+    st.session_state.scan_time = datetime.now().strftime("%H:%M:%S") + f" ({index_opt})"
     prog_bar.empty()
     status_txt.empty()
     st.success(f"✅ Scan complete!  Valid: {len(results)}  Rejected: {rejected}")
