@@ -278,7 +278,7 @@ div[data-testid="stMetricValue"] { color: #00b4d8; font-size: 1.4rem; }
 st.title("📈 NSE Master Scanner Pro  [v5 Targets]")
 
 # ── Live Nifty & Sensex ──
-@st.cache_data(ttl=300)  # refresh every 5 minutes
+@st.cache_data(ttl=5)  # refresh every 5 seconds
 def fetch_indices():
     results = {}
     for name, ticker in [("Nifty 50", "^NSEI"), ("Sensex", "^BSESN")]:
