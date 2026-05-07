@@ -14,6 +14,7 @@ import yfinance as yf
 import streamlit as st
 
 from nse500 import nse500_symbols
+from sectors import SECTORS
 
 # ── Setup ──────────────────────────────────────
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
@@ -21,18 +22,10 @@ warnings.filterwarnings("ignore")
 
 NIFTY500 = list(dict.fromkeys([s.strip().upper().replace(".NS", "") for s in nse500_symbols]))
 
-NIFTY50 = [
-    "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
-    "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BPCL", "BHARTIARTL",
-    "BRITANNIA", "CIPLA", "COALINDIA", "DRREDDY", "EICHERMOT",
-    "ETERNAL", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
-    "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDUSINDBK",
-    "INFY", "ITC", "JIOFIN", "JSWSTEEL", "KOTAKBANK",
-    "LT", "LTIM", "M&M", "MARUTI", "NESTLEIND",
-    "NTPC", "ONGC", "POWERGRID", "RELIANCE", "SBILIFE",
-    "SHRIRAMFIN", "SBIN", "SUNPHARMA", "TATACONSUM", "TATAMOTORS",
-    "TATASTEEL", "TCS", "TECHM", "TITAN", "ULTRACEMCO",
-]
+# Inject full Nifty500 list for the "None" placeholder
+for k in SECTORS:
+    if SECTORS[k] is None:
+        SECTORS[k] = NIFTY500
 
 SCANNER_MODE = "Swing"
 
@@ -297,7 +290,7 @@ col1, col2, col3, col4, col5 = st.columns([2, 2, 2, 2, 2])
 with col1:
     index_opt = st.selectbox(
         "Index",
-        ["Nifty 500", "Nifty 50"],
+        list(SECTORS.keys()),
         label_visibility="collapsed"
     )
 with col2:
@@ -316,10 +309,12 @@ with col5:
 
 # ── Scan ──
 if scan_btn:
-    symbols = NIFTY50 if index_opt == "Nifty 50" else NIFTY500
+    symbols = SECTORS[index_opt]
+    n = len(symbols)
+    est = "~1 min" if n <= 50 else ("~2 mins" if n <= 150 else "3–5 mins")
     prog_bar   = st.progress(0)
     status_txt = st.empty()
-    with st.spinner(f"Scanning {index_opt}... {'~1 min' if index_opt == 'Nifty 50' else '3–5 mins'} on cloud ☁️"):
+    with st.spinner(f"Scanning {index_opt} ({n} stocks)... {est} on cloud ☁️"):
         results, rejected = run_scan(symbols, prog_bar, status_txt)
     st.session_state.results  = results
     st.session_state.rejected = rejected
