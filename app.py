@@ -277,6 +277,102 @@ div[data-testid="stMetricValue"] { color: #00b4d8; font-size: 1.4rem; }
 
 st.title("📈 NSE Master Scanner Pro  [v5 Targets]")
 
+# ── Live Nifty & Sensex ──
+@st.cache_data(ttl=300)  # refresh every 5 minutes
+def fetch_indices():
+    results = {}
+    for name, ticker in [("Nifty 50", "^NSEI"), ("Sensex", "^BSESN")]:
+        try:
+            df = yf.download(ticker, period="1y", interval="1d", progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.dropna()
+            if len(df) < 50:
+                results[name] = None
+                continue
+
+            close  = df["Close"]
+            curr   = float(close.iloc[-1])
+            prev   = float(close.iloc[-2])
+            chg    = curr - prev
+            pct    = (chg / prev) * 100
+
+            # Score components
+            e20  = float(ema(close, 20).iloc[-1])
+            e50  = float(ema(close, 50).iloc[-1])
+            e200 = float(ema(close, 200).iloc[-1]) if len(close) >= 200 else None
+            r    = float(rsi(close).iloc[-1])
+            hh   = float(close.iloc[-11:-1].max())
+            trend_up = (e200 is None or curr > e200) and curr > e20 and e20 > e50
+
+            if len(close) >= 126:
+                mom1 = (curr - float(close.iloc[-21]))  / float(close.iloc[-21])  * 100
+                mom3 = (curr - float(close.iloc[-63]))  / float(close.iloc[-63])  * 100
+                mom6 = (curr - float(close.iloc[-126])) / float(close.iloc[-126]) * 100
+                strongHTF = mom1 > 5 and mom3 > 10 and mom6 > 15
+            else:
+                strongHTF = False
+
+            trendStrong = curr > e20 and e20 > e50
+            qualified   = strongHTF and trendStrong
+
+            score = 0
+            score += 25 if trend_up else 0
+            score += 30 if e20 > e50 else (20 if e20 > e50 * 0.995 else 0)
+            score += 25 if r > 60 else (20 if r > 55 else (15 if r > 50 else (5 if r > 45 else 0)))
+            score += 25 if curr > hh else (15 if curr > hh * 0.98 else 0)
+            if len(close) >= 3 and curr > float(close.iloc[-3]):
+                score += 10
+            score += 25 if qualified else 0
+            score -= 10 if not qualified else 0
+
+            action = action_label(score)
+
+            results[name] = {
+                "value":  curr,
+                "chg":    chg,
+                "pct":    pct,
+                "score":  score,
+                "action": action,
+                "rsi":    round(r, 1),
+                "trend":  "↑ Above EMA20 & EMA50" if trendStrong else "↓ Below EMA",
+            }
+        except Exception:
+            results[name] = None
+    return results
+
+indices = fetch_indices()
+ic1, ic2, ic3 = st.columns([2, 2, 6])
+for col, name in zip([ic1, ic2], ["Nifty 50", "Sensex"]):
+    d = indices.get(name)
+    with col:
+        if d:
+            chg_str  = f"{'+' if d['chg'] >= 0 else ''}{d['chg']:,.1f} ({'+' if d['pct'] >= 0 else ''}{d['pct']:.2f}%)"
+            chg_color = "#2ecc71" if d["chg"] >= 0 else "#e74c3c"
+            arrow     = "▲" if d["chg"] >= 0 else "▼"
+            act       = d["action"]
+            act_color = "#ffd700" if act == "STRONG BUY" else ("#2ecc71" if act == "BUY" else ("#f39c12" if act == "WATCH" else "#e74c3c"))
+            score_pct = min(int(d["score"] / 150 * 100), 100)
+            st.markdown(
+                f'<div style="background:#12122a;border:1px solid #1c1c36;border-radius:10px;padding:12px 16px;">'
+                f'<div style="color:#7a7a9a;font-size:11px;text-transform:uppercase;letter-spacing:1px;">{name}</div>'
+                f'<div style="color:#f0f0f0;font-size:22px;font-weight:bold;">{d["value"]:,.1f}</div>'
+                f'<div style="color:{chg_color};font-size:13px;">{arrow} {chg_str}</div>'
+                f'<div style="margin:8px 0 4px 0;background:#1c1c36;border-radius:4px;height:6px;">'
+                f'<div style="background:{act_color};width:{score_pct}%;height:6px;border-radius:4px;"></div></div>'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+                f'<span style="color:{act_color};font-size:12px;font-weight:bold;">{act} &nbsp;·&nbsp; Score: {d["score"]}</span>'
+                f'<span style="color:#7a7a9a;font-size:11px;">RSI {d["rsi"]}</span>'
+                f'</div>'
+                f'<div style="color:#7a7a9a;font-size:11px;margin-top:4px;">{d["trend"]}</div>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown(f"**{name}:** unavailable")
+with ic3:
+    st.caption("📡 Index data auto-refreshes every 5 min. Score uses same EMA/RSI/momentum logic as stock scanner.")
+
 # ── Session state ──
 if "results" not in st.session_state:
     st.session_state.results = []
