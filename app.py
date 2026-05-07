@@ -199,7 +199,7 @@ def run_scan(symbols, progress_bar, status_text):
         progress_bar.progress(pct)
         try:
             df = yf.download(
-                ticker, period="1y", interval="1d",
+                ticker, period="1y", interval="1h",
                 auto_adjust=True, progress=False, threads=False
             )
             if df.empty:
@@ -283,7 +283,7 @@ def fetch_indices():
     results = {}
     for name, ticker in [("Nifty 50", "^NSEI"), ("Sensex", "^BSESN")]:
         try:
-            df = yf.download(ticker, period="1y", interval="1d", progress=False)
+            df = yf.download(ticker, period="1y", interval="1h", progress=False)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             df = df.dropna()
