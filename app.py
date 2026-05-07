@@ -199,7 +199,7 @@ def run_scan(symbols, progress_bar, status_text):
         progress_bar.progress(pct)
         try:
             df = yf.download(
-                ticker, period="1y", interval="1h",
+                ticker, period="1y", interval="1d",
                 auto_adjust=True, progress=False, threads=False
             )
             if df.empty:
