@@ -9,13 +9,6 @@ Fixes applied:
   FIX-4: EMA/RSI/ATR computed once in score_stock, passed into detect_phase
   FIX-5: Fib SL uses max() not min() — was giving absurdly wide stops
   FIX-6: detect_phase receives pre-computed norm_bull so phase & action use identical inputs
-  FIX-7: _enctoken_widget defined before it is called (NameError fix)
-  FIX-8: OI fetched via Zerodha API when enctoken present (reliable vs NSE scrape)
-  FIX-9: Removed zero-OI guard that blocked display outside/during low-activity periods
-  FIX-10: Cache busting — OI cache keyed on enctoken so new token always triggers fresh fetch
-  FIX-11: Added debug expander to surface Zerodha API errors instead of silently returning None
-  FIX-12: _zd_fetch_oi_zerodha now logs and surfaces HTTP error codes
-  FIX-13: fetch_oi_data clears stale None-cached results when enctoken is freshly provided
 """
 
 import warnings
@@ -130,6 +123,8 @@ def _compute_targets(entry, sl, atr_val, fib, setup_type, sw_hi, sw_lo):
     return t1, t2, t3
 
 # ── FIX-3: Intraday daily context fetch ─────────────────────────
+# Momentum (1M/3M/6M) is meaningless on 5-min bars with daily thresholds.
+# For Intraday scans we fetch a small daily slice just for HTF momentum.
 @st.cache_data(ttl=900)
 def _fetch_daily_close(ticker):
     """Fetch 6 months of daily closes for HTF momentum — used by Intraday mode only."""
@@ -143,12 +138,14 @@ def _fetch_daily_close(ticker):
         return pd.Series(dtype=float)
 
 # ── FIX-4/6: detect_phase accepts pre-computed indicators ────────
+# score_stock computes everything once and passes it in.
+# This eliminates the double-EMA recalculation and ensures phase
+# and action score use identical norm_bull values.
 def detect_phase_and_entry(
     df, mode, *,
     c, e_fast_s, e_slow_s, atr_s, atr_val, atr_mean,
     v, vol_avg, fib, sw_hi, sw_lo, in_golden, near_e127, near_e161,
     norm_bull, trend_up, trend_down, trend_strong, score_th,
-    vdu_setup=False,
 ):
     cfg  = MODE_CFG[mode]
     close = df["Close"]
@@ -180,17 +177,15 @@ def detect_phase_and_entry(
 
     is_fib_buy = trend_up and in_golden
 
-    BRK_CONF_MIN = 0.65
-    brk_weights = {
-        "price_above_high": (0.30, c > rolling_hi_brk + buf),
-        "trend_up":         (0.20, trend_up),
-        "score_ok":         (0.15, norm_bull >= score_th),
-        "compressed":       (0.15, is_compressed),
-        "expanding":        (0.10, is_expanding),
-        "vol_spike":        (0.10, vol_spike),
-    }
-    brk_confidence = sum(w for w, cond in brk_weights.values() if cond)
-    is_breakout = brk_confidence >= BRK_CONF_MIN and not is_exhaustion
+    is_breakout = (
+        c > rolling_hi_brk + buf and
+        trend_up and
+        norm_bull >= score_th and
+        is_compressed and
+        is_expanding and
+        vol_spike and
+        not is_exhaustion
+    )
 
     is_cont = (
         c > float(close.iloc[-4:-1].max()) and
@@ -202,6 +197,7 @@ def detect_phase_and_entry(
     trail_level = float(close.iloc[-10:].max()) - atr_val * 1.5
     trail_break = c < trail_level
 
+    # ── Phase priority ────────────────────────────────────────────
     if trend_down and ema_down:
         phase = PHASE_EXIT
         setup_type = "norm"
@@ -214,9 +210,9 @@ def detect_phase_and_entry(
     elif (is_fib_buy or norm_bull >= score_th) and trend_up:
         phase = PHASE_ENTRY
         setup_type = "fib" if is_fib_buy else "norm"
-    elif (is_fib_buy or norm_bull >= score_th * 0.85 or vdu_setup) and trend_up:
+    elif (is_fib_buy or norm_bull >= score_th * 0.85) and trend_up:
         phase = PHASE_SETUP
-        setup_type = "fib" if is_fib_buy else ("vdu" if vdu_setup else "norm")
+        setup_type = "fib" if is_fib_buy else "norm"
     elif trail_break and trend_up:
         phase = PHASE_EXIT
         setup_type = "norm"
@@ -224,6 +220,7 @@ def detect_phase_and_entry(
         phase = PHASE_IDLE
         setup_type = "norm"
 
+    # ── Entry price ───────────────────────────────────────────────
     entry_price = None
     if phase in (PHASE_ENTRY, PHASE_CONT, PHASE_BRK, PHASE_SETUP):
         prox = atr_val * 0.3
@@ -245,6 +242,10 @@ def detect_phase_and_entry(
 
 # ── Full stock scoring ────────────────────────────────────────────
 def score_stock(df, nifty_close, mode="Swing", daily_close=None):
+    """
+    daily_close: pre-fetched daily Close series (only used when mode==Intraday
+                 to compute HTF momentum on proper daily bars).
+    """
     try:
         cfg    = MODE_CFG[mode]
         close  = df["Close"]
@@ -255,6 +256,7 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None):
 
         c       = float(close.iloc[-1])
         prev    = float(close.iloc[-2])
+        # FIX-4: compute indicators once
         e_fast_s = ema(close, cfg["ema_fast"])
         e_slow_s = ema(close, cfg["ema_slow"])
         e20      = float(e_fast_s.iloc[-1])
@@ -277,6 +279,7 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None):
         trend_down   = (e200 is None or c < e200) and c < e20 and e20 < e50
         trend_strong = c > e20 and e20 > e50
 
+        # FIX-3: use daily_close for HTF momentum when in Intraday mode
         mom_src = daily_close if (mode == "Intraday" and daily_close is not None and len(daily_close) >= 21) else close
         mom_n   = len(mom_src)
         mom1 = (c - float(mom_src.iloc[-21]))  / float(mom_src.iloc[-21])  * 100 if mom_n >= 21  else 0
@@ -290,43 +293,32 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None):
         near_e127 = bool(fib and abs(c - fib["ext127"]) < prox)
         near_e161 = bool(fib and abs(c - fib["ext161"]) < prox)
 
-        VDU_VOL_RATIO  = 0.70
-        VDU_RANGE_MULT = 0.80
-        vdu_vol_dry = False
-        vdu_coil    = False
-        if n >= 20 and vol_avg > 0:
-            recent_vols = [float(volume.iloc[k]) for k in [-3, -2, -1]]
-            vdu_vol_dry = all(vv < vol_avg * VDU_VOL_RATIO for vv in recent_vols)
-        if n >= 5:
-            recent_hi = float(df["High"].iloc[-5:].max())
-            recent_lo = float(df["Low"].iloc[-5:].min())
-            vdu_coil  = (recent_hi - recent_lo) < atr_val * VDU_RANGE_MULT
-        vdu_setup = bool(trend_up and vdu_vol_dry and vdu_coil)
-
+        # FIX-1: Positional qualified — penalty instead of hard gate
+        # Previously: if not qualified: return PHASE_IDLE, None, "norm"  ← killed all Positional results
+        # Now: score is penalised for unqualified stocks but they still appear
         qualified = strong_htf and trend_strong
 
+        # FIX-6: single bull score used by BOTH action label and phase detection
         bull = 0
         bull += 25 if trend_up else 0
-        bull += 20 if e20 > e50 else (10 if e20 > e50 * 0.995 else 0)
-        bull += (20 if r >= 65 else 15) if r >= 60 else (8 if r > 50 else 0)
-        bull += 15 if v > vol_avg * 1.2 else (8 if v > vol_avg else 0)
-        bull += 20 if c > hh else (12 if c > hh * 0.98 else 0)
-        if n >= 3 and c > float(close.iloc[-3]):
-            bull += 10
-        bull += 10 if rs > 0 else (3 if rs > -0.5 else 0)
+        bull += 30 if e20 > e50 else (20 if e20 > e50*0.995 else 0)
+        bull += (25 if r >= 65 else 20) if r >= 60 else (10 if r > 50 else 0)
+        bull += 20 if v > vol_avg*1.2 else (10 if v > vol_avg else 0)
+        bull += 25 if c > hh else (15 if c > hh*0.98 else 0)
+        if n >= 3 and c > float(close.iloc[-3]): bull += 10
+        bull += 15 if rs > 0 else (5 if rs > -0.5 else 0)
+        # FIX-1: penalty not a gate — Positional stocks score lower when unqualified
+        #        but still surface so the user can see them at lower scores
         if mode == "Positional":
-            bull += 20 if qualified else -15
+            bull += 25 if qualified else -15
         else:
-            bull += 20 if strong_htf else -10
-        bull += 15 if in_golden else 0
-        if near_e127:
-            bull -= 20
-        elif near_e161:
-            bull -= 30
+            bull += 25 if strong_htf else -10
+        bull += 30 if in_golden else 0
+        if near_e127: bull -= 20
+        elif near_e161: bull -= 30
 
-        BULL_MAX  = 155
-        score     = max(0, bull)
-        norm_bull = min(100.0, max(0.0, bull * 100 / BULL_MAX))
+        score    = bull
+        norm_bull = min(100.0, bull * 100 / 155)
         score_th  = cfg["score_th"]
 
         def action_label(s):
@@ -335,6 +327,7 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None):
             if s >= 60:  return "WATCH"
             return "SKIP"
 
+        # FIX-4/6: pass pre-computed values — no recalculation inside detect_phase
         phase, entry_price, setup_type = detect_phase_and_entry(
             df, mode,
             c=c, e_fast_s=e_fast_s, e_slow_s=e_slow_s,
@@ -344,17 +337,19 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None):
             in_golden=in_golden, near_e127=near_e127, near_e161=near_e161,
             norm_bull=norm_bull, trend_up=trend_up, trend_down=trend_down,
             trend_strong=trend_strong, score_th=score_th,
-            vdu_setup=vdu_setup,
         )
 
         ltp   = round(c, 2)
         entry = entry_price if entry_price else ltp
 
+        # ── SL (FIX-5: use max() not min() for fib SL) ───────────
         mult = cfg["atr_mult"]
         wide = cfg["atr_wide"]
         maxm = cfg["atr_max"]
 
         if setup_type == "fib" and fib:
+            # Pine: SL = tightest of (swing low, 61.8% - 0.5×ATR, entry - 0.8×ATR)
+            # FIX-5: was min() which picked the widest/lowest — should be max() for tightest
             fib_sl = max(float(sw_lo), fib["618"] - atr_val * 0.5)
             fib_sl = max(fib_sl, entry - atr_val * 0.8)
             sl = round(fib_sl, 2)
@@ -385,7 +380,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None):
             "T2":       t2,
             "T3":       t3,
             "InGolden": in_golden,
-            "VDU":      vdu_setup,
         }
     except Exception:
         return None
@@ -397,103 +391,54 @@ def fetch_nifty(mode="Swing"):
         df.columns = df.columns.get_level_values(0)
     return df["Close"].dropna()
 
-def _market_regime(nifty_close):
-    if len(nifty_close) < 50:
-        return True, "UNKNOWN"
-    ema20_val = float(ema(nifty_close, 20).iloc[-1])
-    ema50_val = float(ema(nifty_close, 50).iloc[-1])
-    bullish   = (float(nifty_close.iloc[-1]) > ema50_val) and (ema20_val > ema50_val)
-    return bullish, "BULLISH" if bullish else "BEARISH"
-
-def _fetch_one(args):
-    sym, mode, min_bars = args
-    cfg    = MODE_CFG[mode]
-    ticker = to_nse(sym)
-    try:
-        df = yf.download(ticker, period=cfg["period"], interval=cfg["interval"],
-                         auto_adjust=True, progress=False, threads=False)
-        if df.empty:
-            return sym, None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df.dropna(how="all")
-        if pd.isna(df["Close"].iloc[-1]):
-            df = df.iloc[:-1]
-        df["Close"]  = df["Close"].ffill()
-        df["Volume"] = df["Volume"].fillna(0)
-        df = df.dropna(subset=["Close"])
-        return sym, (df if len(df) >= min_bars else None)
-    except Exception:
-        return sym, None
-
 def run_scan(symbols, mode, progress_bar, status_text):
-    import concurrent.futures
-
     cfg      = MODE_CFG[mode]
+    data     = {}
     rejected = 0
     total    = len(symbols)
-    min_bars = 30 if mode == "Intraday" else 50
+    nifty    = fetch_nifty(mode)
 
-    nifty = fetch_nifty(mode)
-
-    market_bullish, regime_label = _market_regime(nifty)
-    BEARISH_HAIRCUT = 0.85
-    if not market_bullish:
-        st.warning(
-            f"⚠️ **Market Regime: {regime_label}** — Nifty EMA20 is below EMA50. "
-            "Scores are reduced by 15 % and higher conviction is required. "
-            "Prefer WATCH/SETUP phases; avoid chasing breakouts."
-        )
-
-    status_text.text("Fetching OHLCV data in parallel…")
-    data         = {}
+    # FIX-3: pre-fetch daily closes for all symbols in one pass when Intraday
+    # so score_stock has daily HTF momentum without individual blocking calls
     daily_closes = {}
-    args_list    = [(sym, mode, min_bars) for sym in symbols]
+    if mode == "Intraday":
+        status_text.text("Fetching daily context for HTF momentum…")
+        for sym in symbols:
+            daily_closes[sym] = _fetch_daily_close(to_nse(sym))
 
-    MAX_WORKERS = min(16, total)
-    completed   = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(_fetch_one, a): a[0] for a in args_list}
-        for fut in concurrent.futures.as_completed(futures):
-            sym, df = fut.result()
-            completed += 1
-            progress_bar.progress(completed / total * 0.6)
-            if df is not None:
+    for i, sym in enumerate(symbols):
+        ticker = to_nse(sym)
+        progress_bar.progress((i+1)/total)
+        status_text.text(f"Scanning {i+1}/{total}  ▸  {ticker}  [{mode}]")
+        try:
+            df = yf.download(ticker, period=cfg["period"], interval=cfg["interval"],
+                             auto_adjust=True, progress=False, threads=False)
+            if df.empty:
+                rejected += 1; continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.dropna(how="all")
+            if pd.isna(df["Close"].iloc[-1]):
+                df = df.iloc[:-1]
+            df["Close"]  = df["Close"].ffill()
+            df["Volume"] = df["Volume"].fillna(0)
+            df = df.dropna(subset=["Close"])
+            min_bars = 30 if mode == "Intraday" else 50
+            if len(df) >= min_bars:
                 data[sym] = df
             else:
                 rejected += 1
-
-    if mode == "Intraday":
-        status_text.text("Fetching daily context for HTF momentum…")
-        daily_args = [(sym, "Swing", 50) for sym in data]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            d_futures = {pool.submit(_fetch_one, a): a[0] for a in daily_args}
-            for fut in concurrent.futures.as_completed(d_futures):
-                sym, df = fut.result()
-                if df is not None:
-                    daily_closes[sym] = df["Close"]
+        except Exception:
+            rejected += 1
 
     results = []
-    n_data  = len(data)
-    for i, (sym, df) in enumerate(data.items()):
-        progress_bar.progress(0.6 + (i + 1) / n_data * 0.4)
-        status_text.text(f"Scoring {i+1}/{n_data}  ▸  {sym}")
+    for sym, df in data.items():
         res = score_stock(df, nifty, mode, daily_close=daily_closes.get(sym))
         if res:
-            if not market_bullish:
-                res["Score"] = int(res["Score"] * BEARISH_HAIRCUT)
-                res["Action"] = action_label_fn(res["Score"])
-            res["Regime"] = regime_label
             results.append({"Symbol": sym, **res})
 
     results.sort(key=lambda x: x["Score"], reverse=True)
     return results, rejected
-
-def action_label_fn(s):
-    if s >= 100: return "STRONG BUY"
-    if s >= 80:  return "BUY"
-    if s >= 60:  return "WATCH"
-    return "SKIP"
 
 def fmt(val):
     if val is None or (isinstance(val, float) and np.isnan(val)):
@@ -503,662 +448,30 @@ def fmt(val):
 def action_icon(a):
     return {"STRONG BUY":"🟢","BUY":"🔵","WATCH":"🟡","SKIP":"🔴"}.get(a,"")
 
-# ── Zerodha helpers ──────────────────────────────────────────────
-ZERODHA_QUOTE_URL = "https://api.kite.trade/quote"
-ZERODHA_LTP_URL   = "https://api.kite.trade/quote/ltp"
-
-ZERODHA_INDEX_TOKENS = {
-    "Nifty 50":  "NSE:NIFTY 50",
-    "Sensex":    "BSE:SENSEX",
-    "BankNifty": "NSE:NIFTY BANK",
-}
-
-def _zerodha_headers(enctoken):
-    return {
-        "Authorization": f"enctoken {enctoken.strip()}",
-        "Content-Type":  "application/json",
-        "X-Kite-Version": "3",
-    }
-
-@st.cache_data(ttl=15)
-def zd_fetch_index_quote(enctoken, instruments):
-    import requests
-    try:
-        params = [("i", inst) for inst in instruments]
-        r = requests.get(ZERODHA_QUOTE_URL,
-                         headers=_zerodha_headers(enctoken),
-                         params=params, timeout=5)
-        if r.status_code == 200:
-            return r.json().get("data", {})
-        return {}
-    except Exception:
-        return {}
-
-@st.cache_data(ttl=15)
-def zd_fetch_ltp_bulk(enctoken, instrument_list):
-    import requests
-    out = {}
-    CHUNK = 500
-    for i in range(0, len(instrument_list), CHUNK):
-        chunk = instrument_list[i:i+CHUNK]
-        try:
-            params = [("i", inst) for inst in chunk]
-            r = requests.get(ZERODHA_LTP_URL,
-                             headers=_zerodha_headers(enctoken),
-                             params=params, timeout=8)
-            if r.status_code == 200:
-                data = r.json().get("data", {})
-                for k, v in data.items():
-                    out[k] = v.get("last_price", None)
-        except Exception:
-            pass
-    return out
-
-def zd_index_display(quote_data, instrument_key, name):
-    d = quote_data.get(instrument_key)
-    if not d:
-        return None
-    ltp    = d.get("last_price", 0)
-    ohlc   = d.get("ohlc", {})
-    prev   = ohlc.get("close", ltp)
-    chg    = round(ltp - prev, 2)
-    pct    = round((chg / prev) * 100, 2) if prev else 0
-    return {
-        "value":    ltp,
-        "chg":      chg,
-        "pct":      pct,
-        "open":     ohlc.get("open"),
-        "high":     ohlc.get("high"),
-        "low":      ohlc.get("low"),
-        "prev":     prev,
-        "source":   "Zerodha",
-    }
-
-# ── FIX-7: _enctoken_widget defined HERE, before it is called ────
-def _enctoken_widget():
-    """
-    Renders the one-time enctoken input box.
-    Returns the token string or ''.
-    """
-    if "zd_enctoken" not in st.session_state:
-        st.session_state["zd_enctoken"] = ""
-
-    with st.expander("🔑 Zerodha Live Quotes — Enter enctoken", expanded=not st.session_state["zd_enctoken"]):
-        st.markdown("""
-**How to get your enctoken** (takes ~30 seconds):
-1. Open [kite.zerodha.com](https://kite.zerodha.com) and log in
-2. Press **F12** → **Application** tab → **Cookies** → `kite.zerodha.com`
-3. Find the cookie named **`enctoken`** — copy its value
-4. Paste below ↓
-
-> Token resets daily around **6 AM IST**. Re-paste if quotes stop updating.
-> Your token is stored only in this browser session — never sent anywhere except Zerodha's own servers.
-        """)
-        col_inp, col_btn = st.columns([5, 1])
-        with col_inp:
-            token_input = st.text_input(
-                "enctoken", type="password",
-                value=st.session_state["zd_enctoken"],
-                placeholder="Paste your Zerodha enctoken here…",
-                label_visibility="collapsed",
-            )
-        with col_btn:
-            save_btn = st.button("✅ Save", use_container_width=True)
-
-        if save_btn and token_input.strip():
-            st.session_state["zd_enctoken"] = token_input.strip()
-            # FIX-10: Clear all OI caches when a new token is saved so stale
-            # None results from the previous (no-token) run are evicted immediately.
-            st.cache_data.clear()
-            st.success("Token saved! Live quotes active for this session.")
-            st.rerun()
-        if st.session_state["zd_enctoken"]:
-            if st.button("🗑 Clear token"):
-                st.session_state["zd_enctoken"] = ""
-                st.cache_data.clear()
-                st.rerun()
-
-    return st.session_state.get("zd_enctoken", "")
-
-# ── Instrument CSV helpers (Zerodha) ─────────────────────────────
-@st.cache_data(ttl=14400)
-def _zd_load_instruments(enctoken):
-    """
-    Download Zerodha's NFO + BFO instruments CSVs and return combined DataFrame.
-    FIX-12: surfaces HTTP errors into session_state for the debug panel.
-    """
-    import requests, io
-    frames = []
-    errors = []
-    for segment, exch in [("NFO", "NFO"), ("BFO", "BFO")]:
-        try:
-            r = requests.get(
-                f"https://api.kite.trade/instruments/{segment}",
-                headers=_zerodha_headers(enctoken),
-                timeout=15,
-            )
-            if r.status_code != 200:
-                errors.append(f"instruments/{segment} → HTTP {r.status_code}: {r.text[:200]}")
-                continue
-            df = pd.read_csv(io.StringIO(r.text))
-            df["exchange"] = exch
-            df["expiry"]   = pd.to_datetime(df["expiry"], errors="coerce")
-            frames.append(df)
-        except Exception as e:
-            errors.append(f"instruments/{segment} → Exception: {e}")
-            continue
-
-    if errors:
-        st.session_state["_zd_inst_errors"] = errors
-    else:
-        st.session_state.pop("_zd_inst_errors", None)
-
-    if not frames:
-        return None
-    return pd.concat(frames, ignore_index=True)
-
-
-def _zd_nearest_weekly_expiry(inst_df, underlying="NIFTY"):
-    today = pd.Timestamp.today().normalize()
-    mask  = (
-        (inst_df["name"] == underlying) &
-        (inst_df["instrument_type"].isin(["CE", "PE"])) &
-        (inst_df["expiry"] >= today)
-    )
-    opts = inst_df[mask]["expiry"].dropna().unique()
-    if len(opts) == 0:
-        return None
-    return sorted(opts)[0]
-
-
-_ZD_UNDERLYING_MAP = {
-    "NIFTY":     dict(name="NIFTY",     exch="NFO", spot_key="NSE:NIFTY 50",         step=50),
-    "BANKNIFTY": dict(name="BANKNIFTY", exch="NFO", spot_key="NSE:NIFTY BANK",        step=100),
-    "SENSEX":    dict(name="SENSEX",    exch="BFO", spot_key="BSE:SENSEX",            step=100),
-    "BANKEX":    dict(name="BANKEX",    exch="BFO", spot_key="BSE:BSE BANKEX",        step=100),
-    "FINNIFTY":  dict(name="FINNIFTY",  exch="NFO", spot_key="NSE:NIFTY FIN SERVICE", step=50),
-}
-
-
-# FIX-10: cache keyed on enctoken — new token always gets a fresh fetch
-@st.cache_data(ttl=120)
-def _zd_fetch_oi_zerodha(enctoken, underlying="NIFTY", atm_range=20):
-    """
-    Fetch option chain OI for `underlying` using Zerodha instruments + quote API.
-    FIX-9:  Removed zero-OI guard — show table even when OI = 0 (pre-market / thin contracts).
-    FIX-12: Stores diagnostic info in session_state["_zd_oi_debug"] for the debug panel.
-    """
-    import requests
-
-    debug = {"underlying": underlying, "steps": []}
-
-    cfg = _ZD_UNDERLYING_MAP.get(underlying)
-    if cfg is None:
-        debug["steps"].append(f"FAIL: unknown underlying '{underlying}'")
-        st.session_state["_zd_oi_debug"] = debug
-        return None
-
-    inst_df = _zd_load_instruments(enctoken)
-    if inst_df is None:
-        debug["steps"].append("FAIL: _zd_load_instruments returned None — check token / network")
-        st.session_state["_zd_oi_debug"] = debug
-        return None
-    debug["steps"].append(f"OK: instruments loaded ({len(inst_df)} rows)")
-
-    expiry_dt = _zd_nearest_weekly_expiry(inst_df, cfg["name"])
-    if expiry_dt is None:
-        debug["steps"].append(f"FAIL: no upcoming expiry found for {cfg['name']}")
-        st.session_state["_zd_oi_debug"] = debug
-        return None
-    debug["steps"].append(f"OK: nearest expiry = {expiry_dt.date()}")
-
-    spot = 0.0
-    try:
-        params = [("i", cfg["spot_key"])]
-        r = requests.get(ZERODHA_QUOTE_URL,
-                         headers=_zerodha_headers(enctoken),
-                         params=params, timeout=5)
-        if r.status_code == 200:
-            d = r.json().get("data", {}).get(cfg["spot_key"], {})
-            spot = float(d.get("last_price", 0))
-            debug["steps"].append(f"OK: spot = {spot}")
-        else:
-            debug["steps"].append(f"WARN: spot fetch HTTP {r.status_code} — proceeding without spot")
-    except Exception as e:
-        debug["steps"].append(f"WARN: spot fetch exception: {e}")
-
-    week_opts = inst_df[
-        (inst_df["name"] == cfg["name"]) &
-        (inst_df["instrument_type"].isin(["CE", "PE"])) &
-        (inst_df["expiry"] == expiry_dt)
-    ].copy()
-
-    if week_opts.empty:
-        debug["steps"].append("FAIL: no option rows found for this expiry")
-        st.session_state["_zd_oi_debug"] = debug
-        return None
-    debug["steps"].append(f"OK: {len(week_opts)} option rows for expiry")
-
-    strikes_sorted = sorted(week_opts["strike"].dropna().unique())
-    step = float(strikes_sorted[1] - strikes_sorted[0]) if len(strikes_sorted) >= 2 else float(cfg["step"])
-
-    if spot > 0 and step > 0:
-        atm = round(spot / step) * step
-        lo  = atm - step * atm_range
-        hi  = atm + step * atm_range
-        week_opts = week_opts[(week_opts["strike"] >= lo) & (week_opts["strike"] <= hi)]
-        debug["steps"].append(f"OK: filtered to ATM±{atm_range} strikes → {len(week_opts)} rows (ATM={atm})")
-
-    if week_opts.empty:
-        debug["steps"].append("FAIL: empty after ATM filter")
-        st.session_state["_zd_oi_debug"] = debug
-        return None
-
-    exch = cfg["exch"]
-    trading_symbols = [f"{exch}:{ts}" for ts in week_opts["tradingsymbol"].tolist()]
-    debug["steps"].append(f"OK: quoting {len(trading_symbols)} instruments")
-
-    CHUNK = 500
-    quote_data = {}
-    for i in range(0, len(trading_symbols), CHUNK):
-        chunk = trading_symbols[i:i+CHUNK]
-        try:
-            params = [("i", ts) for ts in chunk]
-            r = requests.get(ZERODHA_QUOTE_URL,
-                             headers=_zerodha_headers(enctoken),
-                             params=params, timeout=10)
-            if r.status_code == 200:
-                quote_data.update(r.json().get("data", {}))
-                debug["steps"].append(f"OK: chunk {i//CHUNK+1} → {len(r.json().get('data',{}))} quotes")
-            else:
-                debug["steps"].append(f"WARN: chunk {i//CHUNK+1} HTTP {r.status_code}: {r.text[:150]}")
-        except Exception as e:
-            debug["steps"].append(f"WARN: chunk {i//CHUNK+1} exception: {e}")
-
-    if not quote_data:
-        debug["steps"].append("FAIL: no quote data returned for any instrument")
-        st.session_state["_zd_oi_debug"] = debug
-        return None
-    debug["steps"].append(f"OK: {len(quote_data)} total quotes received")
-
-    rows = {}
-    for _, row in week_opts.iterrows():
-        key    = f"{exch}:{row['tradingsymbol']}"
-        q      = quote_data.get(key, {})
-        strike = float(row["strike"])
-        itype  = row["instrument_type"]
-        oi     = int(q.get("oi", 0) or 0)
-        ltp    = float(q.get("last_price", 0) or 0)
-
-        if strike not in rows:
-            rows[strike] = {
-                "Strike": strike,
-                "CE_OI": 0, "CE_Chg": 0, "CE_LTP": 0,
-                "PE_OI": 0, "PE_Chg": 0, "PE_LTP": 0,
-            }
-        if itype == "CE":
-            rows[strike]["CE_OI"]  = oi
-            rows[strike]["CE_LTP"] = ltp
-        else:
-            rows[strike]["PE_OI"]  = oi
-            rows[strike]["PE_LTP"] = ltp
-
-    if not rows:
-        debug["steps"].append("FAIL: row assembly produced empty result")
-        st.session_state["_zd_oi_debug"] = debug
-        return None
-
-    df_oi = pd.DataFrame(list(rows.values())).sort_values("Strike").reset_index(drop=True)
-
-    total_ce = df_oi["CE_OI"].sum()
-    total_pe = df_oi["PE_OI"].sum()
-    pcr = round(total_pe / total_ce, 2) if total_ce > 0 else 0
-
-    # FIX-9: Removed the zero-OI guard that was returning None during pre-market
-    # or when Zerodha returns OI=0 for all strikes (e.g. first few minutes of session).
-    # We now show the table regardless — strike prices and LTPs are still useful.
-    debug["steps"].append(f"OK: CE OI total={total_ce:,}, PE OI total={total_pe:,}, PCR={pcr}")
-
-    pains = []
-    for s in df_oi["Strike"]:
-        ce_loss = ((df_oi["Strike"] - s).clip(lower=0) * df_oi["CE_OI"]).sum()
-        pe_loss = ((s - df_oi["Strike"]).clip(lower=0) * df_oi["PE_OI"]).sum()
-        pains.append(ce_loss + pe_loss)
-    df_oi["TotalPain"] = pains
-
-    # When all OI = 0, max pain is meaningless — fall back to ATM strike
-    if total_ce == 0 and total_pe == 0:
-        max_pain_strike = int(round(spot / step) * step) if spot > 0 and step > 0 else int(df_oi["Strike"].median())
-        call_wall       = max_pain_strike
-        put_wall        = max_pain_strike
-        debug["steps"].append("INFO: all OI = 0; max pain / walls set to ATM (data may populate shortly)")
-    else:
-        max_pain_strike = int(df_oi.loc[df_oi["TotalPain"].idxmin(), "Strike"])
-        call_wall       = int(df_oi.loc[df_oi["CE_OI"].idxmax(), "Strike"])
-        put_wall        = int(df_oi.loc[df_oi["PE_OI"].idxmax(), "Strike"])
-
-    st.session_state["_zd_oi_debug"] = debug
-
-    return {
-        "symbol":    underlying,
-        "expiry":    expiry_dt.strftime("%d-%b-%Y"),
-        "spot":      spot if spot > 0 else float(df_oi["Strike"].median()),
-        "pcr":       pcr,
-        "max_pain":  max_pain_strike,
-        "call_wall": call_wall,
-        "put_wall":  put_wall,
-        "top_ce":    df_oi.nlargest(5, "CE_OI")[["Strike","CE_OI","CE_Chg"]].to_dict("records"),
-        "top_pe":    df_oi.nlargest(5, "PE_OI")[["Strike","PE_OI","PE_Chg"]].to_dict("records"),
-        "df_oi":     df_oi,
-        "source":    "Zerodha",
-        "oi_zero":   (total_ce == 0 and total_pe == 0),  # flag for UI warning
-    }
-
-
-# ── NSE fallback (NIFTY / BANKNIFTY only) ────────────────────────
-_NSE_SYMBOL_MAP = {
-    "NIFTY":     "NIFTY",
-    "BANKNIFTY": "BANKNIFTY",
-    "SENSEX":    None,
-}
-
-@st.cache_data(ttl=180)
-def _fetch_oi_nse(symbol="NIFTY"):
-    """NSE option-chain scrape — fallback when no enctoken is set (NIFTY/BANKNIFTY only)."""
-    import requests
-
-    nse_sym = _NSE_SYMBOL_MAP.get(symbol)
-    if nse_sym is None:
-        return None
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://www.nseindia.com/",
-    }
-    session = requests.Session()
-    try:
-        session.get("https://www.nseindia.com", headers=headers, timeout=8)
-        session.get("https://www.nseindia.com/market-data/equity-derivatives-watch",
-                    headers=headers, timeout=8)
-        url  = f"https://www.nseindia.com/api/option-chain-indices?symbol={nse_sym}"
-        resp = session.get(url, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-    except Exception:
-        return None
-
-    try:
-        records       = data["records"]
-        spot          = float(records["underlyingValue"])
-        weekly_expiry = (records["expiryDates"] or [None])[0]
-
-        rows = []
-        for item in records["data"]:
-            if item.get("expiryDate") != weekly_expiry:
-                continue
-            rows.append({
-                "Strike":  item["strikePrice"],
-                "CE_OI":   item.get("CE", {}).get("openInterest", 0) or 0,
-                "CE_Chg":  item.get("CE", {}).get("changeinOpenInterest", 0) or 0,
-                "CE_LTP":  item.get("CE", {}).get("lastPrice", 0) or 0,
-                "PE_OI":   item.get("PE", {}).get("openInterest", 0) or 0,
-                "PE_Chg":  item.get("PE", {}).get("changeinOpenInterest", 0) or 0,
-                "PE_LTP":  item.get("PE", {}).get("lastPrice", 0) or 0,
-            })
-        if not rows:
-            return None
-
-        df_oi    = pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
-        total_ce = df_oi["CE_OI"].sum()
-        total_pe = df_oi["PE_OI"].sum()
-        pcr      = round(total_pe / total_ce, 2) if total_ce > 0 else 0
-
-        pains = []
-        for s in df_oi["Strike"]:
-            pains.append(
-                ((df_oi["Strike"] - s).clip(lower=0) * df_oi["CE_OI"]).sum() +
-                ((s - df_oi["Strike"]).clip(lower=0) * df_oi["PE_OI"]).sum()
-            )
-        df_oi["TotalPain"] = pains
-        max_pain_strike    = int(df_oi.loc[df_oi["TotalPain"].idxmin(), "Strike"])
-
-        return {
-            "symbol":    symbol,
-            "expiry":    weekly_expiry,
-            "spot":      spot,
-            "pcr":       pcr,
-            "max_pain":  max_pain_strike,
-            "call_wall": int(df_oi.loc[df_oi["CE_OI"].idxmax(), "Strike"]),
-            "put_wall":  int(df_oi.loc[df_oi["PE_OI"].idxmax(), "Strike"]),
-            "top_ce":    df_oi.nlargest(5, "CE_OI")[["Strike","CE_OI","CE_Chg"]].to_dict("records"),
-            "top_pe":    df_oi.nlargest(5, "PE_OI")[["Strike","PE_OI","PE_Chg"]].to_dict("records"),
-            "df_oi":     df_oi,
-            "source":    "NSE",
-        }
-    except Exception:
-        return None
-
-
-@st.cache_data(ttl=180)
-def _fetch_oi_bse(symbol="SENSEX"):
-    import requests
-
-    bse_sym_map = {"SENSEX": "SENSEX", "BANKEX": "BANKEX"}
-    bse_sym = bse_sym_map.get(symbol)
-    if bse_sym is None:
-        return None
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Referer": "https://www.bseindia.com/",
-    }
-    try:
-        session = requests.Session()
-        session.get("https://www.bseindia.com", headers=headers, timeout=8)
-        url  = f"https://www.bseindia.com/bseplus/StockReach/AdvanceDeclineData/GetOptionChainData?scripcode={bse_sym}&type=IO"
-        resp = session.get(url, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-    except Exception:
-        return None
-
-    try:
-        rows = []
-        for item in data.get("Table", []):
-            rows.append({
-                "Strike":  float(item.get("STRIKEPRICE", 0)),
-                "CE_OI":   int(item.get("CE_OI", 0) or 0),
-                "CE_Chg":  int(item.get("CE_CHANGE_OI", 0) or 0),
-                "CE_LTP":  float(item.get("CE_LTP", 0) or 0),
-                "PE_OI":   int(item.get("PE_OI", 0) or 0),
-                "PE_Chg":  int(item.get("PE_CHANGE_OI", 0) or 0),
-                "PE_LTP":  float(item.get("PE_LTP", 0) or 0),
-            })
-        if not rows:
-            return None
-
-        spot_str = data.get("Table1", [{}])[0].get("LTP", 0)
-        spot     = float(spot_str or 0)
-
-        df_oi    = pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
-        total_ce = df_oi["CE_OI"].sum()
-        total_pe = df_oi["PE_OI"].sum()
-        pcr      = round(total_pe / total_ce, 2) if total_ce > 0 else 0
-
-        pains = []
-        for s in df_oi["Strike"]:
-            pains.append(
-                ((df_oi["Strike"] - s).clip(lower=0) * df_oi["CE_OI"]).sum() +
-                ((s - df_oi["Strike"]).clip(lower=0) * df_oi["PE_OI"]).sum()
-            )
-        df_oi["TotalPain"] = pains
-        max_pain_strike    = int(df_oi.loc[df_oi["TotalPain"].idxmin(), "Strike"])
-
-        return {
-            "symbol":    symbol,
-            "expiry":    "Weekly",
-            "spot":      spot if spot > 0 else float(df_oi["Strike"].median()),
-            "pcr":       pcr,
-            "max_pain":  max_pain_strike,
-            "call_wall": int(df_oi.loc[df_oi["CE_OI"].idxmax(), "Strike"]),
-            "put_wall":  int(df_oi.loc[df_oi["PE_OI"].idxmax(), "Strike"]),
-            "top_ce":    df_oi.nlargest(5, "CE_OI")[["Strike","CE_OI","CE_Chg"]].to_dict("records"),
-            "top_pe":    df_oi.nlargest(5, "PE_OI")[["Strike","PE_OI","PE_Chg"]].to_dict("records"),
-            "df_oi":     df_oi,
-            "source":    "BSE",
-        }
-    except Exception:
-        return None
-
-
-def fetch_oi_data(symbol="NIFTY", enctoken=""):
-    """
-    Smart OI fetch with full fallback chain:
-      1. Zerodha (reliable, live) — used when enctoken is set (NFO + BFO)
-      2. NSE scrape              — fallback for NIFTY/BANKNIFTY without token
-      3. BSE scrape              — fallback for SENSEX without token
-    """
-    if enctoken:
-        result = _zd_fetch_oi_zerodha(enctoken, underlying=symbol)
-        if result:
-            return result
-        # Zerodha returned None — fall through to scrape fallbacks
-
-    if symbol == "SENSEX":
-        return _fetch_oi_bse("SENSEX")
-    return _fetch_oi_nse(symbol)
-
-def _oi_sentiment(pcr):
-    if pcr >= 1.3:  return "Bullish 🟢", "#2ecc71"
-    if pcr >= 0.9:  return "Neutral 🟡", "#f39c12"
-    return "Bearish 🔴", "#e74c3c"
-
-def _render_oi_card(oi, index_name):
-    if oi is None:
-        st.warning(
-            f"⚠️ OI data unavailable for **{index_name}**.\n\n"
-            "- If you have a Zerodha enctoken entered above, check it is valid.\n"
-            "- Without a token, NSE scraping is used — this often fails outside market hours "
-            "or when Streamlit Cloud's IP is blocked by NSE.\n"
-            "- **Tip:** enter your Zerodha enctoken for reliable OI data."
-        )
-        # FIX-11: Show debug info when Zerodha path was attempted
-        debug = st.session_state.get("_zd_oi_debug")
-        inst_errors = st.session_state.get("_zd_inst_errors")
-        if debug or inst_errors:
-            with st.expander("🔧 Zerodha OI Debug Info", expanded=True):
-                if inst_errors:
-                    st.error("Instrument fetch errors:")
-                    for e in inst_errors:
-                        st.code(e)
-                if debug:
-                    st.write(f"**Underlying:** {debug.get('underlying')}")
-                    for step in debug.get("steps", []):
-                        color = "🔴" if step.startswith("FAIL") else ("🟡" if step.startswith("WARN") else "🟢")
-                        st.write(f"{color} {step}")
-        return
-
-    src = oi.get("source", "NSE")
-    src_color = "#2ecc71" if src == "Zerodha" else "#7a7a9a"
-    src_badge = (
-        f'<span style="background:{"#1a3a1a" if src=="Zerodha" else "#1c1c36"};'
-        f'color:{src_color};padding:1px 7px;border-radius:3px;font-size:10px;">'
-        f'{"🟢 " if src=="Zerodha" else ""}{"Live · " if src=="Zerodha" else ""}{src}</span>'
-    )
-    st.markdown(
-        f'<div style="margin-bottom:6px;font-size:11px;color:#7a7a9a;">'
-        f'Data source: {src_badge}</div>',
-        unsafe_allow_html=True,
-    )
-
-    # FIX-9: Warn when OI is zero but still show the card
-    if oi.get("oi_zero"):
-        st.info(
-            "ℹ️ All OI values are currently 0 — Zerodha may not have published OI yet "
-            "(common in first few minutes of session). Strike prices and spot are live. "
-            "Refresh in ~1 minute."
-        )
-
-    sentiment_label, sentiment_color = _oi_sentiment(oi["pcr"])
-
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Expiry",     oi["expiry"])
-    m2.metric("Spot",       f"₹{oi['spot']:,.0f}")
-    m3.metric("Max Pain",   f"₹{oi['max_pain']:,}",
-              delta=f"{oi['max_pain'] - int(oi['spot']):+,} from spot",
-              delta_color="off")
-    m4.metric("Call Wall",  f"₹{oi['call_wall']:,}")
-    m5.metric("Put Wall",   f"₹{oi['put_wall']:,}")
-
-    st.markdown(
-        f'<div style="margin:6px 0 10px;">'
-        f'<span style="color:#7a7a9a;font-size:12px;">PCR: </span>'
-        f'<span style="color:{sentiment_color};font-weight:bold;font-size:14px;">'
-        f'{oi["pcr"]}  ·  {sentiment_label}</span>'
-        f'&nbsp;&nbsp;<span style="color:#7a7a9a;font-size:11px;">'
-        f'(PCR &gt; 1.3 bullish · &lt; 0.9 bearish)</span>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-    tc1, tc2 = st.columns(2)
-    with tc1:
-        st.markdown("**📞 Top CE OI (Resistance)**")
-        ce_rows = []
-        for r in oi["top_ce"]:
-            chg_str = f"+{r['CE_Chg']:,.0f}" if r['CE_Chg'] >= 0 else f"{r['CE_Chg']:,.0f}"
-            chg_col = "🔺" if r['CE_Chg'] > 0 else ("🔻" if r['CE_Chg'] < 0 else "–")
-            ce_rows.append({
-                "Strike": f"₹{r['Strike']:,}",
-                "OI (lots)": f"{r['CE_OI']:,}",
-                "OI Δ": f"{chg_col} {chg_str}",
-            })
-        st.dataframe(pd.DataFrame(ce_rows), hide_index=True, use_container_width=True)
-    with tc2:
-        st.markdown("**📟 Top PE OI (Support)**")
-        pe_rows = []
-        for r in oi["top_pe"]:
-            chg_str = f"+{r['PE_Chg']:,.0f}" if r['PE_Chg'] >= 0 else f"{r['PE_Chg']:,.0f}"
-            chg_col = "🔺" if r['PE_Chg'] > 0 else ("🔻" if r['PE_Chg'] < 0 else "–")
-            pe_rows.append({
-                "Strike": f"₹{r['Strike']:,}",
-                "OI (lots)": f"{r['PE_OI']:,}",
-                "OI Δ": f"{chg_col} {chg_str}",
-            })
-        st.dataframe(pd.DataFrame(pe_rows), hide_index=True, use_container_width=True)
-
-    if not oi.get("oi_zero"):
-        pain_dist = oi["max_pain"] - int(oi["spot"])
-        if abs(pain_dist) <= 100:
-            tip = "🎯 Spot is near Max Pain — expect pin action / low volatility into expiry."
-        elif pain_dist > 100:
-            tip = f"⬆️ Max Pain is ₹{pain_dist:+,} above spot — options writers may defend upside."
-        else:
-            tip = f"⬇️ Max Pain is ₹{pain_dist:+,} below spot — options writers may drag price down."
-        st.caption(tip)
-
-    # FIX-11: Always show debug steps in a collapsed expander when Zerodha was used
-    debug = st.session_state.get("_zd_oi_debug")
-    if debug and src == "Zerodha":
-        with st.expander("🔧 Zerodha OI Debug", expanded=False):
-            for step in debug.get("steps", []):
-                color = "🔴" if step.startswith("FAIL") else ("🟡" if step.startswith("WARN") else ("ℹ️" if step.startswith("INFO") else "🟢"))
-                st.write(f"{color} {step}")
-
-
-# ── Index fetch (mode-aware) ─────────────────────────────────────
+# ── Streamlit UI ─────────────────────────────────────────────────
+st.set_page_config(page_title="NSE Master Scanner Pro", page_icon="📈",
+                   layout="wide", initial_sidebar_state="collapsed")
+st.markdown("""
+<style>
+body, .stApp { background-color:#0d0d1a; color:#f0f0f0; }
+.stDataFrame { font-size:13px; }
+div[data-testid="stMetricValue"] { color:#00b4d8; font-size:1.4rem; }
+</style>""", unsafe_allow_html=True)
+
+st.title("📈 NSE Master Scanner Pro  [Phase Engine v5]")
+
+for key, default in [("results",[]),("scan_time",None),("rejected",0),("scan_mode","Swing")]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# ── Controls ─────────────────────────────────────────────────────
+c1, c2, c3, c4, c5, c6 = st.columns([2,1,1,2,2,2])
+with c1:
+    index_opt = st.selectbox("Index", list(SECTORS.keys()), label_visibility="collapsed")
+with c2:
+    mode_opt = st.selectbox("Mode", ["Swing","Intraday","Positional"], label_visibility="collapsed")
+
+# ── Nifty & Sensex (mode-aware) ───────────────────────────────────
 @st.cache_data(ttl=300)
 def fetch_indices(mode="Swing"):
     cfg      = MODE_CFG[mode]
@@ -1201,160 +514,37 @@ def fetch_indices(mode="Swing"):
             out[name] = None
     return out
 
-# ════════════════════════════════════════════════════════════════
-# ── Streamlit UI  (all definitions above this line) ─────────────
-# ════════════════════════════════════════════════════════════════
-st.set_page_config(page_title="NSE Master Scanner Pro", page_icon="📈",
-                   layout="wide", initial_sidebar_state="collapsed")
-st.markdown("""
-<style>
-body, .stApp { background-color:#0d0d1a; color:#f0f0f0; }
-.stDataFrame { font-size:13px; }
-div[data-testid="stMetricValue"] { color:#00b4d8; font-size:1.4rem; }
-</style>""", unsafe_allow_html=True)
-
-st.title("📈 NSE Master Scanner Pro  [Phase Engine v5]")
-
-for key, default in [("results",[]),("scan_time",None),("rejected",0),("scan_mode","Swing"),("zd_enctoken",""),("zd_ltp_cache",{})]:
-    if key not in st.session_state:
-        st.session_state[key] = default
-
-# ── Zerodha enctoken widget ───────────────────────────────────────
-enctoken = _enctoken_widget()
-
-# ── Controls ─────────────────────────────────────────────────────
-c1, c2, c3, c4, c5, c6 = st.columns([2,1,1,2,2,2])
-with c1:
-    index_opt = st.selectbox("Index", list(SECTORS.keys()), label_visibility="collapsed")
-with c2:
-    mode_opt = st.selectbox("Mode", ["Swing","Intraday","Positional"], label_visibility="collapsed")
-
 indices = fetch_indices(mode_opt)
-
-# ── OI data — enctoken passed for Zerodha path ──────────────────
-oi_nifty    = fetch_oi_data("NIFTY",   enctoken=enctoken)
-oi_sensex   = fetch_oi_data("SENSEX",  enctoken=enctoken)
-
-# ── Live index quotes (Zerodha if token present, else yfinance) ───
-zd_index_data = {}
-if enctoken:
-    _zd_raw = zd_fetch_index_quote(
-        enctoken,
-        [ZERODHA_INDEX_TOKENS["Nifty 50"], ZERODHA_INDEX_TOKENS["Sensex"]]
-    )
-    for idx_name, inst_key in [("Nifty 50", ZERODHA_INDEX_TOKENS["Nifty 50"]),
-                                ("Sensex",   ZERODHA_INDEX_TOKENS["Sensex"])]:
-        zd_index_data[idx_name] = zd_index_display(_zd_raw, inst_key, idx_name)
-
 ic1, ic2, ic3 = st.columns([2,2,6])
-# FIX: restored Sensex (was incorrectly changed to BANKNIFTY in previous edit)
-for col, name, oi_sym in zip(
-        [ic1, ic2],
-        ["Nifty 50", "Sensex"],
-        [oi_nifty, oi_sensex]):
-    zd = zd_index_data.get(name)
-    d  = indices.get(name)
+for col, name in zip([ic1,ic2],["Nifty 50","Sensex"]):
+    d = indices.get(name)
     with col:
-        if zd:
-            ltp_val = zd["value"]
-            chg_val = zd["chg"]
-            pct_val = zd["pct"]
-            ohlc_str = (
-                f'O:{zd["open"]:,.0f}  H:{zd["high"]:,.0f}  '
-                f'L:{zd["low"]:,.0f}  P:{zd["prev"]:,.0f}'
-                if zd.get("open") else ""
-            )
-            src_badge = (
-                '<span style="background:#1a3a1a;color:#2ecc71;padding:1px 6px;'
-                'border-radius:3px;font-size:9px;margin-left:4px;">🟢 LIVE</span>'
-            )
-        elif d:
-            ltp_val  = d["value"]
-            chg_val  = d["chg"]
-            pct_val  = d["pct"]
-            ohlc_str = ""
-            src_badge = (
-                '<span style="background:#1c1c36;color:#7a7a9a;padding:1px 6px;'
-                'border-radius:3px;font-size:9px;margin-left:4px;">yfinance</span>'
-            )
+        if d:
+            cs = f"{'+' if d['chg']>=0 else ''}{d['chg']:,.1f} ({'+' if d['pct']>=0 else ''}{d['pct']:.2f}%)"
+            cc = "#2ecc71" if d["chg"]>=0 else "#e74c3c"
+            ar = "▲" if d["chg"]>=0 else "▼"
+            act= d["action"]
+            ac = "#ffd700" if act=="STRONG BUY" else ("#2ecc71" if act=="BUY" else ("#f39c12" if act=="WATCH" else "#e74c3c"))
+            sp = min(int(d["score"]/150*100),100)
+            st.markdown(
+                f'<div style="background:#12122a;border:1px solid #1c1c36;border-radius:10px;padding:12px 16px;">'
+                f'<div style="color:#7a7a9a;font-size:11px;text-transform:uppercase;">'
+                f'{name} &nbsp;<span style="background:#1c1c36;padding:1px 6px;border-radius:3px;font-size:10px;">'
+                f'{d["interval"]} · EMA{d["ema_fast"]}/{d["ema_slow"]}</span></div>'
+                f'<div style="color:#f0f0f0;font-size:22px;font-weight:bold;">{d["value"]:,.1f}</div>'
+                f'<div style="color:{cc};font-size:13px;">{ar} {cs}</div>'
+                f'<div style="margin:8px 0 4px;background:#1c1c36;border-radius:4px;height:6px;">'
+                f'<div style="background:{ac};width:{sp}%;height:6px;border-radius:4px;"></div></div>'
+                f'<div style="display:flex;justify-content:space-between;">'
+                f'<span style="color:{ac};font-size:12px;font-weight:bold;">{act} · Score: {d["score"]}</span>'
+                f'<span style="color:#7a7a9a;font-size:11px;">RSI {d["rsi"]}</span></div>'
+                f'<div style="color:#7a7a9a;font-size:11px;margin-top:4px;">{d["trend"]}</div>'
+                f'</div>', unsafe_allow_html=True)
         else:
-            st.markdown(f"**{name}:** unavailable"); continue
-
-        cs  = f"{'+ ' if chg_val>=0 else ''}{chg_val:,.1f} ({'+ ' if pct_val>=0 else ''}{pct_val:.2f}%)"
-        cs  = cs.replace("+ ", "+")
-        cc  = "#2ecc71" if chg_val >= 0 else "#e74c3c"
-        ar  = "▲" if chg_val >= 0 else "▼"
-
-        act = d["action"] if d else "—"
-        rsi_val = d["rsi"]  if d else "—"
-        trend_s = d["trend"] if d else ""
-        ac  = "#ffd700" if act=="STRONG BUY" else ("#2ecc71" if act=="BUY" else ("#f39c12" if act=="WATCH" else "#e74c3c"))
-        sp  = min(int(d["score"]/150*100), 100) if d else 0
-
-        oi_badge = ""
-        if oi_sym:
-            s_label, s_col = _oi_sentiment(oi_sym["pcr"])
-            pain_dist  = oi_sym["max_pain"] - int(ltp_val)
-            pain_arrow = "⬆️" if pain_dist > 0 else ("⬇️" if pain_dist < 0 else "🎯")
-            oi_badge = (
-                f'<div style="margin-top:6px;padding:5px 8px;background:#0a1a0a;'
-                f'border-radius:6px;border:1px solid #1c1c36;font-size:11px;">'
-                f'<span style="color:#7a7a9a;">PCR: </span>'
-                f'<span style="color:{s_col};font-weight:bold;">{oi_sym["pcr"]} {s_label}</span>'
-                f' &nbsp;│&nbsp; '
-                f'<span style="color:#7a7a9a;">MaxPain: </span>'
-                f'<span style="color:#e0c97f;font-weight:bold;">'
-                f'₹{oi_sym["max_pain"]:,} {pain_arrow}{pain_dist:+,}</span>'
-                f' &nbsp;│&nbsp; '
-                f'<span style="color:#7a7a9a;">CWall: </span>'
-                f'<span style="color:#e74c3c;">₹{oi_sym["call_wall"]:,}</span>'
-                f' &nbsp;│&nbsp; '
-                f'<span style="color:#7a7a9a;">PWall: </span>'
-                f'<span style="color:#2ecc71;">₹{oi_sym["put_wall"]:,}</span>'
-                f'</div>'
-            )
-
-        ohlc_html = f'<div style="color:#7a7a9a;font-size:10px;margin-top:2px;">{ohlc_str}</div>' if ohlc_str else ""
-
-        interval_lbl = d["interval"] if d else "—"
-        ema_f = d["ema_fast"] if d else "—"
-        ema_s = d["ema_slow"] if d else "—"
-
-        st.markdown(
-            f'<div style="background:#12122a;border:1px solid #1c1c36;border-radius:10px;padding:12px 16px;">'
-            f'<div style="color:#7a7a9a;font-size:11px;text-transform:uppercase;">'
-            f'{name}{src_badge}'
-            f'&nbsp;<span style="background:#1c1c36;padding:1px 6px;border-radius:3px;font-size:10px;">'
-            f'{interval_lbl} · EMA{ema_f}/{ema_s}</span></div>'
-            f'<div style="color:#f0f0f0;font-size:22px;font-weight:bold;">{ltp_val:,.1f}</div>'
-            f'<div style="color:{cc};font-size:13px;">{ar} {cs}</div>'
-            + ohlc_html +
-            f'<div style="margin:8px 0 4px;background:#1c1c36;border-radius:4px;height:6px;">'
-            f'<div style="background:{ac};width:{sp}%;height:6px;border-radius:4px;"></div></div>'
-            f'<div style="display:flex;justify-content:space-between;">'
-            f'<span style="color:{ac};font-size:12px;font-weight:bold;">{act} · Score: {d["score"] if d else "—"}</span>'
-            f'<span style="color:#7a7a9a;font-size:11px;">RSI {rsi_val}</span></div>'
-            f'<div style="color:#7a7a9a;font-size:11px;margin-top:4px;">{trend_s}</div>'
-            + oi_badge +
-            f'</div>', unsafe_allow_html=True)
-
+            st.markdown(f"**{name}:** unavailable")
+# FIX-2: caption now accurately says 5 min
 with ic3:
-    live_note = "🟢 **Live via Zerodha** (15-sec refresh)" if enctoken else "📡 yfinance (5-min cache)"
-    oi_note   = "🟢 **Zerodha OI** (2-min cache)" if enctoken else "📡 NSE OI (3-min cache, may fail outside market hours)"
-    st.caption(f"{live_note} · {oi_note} · Technical scores via yfinance")
-
-# ── OI Detail expanders ───────────────────────────────────────────
-oi_x1, oi_x2 = st.columns(2)
-with oi_x1:
-    nifty_src  = oi_nifty.get("source", "") if oi_nifty else ""
-    nifty_lbl  = f"📊 Nifty 50 — Weekly OI & Max Pain {'🟢' if nifty_src=='Zerodha' else ''}"
-    with st.expander(nifty_lbl, expanded=bool(oi_nifty)):
-        _render_oi_card(oi_nifty, "NIFTY")
-with oi_x2:
-    bn_src  = oi_sensex.get("source", "") if oi_sensex else ""
-    bn_lbl  = f"📊 Sensex — Weekly OI & Max Pain {'🟢' if bn_src=='Zerodha' else ''}"
-    with st.expander(bn_lbl, expanded=bool(oi_sensex)):
-        _render_oi_card(oi_sensex, "SENSEX")
+    st.caption(f"📡 Index data matches selected mode ({mode_opt}). Auto-refreshes every 5 min.")
 
 with c3:
     scan_btn = st.button("🔍 SCAN", type="primary", use_container_width=True)
@@ -1405,22 +595,8 @@ if scan_btn:
     st.session_state.rejected  = rejected
     st.session_state.scan_mode = mode_opt
     st.session_state.scan_time = datetime.now().strftime("%H:%M:%S") + f" ({index_opt} · {mode_opt})"
-
-    if enctoken and results:
-        stat.text("Fetching live LTP from Zerodha…")
-        instruments = [f"NSE:{r['Symbol']}" for r in results]
-        ltp_map = zd_fetch_ltp_bulk(enctoken, instruments)
-        for r in st.session_state.results:
-            live = ltp_map.get(f"NSE:{r['Symbol']}")
-            if live and live > 0:
-                prev_ltp = r["LTP"]
-                r["LTP"]     = round(live, 2)
-                r["%Change"] = round(((live - prev_ltp) / prev_ltp) * 100, 2) if prev_ltp else r["%Change"]
-                r["_ltp_src"] = "Zerodha"
-
     prog.empty(); stat.empty()
-    st.success(f"✅ Done — {len(results)} valid · {rejected} rejected · {mode_opt} mode"
-               + (" · 🟢 LTP from Zerodha" if enctoken else ""))
+    st.success(f"✅ Done — {len(results)} valid · {rejected} rejected · {mode_opt} mode")
 
 # ── Filtering ────────────────────────────────────────────────────
 results = list(st.session_state.results)
@@ -1466,7 +642,7 @@ if st.session_state.results:
         ac  = "#ffd700" if act=="STRONG BUY" else "#2ecc71"
         ph  = r.get("Phase", PHASE_IDLE)
         pc  = PHASE_COLORS.get(ph, "#555")
-        st_icon = {"fib":"🌀","breakout":"🚀","norm":"📊","vdu":"🔕"}.get(r.get("Setup","norm"),"📊")
+        st_icon = {"fib":"🌀","breakout":"🚀","norm":"📊"}.get(r.get("Setup","norm"),"📊")
         entry_str = f'&#8377;{r["Entry"]:,}' if show_entry and r["Entry"] != r["LTP"] else ""
         return (
             f'<div style="background:#0a1a0a;border:1px solid {border_color};border-radius:8px;'
@@ -1479,8 +655,7 @@ if st.session_state.results:
             f'<div style="margin-top:5px;display:flex;gap:4px;flex-wrap:wrap;">'
             f'<span style="background:{pc};color:#fff;padding:1px 6px;border-radius:3px;font-size:10px;">{ph}</span>'
             f'<span style="background:#1c1c36;color:#aaa;padding:1px 6px;border-radius:3px;font-size:10px;">{st_icon}</span>'
-            + ('<span style="background:#4a3000;color:#ffa500;padding:1px 6px;border-radius:3px;font-size:10px;">🔕VDU</span>' if r.get("VDU") else '')
-            + '</div></div>'
+            f'</div></div>'
         )
 
     if top_act:
@@ -1525,7 +700,7 @@ if results:
         chg   = r["%Change"]
         phase = r.get("Phase", PHASE_IDLE)
         entry_flag = " ⚡" if r["Entry"] != r["LTP"] else ""
-        setup_icon = {"fib":"🌀","breakout":"🚀","norm":"📊","vdu":"🔕"}.get(r.get("Setup","norm"),"📊")
+        setup_icon = {"fib":"🌀","breakout":"🚀","norm":"📊"}.get(r.get("Setup","norm"),"📊")
         rows.append({
             "#":       i+1,
             "Symbol":  r["Symbol"],
@@ -1541,8 +716,6 @@ if results:
             "T2":      fmt(r["T2"]),
             "T3":      fmt(r["T3"]),
             "Golden":  "🌟" if r.get("InGolden") else "",
-            "VDU":     "🔕" if r.get("VDU") else "",
-            "Regime":  r.get("Regime", "—"),
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=480)
     st.caption("⚡ Entry = signal trigger price (fib zone / breakout / EMA cross). LTP = current price.")
