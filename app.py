@@ -10,6 +10,7 @@ Fixes applied:
   FIX-5: Fib SL uses max() not min() — was giving absurdly wide stops
   FIX-6: detect_phase receives pre-computed norm_bull so phase & action use identical inputs
   FIX-7: _enctoken_widget defined before it is called (NameError fix)
+  FIX-8: OI fetched via Zerodha API when enctoken present (reliable vs NSE scrape)
 """
 
 import warnings
@@ -611,10 +612,226 @@ def _enctoken_widget():
 
     return st.session_state.get("zd_enctoken", "")
 
-# ── Options OI + Max Pain (NSE public API) ───────────────────────
-@st.cache_data(ttl=180)
-def fetch_oi_data(symbol="NIFTY"):
-    import requests, json
+# ── Options OI + Max Pain ────────────────────────────────────────
+# FIX-8: Zerodha-first OI fetching.
+# When an enctoken is present we use Zerodha's instruments CSV + bulk quote
+# endpoint — this is the same data Kite uses and is never rate-limited.
+# NSE scraping is retained as an automatic fallback when no token is set.
+#
+# Zerodha option instrument format (from instruments CSV):
+#   tradingsymbol : NIFTY2551522500CE
+#   name          : NIFTY
+#   expiry        : 2025-05-15
+#   strike        : 22500.0
+#   instrument_type: CE / PE
+#   exchange      : NFO
+#   lot_size      : 75
+#
+# We fetch the NFO instruments CSV once (cached 4 h), filter for the
+# nearest weekly expiry around ATM ± N strikes, bulk-quote those
+# instruments for OI, then compute PCR / Max Pain / walls.
+
+# ── Instrument CSV helpers (Zerodha) ─────────────────────────────
+@st.cache_data(ttl=14400)   # 4-hour cache — instruments don't change intraday
+def _zd_load_instruments(enctoken):
+    """Download Zerodha's NFO instruments CSV and return as DataFrame."""
+    import requests, io
+    try:
+        r = requests.get(
+            "https://api.kite.trade/instruments/NFO",
+            headers=_zerodha_headers(enctoken),
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        df = pd.read_csv(io.StringIO(r.text))
+        df["expiry"] = pd.to_datetime(df["expiry"], errors="coerce")
+        return df
+    except Exception:
+        return None
+
+
+def _zd_nearest_weekly_expiry(inst_df, underlying="NIFTY"):
+    """
+    Return the nearest weekly expiry date for the given underlying.
+    Zerodha marks weekly expiries by their recurrence every Thursday.
+    We simply pick the smallest expiry >= today.
+    """
+    today = pd.Timestamp.today().normalize()
+    opts  = inst_df[
+        (inst_df["name"] == underlying) &
+        (inst_df["instrument_type"].isin(["CE", "PE"])) &
+        (inst_df["expiry"] >= today)
+    ]["expiry"].dropna().unique()
+    if len(opts) == 0:
+        return None
+    return sorted(opts)[0]
+
+
+@st.cache_data(ttl=120)   # 2-min cache — OI changes tick by tick
+def _zd_fetch_oi_zerodha(enctoken, underlying="NIFTY", atm_range=20):
+    """
+    Fetch option chain OI for `underlying` using Zerodha instruments + quote API.
+
+    atm_range: number of strikes on each side of ATM to include.
+               20 strikes × 50-pt step = ±1000 pts coverage for NIFTY.
+    Returns the same dict shape as fetch_oi_data_nse() so _render_oi_card
+    works without any changes.
+    """
+    import requests
+
+    inst_df = _zd_load_instruments(enctoken)
+    if inst_df is None:
+        return None
+
+    # ── Step 1: find nearest weekly expiry ───────────────────────
+    expiry_dt = _zd_nearest_weekly_expiry(inst_df, underlying)
+    if expiry_dt is None:
+        return None
+    expiry_str = expiry_dt.strftime("%Y-%m-%d")
+
+    # ── Step 2: get spot price for ATM ───────────────────────────
+    index_token_map = {
+        "NIFTY":    "NSE:NIFTY 50",
+        "BANKNIFTY":"NSE:NIFTY BANK",
+        "FINNIFTY": "NSE:NIFTY FIN SERVICE",
+    }
+    spot_instrument = index_token_map.get(underlying)
+    spot = 0.0
+    if spot_instrument:
+        try:
+            params = [("i", spot_instrument)]
+            r = requests.get(ZERODHA_QUOTE_URL,
+                             headers=_zerodha_headers(enctoken),
+                             params=params, timeout=5)
+            if r.status_code == 200:
+                d = r.json().get("data", {}).get(spot_instrument, {})
+                spot = float(d.get("last_price", 0))
+        except Exception:
+            pass
+
+    # ── Step 3: filter instruments for this expiry ───────────────
+    week_opts = inst_df[
+        (inst_df["name"] == underlying) &
+        (inst_df["instrument_type"].isin(["CE", "PE"])) &
+        (inst_df["expiry"] == expiry_dt)
+    ].copy()
+
+    if week_opts.empty:
+        return None
+
+    # Determine strike step (50 for NIFTY, 100 for BANKNIFTY)
+    strikes_sorted = sorted(week_opts["strike"].dropna().unique())
+    if len(strikes_sorted) >= 2:
+        step = float(strikes_sorted[1] - strikes_sorted[0])
+    else:
+        step = 50.0
+
+    # ATM strike
+    if spot > 0 and step > 0:
+        atm = round(spot / step) * step
+        lo  = atm - step * atm_range
+        hi  = atm + step * atm_range
+        week_opts = week_opts[
+            (week_opts["strike"] >= lo) & (week_opts["strike"] <= hi)
+        ]
+
+    if week_opts.empty:
+        return None
+
+    # ── Step 4: bulk-quote all selected instruments ───────────────
+    # Zerodha uses "NFO:NIFTY2551522500CE" format
+    trading_symbols = [f"NFO:{ts}" for ts in week_opts["tradingsymbol"].tolist()]
+
+    CHUNK = 500
+    quote_data = {}
+    for i in range(0, len(trading_symbols), CHUNK):
+        chunk = trading_symbols[i:i+CHUNK]
+        try:
+            params = [("i", ts) for ts in chunk]
+            r = requests.get(ZERODHA_QUOTE_URL,
+                             headers=_zerodha_headers(enctoken),
+                             params=params, timeout=10)
+            if r.status_code == 200:
+                quote_data.update(r.json().get("data", {}))
+        except Exception:
+            pass
+
+    if not quote_data:
+        return None
+
+    # ── Step 5: build OI table ────────────────────────────────────
+    rows = {}
+    for _, row in week_opts.iterrows():
+        key    = f"NFO:{row['tradingsymbol']}"
+        q      = quote_data.get(key, {})
+        strike = float(row["strike"])
+        itype  = row["instrument_type"]   # CE or PE
+        oi     = int(q.get("oi", 0) or 0)
+        oi_chg = int(q.get("oi_day_change", 0) or 0)  # Zerodha field name
+        ltp    = float(q.get("last_price", 0) or 0)
+
+        if strike not in rows:
+            rows[strike] = {
+                "Strike": strike,
+                "CE_OI": 0, "CE_Chg": 0, "CE_LTP": 0,
+                "PE_OI": 0, "PE_Chg": 0, "PE_LTP": 0,
+            }
+        if itype == "CE":
+            rows[strike]["CE_OI"]  = oi
+            rows[strike]["CE_Chg"] = oi_chg
+            rows[strike]["CE_LTP"] = ltp
+        else:
+            rows[strike]["PE_OI"]  = oi
+            rows[strike]["PE_Chg"] = oi_chg
+            rows[strike]["PE_LTP"] = ltp
+
+    if not rows:
+        return None
+
+    df_oi = pd.DataFrame(list(rows.values())).sort_values("Strike").reset_index(drop=True)
+
+    # ── Step 6: compute metrics ───────────────────────────────────
+    total_ce = df_oi["CE_OI"].sum()
+    total_pe = df_oi["PE_OI"].sum()
+    pcr = round(total_pe / total_ce, 2) if total_ce > 0 else 0
+
+    pains = []
+    for s in df_oi["Strike"]:
+        ce_loss = ((df_oi["Strike"] - s).clip(lower=0) * df_oi["CE_OI"]).sum()
+        pe_loss = ((s - df_oi["Strike"]).clip(lower=0) * df_oi["PE_OI"]).sum()
+        pains.append(ce_loss + pe_loss)
+    df_oi["TotalPain"] = pains
+    max_pain_strike = int(df_oi.loc[df_oi["TotalPain"].idxmin(), "Strike"])
+
+    call_wall = int(df_oi.loc[df_oi["CE_OI"].idxmax(), "Strike"])
+    put_wall  = int(df_oi.loc[df_oi["PE_OI"].idxmax(), "Strike"])
+
+    top_ce = df_oi.nlargest(5, "CE_OI")[["Strike","CE_OI","CE_Chg"]].to_dict("records")
+    top_pe = df_oi.nlargest(5, "PE_OI")[["Strike","PE_OI","PE_Chg"]].to_dict("records")
+
+    expiry_display = expiry_dt.strftime("%d-%b-%Y")
+    source_badge   = "Zerodha"
+
+    return {
+        "symbol":    underlying,
+        "expiry":    expiry_display,
+        "spot":      spot if spot > 0 else float(df_oi["Strike"].median()),
+        "pcr":       pcr,
+        "max_pain":  max_pain_strike,
+        "call_wall": call_wall,
+        "put_wall":  put_wall,
+        "top_ce":    top_ce,
+        "top_pe":    top_pe,
+        "df_oi":     df_oi,
+        "source":    source_badge,
+    }
+
+
+@st.cache_data(ttl=180)   # 3-min cache for NSE fallback
+def _fetch_oi_nse(symbol="NIFTY"):
+    """NSE option-chain scrape — fallback when no enctoken is set."""
+    import requests
 
     headers = {
         "User-Agent": (
@@ -626,13 +843,12 @@ def fetch_oi_data(symbol="NIFTY"):
         "Accept-Encoding": "gzip, deflate, br",
         "Referer": "https://www.nseindia.com/",
     }
-
     session = requests.Session()
     try:
         session.get("https://www.nseindia.com", headers=headers, timeout=8)
         session.get("https://www.nseindia.com/market-data/equity-derivatives-watch",
                     headers=headers, timeout=8)
-        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+        url  = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
         resp = session.get(url, headers=headers, timeout=10)
         if resp.status_code != 200:
             return None
@@ -641,35 +857,32 @@ def fetch_oi_data(symbol="NIFTY"):
         return None
 
     try:
-        records = data["records"]
-        spot    = float(records["underlyingValue"])
-        expiries = records["expiryDates"]
-        weekly_expiry = expiries[0] if expiries else None
+        records       = data["records"]
+        spot          = float(records["underlyingValue"])
+        weekly_expiry = (records["expiryDates"] or [None])[0]
 
         rows = []
         for item in records["data"]:
             if item.get("expiryDate") != weekly_expiry:
                 continue
             strike = item["strikePrice"]
-            ce_oi  = item.get("CE", {}).get("openInterest", 0) or 0
-            pe_oi  = item.get("PE", {}).get("openInterest", 0) or 0
-            ce_chg = item.get("CE", {}).get("changeinOpenInterest", 0) or 0
-            pe_chg = item.get("PE", {}).get("changeinOpenInterest", 0) or 0
-            ce_ltp = item.get("CE", {}).get("lastPrice", 0) or 0
-            pe_ltp = item.get("PE", {}).get("lastPrice", 0) or 0
             rows.append({
-                "Strike": strike,
-                "CE_OI": ce_oi, "CE_Chg": ce_chg, "CE_LTP": ce_ltp,
-                "PE_OI": pe_oi, "PE_Chg": pe_chg, "PE_LTP": pe_ltp,
+                "Strike":  strike,
+                "CE_OI":   item.get("CE", {}).get("openInterest", 0) or 0,
+                "CE_Chg":  item.get("CE", {}).get("changeinOpenInterest", 0) or 0,
+                "CE_LTP":  item.get("CE", {}).get("lastPrice", 0) or 0,
+                "PE_OI":   item.get("PE", {}).get("openInterest", 0) or 0,
+                "PE_Chg":  item.get("PE", {}).get("changeinOpenInterest", 0) or 0,
+                "PE_LTP":  item.get("PE", {}).get("lastPrice", 0) or 0,
             })
 
         if not rows:
             return None
 
-        df_oi = pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
+        df_oi    = pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
         total_ce = df_oi["CE_OI"].sum()
         total_pe = df_oi["PE_OI"].sum()
-        pcr = round(total_pe / total_ce, 2) if total_ce > 0 else 0
+        pcr      = round(total_pe / total_ce, 2) if total_ce > 0 else 0
 
         pains = []
         for s in df_oi["Strike"]:
@@ -677,13 +890,9 @@ def fetch_oi_data(symbol="NIFTY"):
             pe_loss = ((s - df_oi["Strike"]).clip(lower=0) * df_oi["PE_OI"]).sum()
             pains.append(ce_loss + pe_loss)
         df_oi["TotalPain"] = pains
-        max_pain_strike = int(df_oi.loc[df_oi["TotalPain"].idxmin(), "Strike"])
-
-        call_wall = int(df_oi.loc[df_oi["CE_OI"].idxmax(), "Strike"])
-        put_wall  = int(df_oi.loc[df_oi["PE_OI"].idxmax(), "Strike"])
-
-        top_ce = df_oi.nlargest(5, "CE_OI")[["Strike","CE_OI","CE_Chg"]].to_dict("records")
-        top_pe = df_oi.nlargest(5, "PE_OI")[["Strike","PE_OI","PE_Chg"]].to_dict("records")
+        max_pain_strike    = int(df_oi.loc[df_oi["TotalPain"].idxmin(), "Strike"])
+        call_wall          = int(df_oi.loc[df_oi["CE_OI"].idxmax(), "Strike"])
+        put_wall           = int(df_oi.loc[df_oi["PE_OI"].idxmax(), "Strike"])
 
         return {
             "symbol":    symbol,
@@ -693,12 +902,27 @@ def fetch_oi_data(symbol="NIFTY"):
             "max_pain":  max_pain_strike,
             "call_wall": call_wall,
             "put_wall":  put_wall,
-            "top_ce":    top_ce,
-            "top_pe":    top_pe,
+            "top_ce":    df_oi.nlargest(5, "CE_OI")[["Strike","CE_OI","CE_Chg"]].to_dict("records"),
+            "top_pe":    df_oi.nlargest(5, "PE_OI")[["Strike","PE_OI","PE_Chg"]].to_dict("records"),
             "df_oi":     df_oi,
+            "source":    "NSE",
         }
     except Exception:
         return None
+
+
+def fetch_oi_data(symbol="NIFTY", enctoken=""):
+    """
+    Smart OI fetch: Zerodha (reliable, live) when token is set,
+    NSE scrape (unreliable outside mkt hours) as fallback.
+    symbol: 'NIFTY' or 'BANKNIFTY'
+    """
+    if enctoken:
+        result = _zd_fetch_oi_zerodha(enctoken, underlying=symbol)
+        if result:
+            return result
+        # Zerodha failed (market closed / bad token) → try NSE
+    return _fetch_oi_nse(symbol)
 
 def _oi_sentiment(pcr):
     if pcr >= 1.3:  return "Bullish 🟢", "#2ecc71"
@@ -707,8 +931,27 @@ def _oi_sentiment(pcr):
 
 def _render_oi_card(oi, index_name):
     if oi is None:
-        st.caption(f"⚠️ OI data unavailable for {index_name} — NSE API may be closed or rate-limited.")
+        st.warning(
+            f"⚠️ OI data unavailable for **{index_name}**.\n\n"
+            "- If you have a Zerodha enctoken entered above, check it is valid.\n"
+            "- Without a token, NSE scraping is used — this often fails outside market hours "
+            "or when Streamlit Cloud's IP is blocked by NSE.\n"
+            "- **Tip:** enter your Zerodha enctoken for reliable OI data."
+        )
         return
+
+    src = oi.get("source", "NSE")
+    src_color = "#2ecc71" if src == "Zerodha" else "#7a7a9a"
+    src_badge = (
+        f'<span style="background:{"#1a3a1a" if src=="Zerodha" else "#1c1c36"};'
+        f'color:{src_color};padding:1px 7px;border-radius:3px;font-size:10px;">'
+        f'{"🟢 " if src=="Zerodha" else ""}{"Live · " if src=="Zerodha" else ""}{src}</span>'
+    )
+    st.markdown(
+        f'<div style="margin-bottom:6px;font-size:11px;color:#7a7a9a;">'
+        f'Data source: {src_badge}</div>',
+        unsafe_allow_html=True,
+    )
 
     sentiment_label, sentiment_color = _oi_sentiment(oi["pcr"])
 
@@ -841,9 +1084,9 @@ with c2:
 
 indices = fetch_indices(mode_opt)
 
-# ── OI data ───────────────────────────────────────────────────────
-oi_nifty  = fetch_oi_data("NIFTY")
-oi_sensex = fetch_oi_data("BANKNIFTY")
+# ── OI data — FIX-8: pass enctoken so Zerodha path is used ──────
+oi_nifty  = fetch_oi_data("NIFTY",     enctoken=enctoken)
+oi_sensex = fetch_oi_data("BANKNIFTY", enctoken=enctoken)
 
 # ── Live index quotes (Zerodha if token present, else yfinance) ───
 zd_index_data = {}
@@ -950,15 +1193,20 @@ for col, name, oi_sym in zip(
 # FIX-2: corrected caption
 with ic3:
     live_note = "🟢 **Live via Zerodha** (15-sec refresh)" if enctoken else "📡 yfinance (5-min cache)"
-    st.caption(f"{live_note} · OI refreshes every 3 min · Technical scores via yfinance")
+    oi_note   = "🟢 **Zerodha OI** (2-min cache)" if enctoken else "📡 NSE OI (3-min cache, may fail outside market hours)"
+    st.caption(f"{live_note} · {oi_note} · Technical scores via yfinance")
 
-# ── OI Detail expanders ───────────────────────────────────────────
+# ── OI Detail expanders — auto-expand when data is present ───────
 oi_x1, oi_x2 = st.columns(2)
 with oi_x1:
-    with st.expander("📊 Nifty 50 — Weekly OI & Max Pain", expanded=False):
+    nifty_src  = oi_nifty.get("source", "") if oi_nifty else ""
+    nifty_lbl  = f"📊 Nifty 50 — Weekly OI & Max Pain {'🟢' if nifty_src=='Zerodha' else ''}"
+    with st.expander(nifty_lbl, expanded=bool(oi_nifty)):
         _render_oi_card(oi_nifty, "NIFTY")
 with oi_x2:
-    with st.expander("📊 Bank Nifty — Weekly OI & Max Pain (NSE proxy for Sensex)", expanded=False):
+    bn_src  = oi_sensex.get("source", "") if oi_sensex else ""
+    bn_lbl  = f"📊 Bank Nifty — Weekly OI & Max Pain {'🟢' if bn_src=='Zerodha' else ''}"
+    with st.expander(bn_lbl, expanded=bool(oi_sensex)):
         _render_oi_card(oi_sensex, "BANKNIFTY")
 
 with c3:
