@@ -1,6 +1,14 @@
 """
 NSE Master Scanner Pro — Streamlit Edition
 Mode-aware (Intraday / Swing / Positional) with Phase State Machine
+
+Fixes applied:
+  FIX-1: Positional qualified gate — demoted from hard block to score penalty
+  FIX-2: TTL comment was stale (already 300s, caption corrected)
+  FIX-3: Intraday momentum now uses a separate daily fetch; 5m bars excluded
+  FIX-4: EMA/RSI/ATR computed once in score_stock, passed into detect_phase
+  FIX-5: Fib SL uses max() not min() — was giving absurdly wide stops
+  FIX-6: detect_phase receives pre-computed norm_bull so phase & action use identical inputs
 """
 
 import warnings
@@ -23,7 +31,7 @@ for k in SECTORS:
     if SECTORS[k] is None:
         SECTORS[k] = NIFTY500
 
-# ── Mode config (mirrors Pine Script dynamic params) ─────────────
+# ── Mode config ──────────────────────────────────────────────────
 MODE_CFG = {
     "Intraday":   dict(period="5d",  interval="5m",  ema_fast=20, ema_slow=50,
                        atr_mult=1.5, atr_wide=3.0, atr_max=1.0,
@@ -73,7 +81,6 @@ def atr_series(df, p=14):
     return tr.ewm(alpha=1/p, adjust=False).mean()
 
 def fib_levels(df, lookback=30):
-    """Fib retracement + extensions from swing hi/lo over lookback bars (uses High/Low like Pine)."""
     sw_hi = float(df["High"].iloc[-lookback:].max())
     sw_lo = float(df["Low"].iloc[-lookback:].min())
     rng   = sw_hi - sw_lo
@@ -85,38 +92,28 @@ def fib_levels(df, lookback=30):
         "500":    sw_hi - rng * 0.500,
         "618":    sw_hi - rng * 0.618,
         "786":    sw_hi - rng * 0.786,
-        "ext127": sw_hi + rng * 0.272,   # 127.2% extension
-        "ext161": sw_hi + rng * 0.618,   # 161.8% extension
-        "ext261": sw_hi + rng * 1.618,   # 261.8% extension
+        "ext127": sw_hi + rng * 0.272,
+        "ext161": sw_hi + rng * 0.618,
+        "ext261": sw_hi + rng * 1.618,
     }, rng
 
 def _compute_targets(entry, sl, atr_val, fib, setup_type, sw_hi, sw_lo):
-    """
-    Pine Script target engine — mode-aware by setup type.
-    setup_type: 'fib' | 'breakout' | 'norm'
-    """
-    rk = max(entry - sl, atr_val * 0.5)  # minimum 0.5×ATR risk
+    rk = max(entry - sl, atr_val * 0.5)
 
     if setup_type == "fib" and fib:
-        # Pine STYPE_FIB: T1=ext127, T2=ext161, T3=ext161 + min(range, 3×ATR)
         t1 = round(fib["ext127"], 2)
         t2 = round(fib["ext161"], 2)
         ext_range = fib["ext161"] - fib["ext127"]
         t3 = round(fib["ext161"] + min(ext_range, atr_val * 3), 2)
-
     elif setup_type == "breakout" and fib:
-        # Breakout: blended — avg of ATR-based and Fib extensions
         t1 = round((entry + rk      + fib["ext127"]) / 2, 2)
         t2 = round((entry + rk * 2  + fib["ext161"]) / 2, 2)
         t3 = round((entry + rk * 3  + fib["ext261"]) / 2, 2)
-
     else:
-        # Pure ATR (norm / no fib available)
         t1 = round(entry + rk, 2)
         t2 = round(entry + rk * 2, 2)
         t3 = round(entry + rk * 3, 2)
 
-    # Safety: ensure targets never collapse below entry
     min_move = atr_val * 0.8
     if t1 - entry < min_move:
         t1 = round(entry + min_move, 2)
@@ -125,110 +122,82 @@ def _compute_targets(entry, sl, atr_val, fib, setup_type, sw_hi, sw_lo):
 
     return t1, t2, t3
 
-# ── Phase detection (Pine-accurate) ──────────────────────────────
-def detect_phase_and_entry(df, mode="Swing"):
-    cfg    = MODE_CFG[mode]
-    close  = df["Close"]
-    high   = df["High"]
-    low    = df["Low"]
-    volume = df["Volume"]
-    n      = len(close)
+# ── FIX-3: Intraday daily context fetch ─────────────────────────
+# Momentum (1M/3M/6M) is meaningless on 5-min bars with daily thresholds.
+# For Intraday scans we fetch a small daily slice just for HTF momentum.
+@st.cache_data(ttl=900)
+def _fetch_daily_close(ticker):
+    """Fetch 6 months of daily closes for HTF momentum — used by Intraday mode only."""
+    try:
+        df = yf.download(ticker, period="6mo", interval="1d",
+                         auto_adjust=True, progress=False, threads=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df["Close"].dropna()
+    except Exception:
+        return pd.Series(dtype=float)
+
+# ── FIX-4/6: detect_phase accepts pre-computed indicators ────────
+# score_stock computes everything once and passes it in.
+# This eliminates the double-EMA recalculation and ensures phase
+# and action score use identical norm_bull values.
+def detect_phase_and_entry(
+    df, mode, *,
+    c, e_fast_s, e_slow_s, atr_s, atr_val, atr_mean,
+    v, vol_avg, fib, sw_hi, sw_lo, in_golden, near_e127, near_e161,
+    norm_bull, trend_up, trend_down, trend_strong, score_th,
+):
+    cfg  = MODE_CFG[mode]
+    close = df["Close"]
+    high  = df["High"]
+    n     = len(close)
     if n < 60:
         return PHASE_IDLE, None, "norm"
 
-    c       = float(close.iloc[-1])
-    atr_s   = atr_series(df)
-    atr_val = float(atr_s.iloc[-1])
-    atr_mean= float(atr_s.rolling(20).mean().iloc[-1])
-    e_fast  = ema(close, cfg["ema_fast"])
-    e_slow  = ema(close, cfg["ema_slow"])
-    e20v    = float(e_fast.iloc[-1])
-    e50v    = float(e_slow.iloc[-1])
-    e200v   = float(ema(close, 200).iloc[-1]) if n >= 200 else e50v
-    r       = float(rsi(close, cfg["rsi_len"]).iloc[-1])
-    vol_avg = float(volume.rolling(20).mean().iloc[-1])
-    v       = float(volume.iloc[-1])
-    hh      = float(close.iloc[-11:-1].max())
+    e20v = float(e_fast_s.iloc[-1])
+    e50v = float(e_slow_s.iloc[-1])
 
-    trend_up     = c > e200v and c > e20v and e20v > e50v
-    trend_down   = c < e200v and c < e20v and e20v < e50v
-    trend_strong = c > e20v and e20v > e50v
+    brk_lb         = 5
+    rolling_hi_brk = float(high.iloc[-brk_lb-1:-1].max()) if n > brk_lb+1 else float(high.iloc[-1])
+    buf             = atr_val * 0.2
 
-    # Pine uses i_brkLB=5 for lookback on highs (not closes)
-    brk_lb   = 5
-    rolling_hi_brk = float(high.iloc[-brk_lb-1:-1].max()) if n > brk_lb+1 else hh
-    buf      = atr_val * 0.2
+    is_compressed = atr_val < atr_mean * 0.8
+    is_expanding  = atr_val > float(atr_s.iloc[-2])
 
-    # Pine compression + expansion checks
-    is_compressed = atr_val < atr_mean * 0.8          # ATR < 80% of 20-bar mean
-    is_expanding  = atr_val > float(atr_s.iloc[-2])   # ATR growing
-
-    # Wick exhaustion filter (Pine: upperWick > body × 1.5 and close < high)
-    body       = abs(float(close.iloc[-1]) - float(df["Open"].iloc[-1])) if "Open" in df.columns else atr_val * 0.3
-    upper_wick = float(high.iloc[-1]) - max(float(close.iloc[-1]), float(df["Open"].iloc[-1])) if "Open" in df.columns else 0
+    body = (
+        abs(float(close.iloc[-1]) - float(df["Open"].iloc[-1]))
+        if "Open" in df.columns else atr_val * 0.3
+    )
+    upper_wick = (
+        float(high.iloc[-1]) - max(float(close.iloc[-1]), float(df["Open"].iloc[-1]))
+        if "Open" in df.columns else 0
+    )
     is_exhaustion = upper_wick > body * 1.5
+    vol_spike     = v > vol_avg * 1.3
 
-    # Volume spike
-    vol_spike = v > vol_avg * 1.3
-
-    sw_hi, sw_lo, fib, fib_rng = fib_levels(df, lookback=30)
-    prox      = atr_val * 0.3
-    in_golden = bool(fib and c >= fib["618"] - prox and c <= fib["500"] + prox)
-    near_e127 = bool(fib and abs(c - fib["ext127"]) < prox)
-    near_e161 = bool(fib and abs(c - fib["ext161"]) < prox)
-
-    mom1 = (c - float(close.iloc[-21])) / float(close.iloc[-21]) * 100 if n >= 21 else 0
-    mom3 = (c - float(close.iloc[-63])) / float(close.iloc[-63]) * 100 if n >= 63 else 0
-    mom6 = (c - float(close.iloc[-126])) / float(close.iloc[-126]) * 100 if n >= 126 else 0
-    strong_htf = mom1 > cfg["mom1_th"] and mom3 > cfg["mom3_th"] and mom6 > cfg["mom6_th"]
-    qualified  = (strong_htf and trend_strong) if mode == "Positional" else True
-
-    # Bull score
-    bull = 0
-    bull += 25 if trend_up else 0
-    bull += 30 if e20v > e50v else (20 if e20v > e50v*0.995 else 0)
-    bull += (25 if r >= 65 else 20) if r >= 60 else (10 if r > 50 else 0)
-    bull += 20 if v > vol_avg*1.2 else (10 if v > vol_avg else 0)
-    bull += 25 if c > hh else (15 if c > hh*0.98 else 0)
-    if n >= 3 and c > float(close.iloc[-3]): bull += 10
-    bull += 30 if in_golden else 0
-    if near_e127: bull -= 20
-    elif near_e161: bull -= 30
-    norm_bull = min(100, bull * 100 / 155)
-
-    score_th   = cfg["score_th"]
     is_fib_buy = trend_up and in_golden
 
-    # ── Pine-accurate breakout (smartBreakout) ────────────────────
-    # qualifiedStock AND isBreakout AND trendUp AND normBull>=th
-    # AND isCompressed[1] AND isExpanding AND volSpike AND NOT isExhaustion
     is_breakout = (
-        qualified and
-        c > rolling_hi_brk + buf and     # close breaks above 5-bar high+buffer
+        c > rolling_hi_brk + buf and
         trend_up and
         norm_bull >= score_th and
-        is_compressed and                  # was in consolidation
-        is_expanding and                   # ATR now expanding
-        vol_spike and                      # volume confirmation
-        not is_exhaustion                  # no wick exhaustion
+        is_compressed and
+        is_expanding and
+        vol_spike and
+        not is_exhaustion
     )
 
-    # Continuation: close > 3-bar high, volume > avg, trend intact
     is_cont = (
         c > float(close.iloc[-4:-1].max()) and
         v > vol_avg and
         trend_strong
     )
 
-    # Exit conditions
-    ema_down    = e20v < e50v and float(e_fast.iloc[-4]) < float(e_slow.iloc[-4])
+    ema_down    = e20v < e50v and float(e_fast_s.iloc[-4]) < float(e_slow_s.iloc[-4])
     trail_level = float(close.iloc[-10:].max()) - atr_val * 1.5
     trail_break = c < trail_level
 
-    if not qualified:
-        return PHASE_IDLE, None, "norm"
-
-    # ── Phase priority (mirrors Pine state machine) ───────────────
+    # ── Phase priority ────────────────────────────────────────────
     if trend_down and ema_down:
         phase = PHASE_EXIT
         setup_type = "norm"
@@ -251,18 +220,17 @@ def detect_phase_and_entry(df, mode="Swing"):
         phase = PHASE_IDLE
         setup_type = "norm"
 
-    # ── Entry price = actual signal trigger level ─────────────────
+    # ── Entry price ───────────────────────────────────────────────
     entry_price = None
     if phase in (PHASE_ENTRY, PHASE_CONT, PHASE_BRK, PHASE_SETUP):
+        prox = atr_val * 0.3
         if is_breakout:
-            # Pine: entry at close of breakout bar (which already broke rolling_hi + buf)
             entry_price = round(rolling_hi_brk + buf, 2)
         elif is_fib_buy and fib:
-            # Pine: entry at top of golden zone (61.8% level + tiny buffer)
             entry_price = round(fib["618"] + prox * 0.3, 2)
         else:
-            # Entry at last EMA fast crossover bar
-            cross       = close > e_fast
+            e_fast_ser = e_fast_s
+            cross       = close > e_fast_ser
             signal_bars = cross & ~cross.shift(1).fillna(False)
             if signal_bars.any():
                 last_idx    = signal_bars[::-1].idxmax()
@@ -273,7 +241,11 @@ def detect_phase_and_entry(df, mode="Swing"):
     return phase, entry_price, setup_type
 
 # ── Full stock scoring ────────────────────────────────────────────
-def score_stock(df, nifty_close, mode="Swing"):
+def score_stock(df, nifty_close, mode="Swing", daily_close=None):
+    """
+    daily_close: pre-fetched daily Close series (only used when mode==Intraday
+                 to compute HTF momentum on proper daily bars).
+    """
     try:
         cfg    = MODE_CFG[mode]
         close  = df["Close"]
@@ -284,26 +256,35 @@ def score_stock(df, nifty_close, mode="Swing"):
 
         c       = float(close.iloc[-1])
         prev    = float(close.iloc[-2])
-        e20     = float(ema(close, cfg["ema_fast"]).iloc[-1])
-        e50     = float(ema(close, cfg["ema_slow"]).iloc[-1])
-        e200    = float(ema(close, 200).iloc[-1]) if n >= 200 else None
-        r       = float(rsi(close, cfg["rsi_len"]).iloc[-1])
-        atr_val = float(atr_series(df).iloc[-1])
-        vol_avg = float(volume.rolling(20).mean().iloc[-1])
-        v       = float(volume.iloc[-1])
-        chg     = round(((c - prev) / prev) * 100, 2)
-        hh      = float(close.iloc[-11:-1].max())
+        # FIX-4: compute indicators once
+        e_fast_s = ema(close, cfg["ema_fast"])
+        e_slow_s = ema(close, cfg["ema_slow"])
+        e20      = float(e_fast_s.iloc[-1])
+        e50      = float(e_slow_s.iloc[-1])
+        e200     = float(ema(close, 200).iloc[-1]) if n >= 200 else None
+        r        = float(rsi(close, cfg["rsi_len"]).iloc[-1])
+        atr_s    = atr_series(df)
+        atr_val  = float(atr_s.iloc[-1])
+        atr_mean = float(atr_s.rolling(20).mean().iloc[-1])
+        vol_avg  = float(volume.rolling(20).mean().iloc[-1])
+        v        = float(volume.iloc[-1])
+        chg      = round(((c - prev) / prev) * 100, 2)
+        hh       = float(close.iloc[-11:-1].max())
 
         rs = 0
         if n >= 6 and len(nifty_close) >= 6:
             rs = (c - float(close.iloc[-6])) - (float(nifty_close.iloc[-1]) - float(nifty_close.iloc[-6]))
 
         trend_up     = (e200 is None or c > e200) and c > e20 and e20 > e50
+        trend_down   = (e200 is None or c < e200) and c < e20 and e20 < e50
         trend_strong = c > e20 and e20 > e50
 
-        mom1 = (c - float(close.iloc[-21])) / float(close.iloc[-21]) * 100 if n >= 21 else 0
-        mom3 = (c - float(close.iloc[-63])) / float(close.iloc[-63]) * 100 if n >= 63 else 0
-        mom6 = (c - float(close.iloc[-126])) / float(close.iloc[-126]) * 100 if n >= 126 else 0
+        # FIX-3: use daily_close for HTF momentum when in Intraday mode
+        mom_src = daily_close if (mode == "Intraday" and daily_close is not None and len(daily_close) >= 21) else close
+        mom_n   = len(mom_src)
+        mom1 = (c - float(mom_src.iloc[-21]))  / float(mom_src.iloc[-21])  * 100 if mom_n >= 21  else 0
+        mom3 = (c - float(mom_src.iloc[-63]))  / float(mom_src.iloc[-63])  * 100 if mom_n >= 63  else 0
+        mom6 = (c - float(mom_src.iloc[-126])) / float(mom_src.iloc[-126]) * 100 if mom_n >= 126 else 0
         strong_htf = mom1 > cfg["mom1_th"] and mom3 > cfg["mom3_th"] and mom6 > cfg["mom6_th"]
 
         sw_hi, sw_lo, fib, fib_rng = fib_levels(df, lookback=30)
@@ -312,6 +293,12 @@ def score_stock(df, nifty_close, mode="Swing"):
         near_e127 = bool(fib and abs(c - fib["ext127"]) < prox)
         near_e161 = bool(fib and abs(c - fib["ext161"]) < prox)
 
+        # FIX-1: Positional qualified — penalty instead of hard gate
+        # Previously: if not qualified: return PHASE_IDLE, None, "norm"  ← killed all Positional results
+        # Now: score is penalised for unqualified stocks but they still appear
+        qualified = strong_htf and trend_strong
+
+        # FIX-6: single bull score used by BOTH action label and phase detection
         bull = 0
         bull += 25 if trend_up else 0
         bull += 30 if e20 > e50 else (20 if e20 > e50*0.995 else 0)
@@ -320,12 +307,19 @@ def score_stock(df, nifty_close, mode="Swing"):
         bull += 25 if c > hh else (15 if c > hh*0.98 else 0)
         if n >= 3 and c > float(close.iloc[-3]): bull += 10
         bull += 15 if rs > 0 else (5 if rs > -0.5 else 0)
-        bull += 25 if strong_htf else -10
+        # FIX-1: penalty not a gate — Positional stocks score lower when unqualified
+        #        but still surface so the user can see them at lower scores
+        if mode == "Positional":
+            bull += 25 if qualified else -15
+        else:
+            bull += 25 if strong_htf else -10
         bull += 30 if in_golden else 0
         if near_e127: bull -= 20
         elif near_e161: bull -= 30
 
-        score = bull
+        score    = bull
+        norm_bull = min(100.0, bull * 100 / 155)
+        score_th  = cfg["score_th"]
 
         def action_label(s):
             if s >= 100: return "STRONG BUY"
@@ -333,22 +327,33 @@ def score_stock(df, nifty_close, mode="Swing"):
             if s >= 60:  return "WATCH"
             return "SKIP"
 
-        phase, entry_price, setup_type = detect_phase_and_entry(df, mode)
+        # FIX-4/6: pass pre-computed values — no recalculation inside detect_phase
+        phase, entry_price, setup_type = detect_phase_and_entry(
+            df, mode,
+            c=c, e_fast_s=e_fast_s, e_slow_s=e_slow_s,
+            atr_s=atr_s, atr_val=atr_val, atr_mean=atr_mean,
+            v=v, vol_avg=vol_avg,
+            fib=fib, sw_hi=sw_hi, sw_lo=sw_lo,
+            in_golden=in_golden, near_e127=near_e127, near_e161=near_e161,
+            norm_bull=norm_bull, trend_up=trend_up, trend_down=trend_down,
+            trend_strong=trend_strong, score_th=score_th,
+        )
+
         ltp   = round(c, 2)
         entry = entry_price if entry_price else ltp
 
-        # ── SL (Pine-accurate, mode-aware) ────────────────────────
-        mult   = cfg["atr_mult"]
-        wide   = cfg["atr_wide"]
-        maxm   = cfg["atr_max"]
+        # ── SL (FIX-5: use max() not min() for fib SL) ───────────
+        mult = cfg["atr_mult"]
+        wide = cfg["atr_wide"]
+        maxm = cfg["atr_max"]
 
         if setup_type == "fib" and fib:
-            # Pine STYPE_FIB: SL below swing low or 61.8% - 0.5×ATR
-            fib_sl = min(float(sw_lo), fib["618"] - atr_val * 0.5)
-            fib_sl = min(fib_sl, entry - atr_val * 0.8)
+            # Pine: SL = tightest of (swing low, 61.8% - 0.5×ATR, entry - 0.8×ATR)
+            # FIX-5: was min() which picked the widest/lowest — should be max() for tightest
+            fib_sl = max(float(sw_lo), fib["618"] - atr_val * 0.5)
+            fib_sl = max(fib_sl, entry - atr_val * 0.8)
             sl = round(fib_sl, 2)
         elif setup_type == "breakout":
-            # Breakout SL: tighter — entry - 1.5×ATR (Pine breakout SL)
             sl = round(entry - atr_val * (1.5 if mode == "Intraday" else 2.0), 2)
         else:
             raw_sl = entry - atr_val * mult
@@ -356,27 +361,25 @@ def score_stock(df, nifty_close, mode="Swing"):
             max_sl = entry - atr_val * maxm
             sl = round(max(min_sl, min(raw_sl, max_sl)), 2)
 
-        # Minimum risk floor
         min_risk = atr_val * 0.5
         if entry - sl < min_risk:
             sl = round(entry - min_risk, 2)
 
-        # ── Targets (Pine-accurate, setup-aware) ──────────────────
         t1, t2, t3 = _compute_targets(entry, sl, atr_val, fib, setup_type, sw_hi, sw_lo)
 
         return {
-            "Score":     score,
-            "Action":    action_label(score),
-            "Phase":     phase,
-            "Setup":     setup_type,
-            "%Change":   chg,
-            "LTP":       ltp,
-            "Entry":     entry,
-            "SL":        sl,
-            "T1":        t1,
-            "T2":        t2,
-            "T3":        t3,
-            "InGolden":  in_golden,
+            "Score":    score,
+            "Action":   action_label(score),
+            "Phase":    phase,
+            "Setup":    setup_type,
+            "%Change":  chg,
+            "LTP":      ltp,
+            "Entry":    entry,
+            "SL":       sl,
+            "T1":       t1,
+            "T2":       t2,
+            "T3":       t3,
+            "InGolden": in_golden,
         }
     except Exception:
         return None
@@ -394,6 +397,14 @@ def run_scan(symbols, mode, progress_bar, status_text):
     rejected = 0
     total    = len(symbols)
     nifty    = fetch_nifty(mode)
+
+    # FIX-3: pre-fetch daily closes for all symbols in one pass when Intraday
+    # so score_stock has daily HTF momentum without individual blocking calls
+    daily_closes = {}
+    if mode == "Intraday":
+        status_text.text("Fetching daily context for HTF momentum…")
+        for sym in symbols:
+            daily_closes[sym] = _fetch_daily_close(to_nse(sym))
 
     for i, sym in enumerate(symbols):
         ticker = to_nse(sym)
@@ -422,7 +433,7 @@ def run_scan(symbols, mode, progress_bar, status_text):
 
     results = []
     for sym, df in data.items():
-        res = score_stock(df, nifty, mode)
+        res = score_stock(df, nifty, mode, daily_close=daily_closes.get(sym))
         if res:
             results.append({"Symbol": sym, **res})
 
@@ -449,12 +460,11 @@ div[data-testid="stMetricValue"] { color:#00b4d8; font-size:1.4rem; }
 
 st.title("📈 NSE Master Scanner Pro  [Phase Engine v5]")
 
-# ── Session state ────────────────────────────────────────────────
 for key, default in [("results",[]),("scan_time",None),("rejected",0),("scan_mode","Swing")]:
     if key not in st.session_state:
         st.session_state[key] = default
 
-# ── Controls (mode must be selected BEFORE fetching indices) ─────
+# ── Controls ─────────────────────────────────────────────────────
 c1, c2, c3, c4, c5, c6 = st.columns([2,1,1,2,2,2])
 with c1:
     index_opt = st.selectbox("Index", list(SECTORS.keys()), label_visibility="collapsed")
@@ -464,10 +474,10 @@ with c2:
 # ── Nifty & Sensex (mode-aware) ───────────────────────────────────
 @st.cache_data(ttl=300)
 def fetch_indices(mode="Swing"):
-    cfg    = MODE_CFG[mode]
-    ema_f  = cfg["ema_fast"]
-    ema_s  = cfg["ema_slow"]
-    rsi_l  = cfg["rsi_len"]
+    cfg      = MODE_CFG[mode]
+    ema_f    = cfg["ema_fast"]
+    ema_s    = cfg["ema_slow"]
+    rsi_l    = cfg["rsi_len"]
     min_bars = 30 if mode == "Intraday" else 50
     out = {}
     for name, ticker in [("Nifty 50","^NSEI"),("Sensex","^BSESN")]:
@@ -500,7 +510,7 @@ def fetch_indices(mode="Swing"):
                          "trend":"↑ Above EMAs" if trend_up else "↓ Below EMAs",
                          "interval": interval_label,
                          "ema_fast": ema_f, "ema_slow": ema_s}
-        except:
+        except Exception:
             out[name] = None
     return out
 
@@ -532,8 +542,10 @@ for col, name in zip([ic1,ic2],["Nifty 50","Sensex"]):
                 f'</div>', unsafe_allow_html=True)
         else:
             st.markdown(f"**{name}:** unavailable")
+# FIX-2: caption now accurately says 5 min
 with ic3:
     st.caption(f"📡 Index data matches selected mode ({mode_opt}). Auto-refreshes every 5 min.")
+
 with c3:
     scan_btn = st.button("🔍 SCAN", type="primary", use_container_width=True)
 with c4:
@@ -547,21 +559,27 @@ with c5:
 with c6:
     search_q = st.text_input("Search", placeholder="e.g. RELIANCE", label_visibility="collapsed")
 
-# Mode badge row
+# Mode badge
 mc = {"Intraday":"#e67e22","Swing":"#27ae60","Positional":"#2980b9"}
 mi = {"Intraday":"⚡","Swing":"📈","Positional":"🧘"}
 cfg_cur = MODE_CFG[mode_opt]
 interval_label = {"5m":"5min candles","1d":"Daily candles","1wk":"Weekly candles"}.get(cfg_cur["interval"], cfg_cur["interval"])
-last_info = (f"&nbsp;&nbsp;<span style='color:#7a7a9a;font-size:11px;'>"
-             f"{st.session_state.scan_time} · Rejected: {st.session_state.rejected}</span>"
-             if st.session_state.scan_time else "")
+last_info = (
+    f"&nbsp;&nbsp;<span style='color:#7a7a9a;font-size:11px;'>"
+    f"{st.session_state.scan_time} · Rejected: {st.session_state.rejected}</span>"
+    if st.session_state.scan_time else ""
+)
+intraday_note = (
+    " &nbsp;<span style='color:#e67e22;font-size:10px;'>HTF momentum via daily data</span>"
+    if mode_opt == "Intraday" else ""
+)
 st.markdown(
     f'<div style="margin-bottom:8px;">'
     f'<span style="background:{mc.get(mode_opt,"#555")};color:#fff;'
     f'padding:3px 12px;border-radius:12px;font-size:12px;font-weight:bold;">'
     f'{mi.get(mode_opt,"")} {mode_opt} · {interval_label} · '
     f'EMA{cfg_cur["ema_fast"]}/{cfg_cur["ema_slow"]}'
-    f'</span>{last_info}</div>',
+    f'</span>{intraday_note}{last_info}</div>',
     unsafe_allow_html=True)
 
 # ── Scan ─────────────────────────────────────────────────────────
@@ -596,28 +614,23 @@ if phase_filter != "All Phases":
 if search_q:
     results = [r for r in results if search_q.upper() in r["Symbol"]]
 
-# ── Top 15 ───────────────────────────────────────────────────────
+# ── Top cards ────────────────────────────────────────────────────
 if st.session_state.results:
     all_results = st.session_state.results
-
-    # Actionable = phase is ENTRY, CONT, or BREAKOUT + BUY/STRONG BUY action
     ACTIONABLE_PHASES = {PHASE_ENTRY, PHASE_CONT, PHASE_BRK}
     actionable = [
         r for r in all_results
-        if r.get("Phase") in ACTIONABLE_PHASES
-        and r["Action"] in ("BUY", "STRONG BUY")
+        if r.get("Phase") in ACTIONABLE_PHASES and r["Action"] in ("BUY","STRONG BUY")
     ]
-    # Sort actionable: BREAKOUT first, then by score
     phase_rank = {PHASE_BRK: 0, PHASE_CONT: 1, PHASE_ENTRY: 2}
     actionable.sort(key=lambda x: (phase_rank.get(x.get("Phase"), 9), -x["Score"]))
     top_act = actionable[:15]
 
-    # Watch list = high score but SETUP or IDLE — not ready yet
     watchlist = [
         r for r in all_results
         if r.get("Phase") in (PHASE_SETUP, PHASE_IDLE)
         and r["Score"] >= 70
-        and r["Action"] in ("BUY", "STRONG BUY")
+        and r["Action"] in ("BUY","STRONG BUY")
     ][:10]
 
     def make_card(i, r, border_color, show_entry=True):
@@ -653,7 +666,7 @@ if st.session_state.results:
             cards += '</div>'
             st.markdown(cards, unsafe_allow_html=True)
     else:
-        st.info("No stocks in ENTRY / CONT / BREAKOUT phase right now. Check SETUP watchlist below.")
+        st.info("No stocks in ENTRY / CONT / BREAKOUT phase right now.")
 
     if watchlist:
         with st.expander("👁 WATCHLIST — High Score but Not Yet Ready (SETUP / IDLE)", expanded=False):
@@ -722,17 +735,15 @@ if results:
         r = next((x for x in results if x["Symbol"]==sel), None)
         if r:
             phase = r.get("Phase", PHASE_IDLE)
-            pc    = PHASE_COLORS.get(phase,"#555")
             chg   = r["%Change"]
 
-            # Phase state machine display
             phases_order = [PHASE_IDLE, PHASE_SETUP, PHASE_ENTRY, PHASE_CONT, PHASE_BRK, PHASE_EXIT]
             phase_html = '<div style="display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap;">'
             for ph in phases_order:
                 active = ph == phase
-                bg = PHASE_COLORS[ph] if active else "#1c1c36"
+                bg     = PHASE_COLORS[ph] if active else "#1c1c36"
                 border = f"2px solid {PHASE_COLORS[ph]}" if active else "2px solid #333"
-                fw = "bold" if active else "normal"
+                fw     = "bold" if active else "normal"
                 phase_html += (
                     f'<div style="background:{bg};border:{border};color:#fff;'
                     f'padding:5px 12px;border-radius:6px;font-size:12px;font-weight:{fw};">'
@@ -742,10 +753,10 @@ if results:
             st.markdown(phase_html, unsafe_allow_html=True)
 
             d1,d2,d3,d4 = st.columns(4)
-            d1.metric("LTP",        fmt(r["LTP"]),  f"{'+' if chg>=0 else ''}{chg}%")
-            d2.metric("Entry ⚡",   fmt(r["Entry"]))
-            d3.metric("Stop Loss",  fmt(r["SL"]))
-            d4.metric("Score",      r["Score"])
+            d1.metric("LTP",       fmt(r["LTP"]),  f"{'+' if chg>=0 else ''}{chg}%")
+            d2.metric("Entry ⚡",  fmt(r["Entry"]))
+            d3.metric("Stop Loss", fmt(r["SL"]))
+            d4.metric("Score",     r["Score"])
 
             t1c,t2c,t3c = st.columns(3)
             t1c.metric("T1 (+1R)", fmt(r["T1"]))
@@ -757,10 +768,11 @@ if results:
                 f'**Golden Zone:** {"🌟 Yes — price in 61.8%–50% fib zone" if r.get("InGolden") else "No"}'
             )
             if r["Entry"] != r["LTP"]:
-                st.info(f"⚡ Entry ₹{r['Entry']:,} is the signal trigger price. "
-                        f"Current LTP is ₹{r['LTP']:,}. "
-                        f"Place order near Entry when phase reaches ENTRY or BREAKOUT.")
-
+                st.info(
+                    f"⚡ Entry ₹{r['Entry']:,} is the signal trigger price. "
+                    f"Current LTP is ₹{r['LTP']:,}. "
+                    f"Place order near Entry when phase reaches ENTRY or BREAKOUT."
+                )
 else:
     if not st.session_state.results:
         st.info("👆 Select **Index** + **Mode**, then press **SCAN** to begin.")
