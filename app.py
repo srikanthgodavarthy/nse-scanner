@@ -73,30 +73,73 @@ def atr_series(df, p=14):
     return tr.ewm(alpha=1/p, adjust=False).mean()
 
 def fib_levels(df, lookback=30):
-    sw_hi = df["High"].iloc[-lookback:].max()
-    sw_lo = df["Low"].iloc[-lookback:].min()
+    """Fib retracement + extensions from swing hi/lo over lookback bars (uses High/Low like Pine)."""
+    sw_hi = float(df["High"].iloc[-lookback:].max())
+    sw_lo = float(df["Low"].iloc[-lookback:].min())
     rng   = sw_hi - sw_lo
     if rng == 0:
         return sw_hi, sw_lo, {}, rng
     return sw_hi, sw_lo, {
-        "236": sw_hi - rng*0.236, "382": sw_hi - rng*0.382,
-        "500": sw_hi - rng*0.500, "618": sw_hi - rng*0.618,
-        "786": sw_hi - rng*0.786,
-        "ext127": sw_hi + rng*0.272, "ext161": sw_hi + rng*0.618,
-        "ext261": sw_hi + rng*1.618,
+        "236":    sw_hi - rng * 0.236,
+        "382":    sw_hi - rng * 0.382,
+        "500":    sw_hi - rng * 0.500,
+        "618":    sw_hi - rng * 0.618,
+        "786":    sw_hi - rng * 0.786,
+        "ext127": sw_hi + rng * 0.272,   # 127.2% extension
+        "ext161": sw_hi + rng * 0.618,   # 161.8% extension
+        "ext261": sw_hi + rng * 1.618,   # 261.8% extension
     }, rng
 
-# ── Phase detection ───────────────────────────────────────────────
+def _compute_targets(entry, sl, atr_val, fib, setup_type, sw_hi, sw_lo):
+    """
+    Pine Script target engine — mode-aware by setup type.
+    setup_type: 'fib' | 'breakout' | 'norm'
+    """
+    rk = max(entry - sl, atr_val * 0.5)  # minimum 0.5×ATR risk
+
+    if setup_type == "fib" and fib:
+        # Pine STYPE_FIB: T1=ext127, T2=ext161, T3=ext161 + min(range, 3×ATR)
+        t1 = round(fib["ext127"], 2)
+        t2 = round(fib["ext161"], 2)
+        ext_range = fib["ext161"] - fib["ext127"]
+        t3 = round(fib["ext161"] + min(ext_range, atr_val * 3), 2)
+
+    elif setup_type == "breakout" and fib:
+        # Breakout: blended — avg of ATR-based and Fib extensions
+        t1 = round((entry + rk      + fib["ext127"]) / 2, 2)
+        t2 = round((entry + rk * 2  + fib["ext161"]) / 2, 2)
+        t3 = round((entry + rk * 3  + fib["ext261"]) / 2, 2)
+
+    else:
+        # Pure ATR (norm / no fib available)
+        t1 = round(entry + rk, 2)
+        t2 = round(entry + rk * 2, 2)
+        t3 = round(entry + rk * 3, 2)
+
+    # Safety: ensure targets never collapse below entry
+    min_move = atr_val * 0.8
+    if t1 - entry < min_move:
+        t1 = round(entry + min_move, 2)
+        t2 = round(entry + min_move * 2, 2)
+        t3 = round(entry + min_move * 3, 2)
+
+    return t1, t2, t3
+
+# ── Phase detection (Pine-accurate) ──────────────────────────────
 def detect_phase_and_entry(df, mode="Swing"):
-    cfg = MODE_CFG[mode]
+    cfg    = MODE_CFG[mode]
     close  = df["Close"]
+    high   = df["High"]
+    low    = df["Low"]
     volume = df["Volume"]
-    n = len(close)
+    n      = len(close)
     if n < 60:
-        return PHASE_IDLE, None
+        return PHASE_IDLE, None, "norm"
 
     c       = float(close.iloc[-1])
-    atr_val = float(atr_series(df).iloc[-1])
+    atr_s   = atr_series(df)
+    atr_val = float(atr_s.iloc[-1])
+    atr_mean= float(atr_s.rolling(20).mean().iloc[-1])
     e_fast  = ema(close, cfg["ema_fast"])
     e_slow  = ema(close, cfg["ema_slow"])
     e20v    = float(e_fast.iloc[-1])
@@ -107,9 +150,26 @@ def detect_phase_and_entry(df, mode="Swing"):
     v       = float(volume.iloc[-1])
     hh      = float(close.iloc[-11:-1].max())
 
-    trend_up   = c > e200v and c > e20v and e20v > e50v
-    trend_down = c < e200v and c < e20v and e20v < e50v
+    trend_up     = c > e200v and c > e20v and e20v > e50v
+    trend_down   = c < e200v and c < e20v and e20v < e50v
     trend_strong = c > e20v and e20v > e50v
+
+    # Pine uses i_brkLB=5 for lookback on highs (not closes)
+    brk_lb   = 5
+    rolling_hi_brk = float(high.iloc[-brk_lb-1:-1].max()) if n > brk_lb+1 else hh
+    buf      = atr_val * 0.2
+
+    # Pine compression + expansion checks
+    is_compressed = atr_val < atr_mean * 0.8          # ATR < 80% of 20-bar mean
+    is_expanding  = atr_val > float(atr_s.iloc[-2])   # ATR growing
+
+    # Wick exhaustion filter (Pine: upperWick > body × 1.5 and close < high)
+    body       = abs(float(close.iloc[-1]) - float(df["Open"].iloc[-1])) if "Open" in df.columns else atr_val * 0.3
+    upper_wick = float(high.iloc[-1]) - max(float(close.iloc[-1]), float(df["Open"].iloc[-1])) if "Open" in df.columns else 0
+    is_exhaustion = upper_wick > body * 1.5
+
+    # Volume spike
+    vol_spike = v > vol_avg * 1.3
 
     sw_hi, sw_lo, fib, fib_rng = fib_levels(df, lookback=30)
     prox      = atr_val * 0.3
@@ -136,64 +196,81 @@ def detect_phase_and_entry(df, mode="Swing"):
     elif near_e161: bull -= 30
     norm_bull = min(100, bull * 100 / 155)
 
-    score_th    = cfg["score_th"]
-    is_fib_buy  = trend_up and in_golden
-    is_norm_buy = trend_up and norm_bull >= score_th
+    score_th   = cfg["score_th"]
+    is_fib_buy = trend_up and in_golden
 
-    # Breakout check
-    lookback_brk = 5
-    rolling_hi   = float(close.iloc[-lookback_brk-1:-1].max()) if n > lookback_brk+1 else hh
-    buf          = atr_val * 0.2
-    is_breakout  = c > rolling_hi + buf and v > vol_avg * 1.3
+    # ── Pine-accurate breakout (smartBreakout) ────────────────────
+    # qualifiedStock AND isBreakout AND trendUp AND normBull>=th
+    # AND isCompressed[1] AND isExpanding AND volSpike AND NOT isExhaustion
+    is_breakout = (
+        qualified and
+        c > rolling_hi_brk + buf and     # close breaks above 5-bar high+buffer
+        trend_up and
+        norm_bull >= score_th and
+        is_compressed and                  # was in consolidation
+        is_expanding and                   # ATR now expanding
+        vol_spike and                      # volume confirmation
+        not is_exhaustion                  # no wick exhaustion
+    )
 
-    # Continuation
-    is_cont = (c > float(close.iloc[-4:-1].max())) and (v > vol_avg) and trend_strong
+    # Continuation: close > 3-bar high, volume > avg, trend intact
+    is_cont = (
+        c > float(close.iloc[-4:-1].max()) and
+        v > vol_avg and
+        trend_strong
+    )
 
-    # Exit
-    ema_down   = e20v < e50v
-    trail_level= float(close.iloc[-10:].max()) - atr_val * 1.5
-    trail_break= c < trail_level
+    # Exit conditions
+    ema_down    = e20v < e50v and float(e_fast.iloc[-4]) < float(e_slow.iloc[-4])
+    trail_level = float(close.iloc[-10:].max()) - atr_val * 1.5
+    trail_break = c < trail_level
 
     if not qualified:
-        return PHASE_IDLE, None
+        return PHASE_IDLE, None, "norm"
 
-    # Phase priority
+    # ── Phase priority (mirrors Pine state machine) ───────────────
     if trend_down and ema_down:
         phase = PHASE_EXIT
-    elif is_breakout and trend_up and norm_bull >= score_th:
+        setup_type = "norm"
+    elif is_breakout:
         phase = PHASE_BRK
-    elif (is_fib_buy or is_norm_buy) and is_cont:
+        setup_type = "breakout"
+    elif (is_fib_buy or norm_bull >= score_th) and is_cont and trend_up:
         phase = PHASE_CONT
-    elif (is_fib_buy or is_norm_buy) and norm_bull >= score_th:
+        setup_type = "fib" if is_fib_buy else "norm"
+    elif (is_fib_buy or norm_bull >= score_th) and trend_up:
         phase = PHASE_ENTRY
-    elif (is_fib_buy or is_norm_buy) and norm_bull >= score_th * 0.85:
+        setup_type = "fib" if is_fib_buy else "norm"
+    elif (is_fib_buy or norm_bull >= score_th * 0.85) and trend_up:
         phase = PHASE_SETUP
+        setup_type = "fib" if is_fib_buy else "norm"
     elif trail_break and trend_up:
         phase = PHASE_EXIT
+        setup_type = "norm"
     else:
         phase = PHASE_IDLE
+        setup_type = "norm"
 
-    # Entry price = actual trigger level
+    # ── Entry price = actual signal trigger level ─────────────────
     entry_price = None
     if phase in (PHASE_ENTRY, PHASE_CONT, PHASE_BRK, PHASE_SETUP):
         if is_breakout:
-            # Entry at breakout level
-            entry_price = round(rolling_hi + buf, 2)
+            # Pine: entry at close of breakout bar (which already broke rolling_hi + buf)
+            entry_price = round(rolling_hi_brk + buf, 2)
         elif is_fib_buy and fib:
-            # Entry at top of golden zone (61.8% + small buffer)
-            entry_price = round(fib["618"] + prox * 0.5, 2)
+            # Pine: entry at top of golden zone (61.8% level + tiny buffer)
+            entry_price = round(fib["618"] + prox * 0.3, 2)
         else:
-            # Entry at EMA fast cross point — walk back to find last cross
-            cross = (close > e_fast)
-            prev_cross = cross.shift(1).fillna(False)
-            signal_bars = cross & ~prev_cross
+            # Entry at last EMA fast crossover bar
+            cross       = close > e_fast
+            signal_bars = cross & ~cross.shift(1).fillna(False)
             if signal_bars.any():
-                last_signal_idx = signal_bars[::-1].idxmax()
-                entry_price = round(float(close[last_signal_idx]), 2)
+                last_idx    = signal_bars[::-1].idxmax()
+                entry_price = round(float(close[last_idx]), 2)
             else:
                 entry_price = round(c, 2)
 
-    return phase, entry_price
+    return phase, entry_price, setup_type
 
 # ── Full stock scoring ────────────────────────────────────────────
 def score_stock(df, nifty_close, mode="Swing"):
@@ -256,34 +333,50 @@ def score_stock(df, nifty_close, mode="Swing"):
             if s >= 60:  return "WATCH"
             return "SKIP"
 
-        phase, entry_price = detect_phase_and_entry(df, mode)
+        phase, entry_price, setup_type = detect_phase_and_entry(df, mode)
         ltp   = round(c, 2)
         entry = entry_price if entry_price else ltp
 
+        # ── SL (Pine-accurate, mode-aware) ────────────────────────
         mult   = cfg["atr_mult"]
         wide   = cfg["atr_wide"]
         maxm   = cfg["atr_max"]
-        raw_sl = entry - atr_val * mult
-        min_sl = entry - atr_val * wide
-        max_sl = entry - atr_val * maxm
-        sl  = round(max(min_sl, min(raw_sl, max_sl)), 2)
-        rk  = max(entry - sl, atr_val * 0.5)
-        t1  = round(entry + rk, 2)
-        t2  = round(entry + rk * 2, 2)
-        t3  = round(entry + rk * 3, 2)
+
+        if setup_type == "fib" and fib:
+            # Pine STYPE_FIB: SL below swing low or 61.8% - 0.5×ATR
+            fib_sl = min(float(sw_lo), fib["618"] - atr_val * 0.5)
+            fib_sl = min(fib_sl, entry - atr_val * 0.8)
+            sl = round(fib_sl, 2)
+        elif setup_type == "breakout":
+            # Breakout SL: tighter — entry - 1.5×ATR (Pine breakout SL)
+            sl = round(entry - atr_val * (1.5 if mode == "Intraday" else 2.0), 2)
+        else:
+            raw_sl = entry - atr_val * mult
+            min_sl = entry - atr_val * wide
+            max_sl = entry - atr_val * maxm
+            sl = round(max(min_sl, min(raw_sl, max_sl)), 2)
+
+        # Minimum risk floor
+        min_risk = atr_val * 0.5
+        if entry - sl < min_risk:
+            sl = round(entry - min_risk, 2)
+
+        # ── Targets (Pine-accurate, setup-aware) ──────────────────
+        t1, t2, t3 = _compute_targets(entry, sl, atr_val, fib, setup_type, sw_hi, sw_lo)
 
         return {
-            "Score":    score,
-            "Action":   action_label(score),
-            "Phase":    phase,
-            "%Change":  chg,
-            "LTP":      ltp,
-            "Entry":    entry,
-            "SL":       sl,
-            "T1":       t1,
-            "T2":       t2,
-            "T3":       t3,
-            "InGolden": in_golden,
+            "Score":     score,
+            "Action":    action_label(score),
+            "Phase":     phase,
+            "Setup":     setup_type,
+            "%Change":   chg,
+            "LTP":       ltp,
+            "Entry":     entry,
+            "SL":        sl,
+            "T1":        t1,
+            "T2":        t2,
+            "T3":        t3,
+            "InGolden":  in_golden,
         }
     except Exception:
         return None
@@ -356,40 +449,62 @@ div[data-testid="stMetricValue"] { color:#00b4d8; font-size:1.4rem; }
 
 st.title("📈 NSE Master Scanner Pro  [Phase Engine v5]")
 
-# ── Nifty & Sensex ───────────────────────────────────────────────
+# ── Session state ────────────────────────────────────────────────
+for key, default in [("results",[]),("scan_time",None),("rejected",0),("scan_mode","Swing")]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# ── Controls (mode must be selected BEFORE fetching indices) ─────
+c1, c2, c3, c4, c5, c6 = st.columns([2,1,1,2,2,2])
+with c1:
+    index_opt = st.selectbox("Index", list(SECTORS.keys()), label_visibility="collapsed")
+with c2:
+    mode_opt = st.selectbox("Mode", ["Swing","Intraday","Positional"], label_visibility="collapsed")
+
+# ── Nifty & Sensex (mode-aware) ───────────────────────────────────
 @st.cache_data(ttl=300)
-def fetch_indices():
+def fetch_indices(mode="Swing"):
+    cfg    = MODE_CFG[mode]
+    ema_f  = cfg["ema_fast"]
+    ema_s  = cfg["ema_slow"]
+    rsi_l  = cfg["rsi_len"]
+    min_bars = 30 if mode == "Intraday" else 50
     out = {}
     for name, ticker in [("Nifty 50","^NSEI"),("Sensex","^BSESN")]:
         try:
-            df = yf.download(ticker, period="1y", interval="1d", progress=False)
+            df = yf.download(ticker, period=cfg["period"], interval=cfg["interval"], progress=False)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             df = df.dropna()
-            if len(df) < 50: out[name]=None; continue
+            if len(df) < min_bars: out[name]=None; continue
             close = df["Close"]
             c, prev = float(close.iloc[-1]), float(close.iloc[-2])
             chg, pct = c-prev, (c-prev)/prev*100
-            e20v = float(ema(close,20).iloc[-1])
-            e50v = float(ema(close,50).iloc[-1])
-            r    = float(rsi(close).iloc[-1])
+            ef   = float(ema(close, ema_f).iloc[-1])
+            es   = float(ema(close, ema_s).iloc[-1])
+            e200 = float(ema(close, 200).iloc[-1]) if len(close)>=200 else es
+            r    = float(rsi(close, rsi_l).iloc[-1])
             hh   = float(close.iloc[-11:-1].max())
-            trend_up = c > e20v and e20v > e50v
+            trend_up = c > e200 and c > ef and ef > es
             bull  = 0
             bull += 25 if trend_up else 0
-            bull += 30 if e20v > e50v else 0
-            bull += 25 if r>=60 else (15 if r>=50 else 0)
-            bull += 25 if c>hh else 0
+            bull += 30 if ef > es else (20 if ef > es*0.995 else 0)
+            bull += (25 if r>=65 else 20) if r>=60 else (10 if r>50 else 0)
+            bull += 25 if c>hh else (15 if c>hh*0.98 else 0)
             if len(close)>=3 and c>float(close.iloc[-3]): bull+=10
             score  = bull
             action = "STRONG BUY" if score>=100 else ("BUY" if score>=80 else ("WATCH" if score>=60 else "SKIP"))
+            interval_label = {"5m":"5min","1d":"Daily","1wk":"Weekly"}.get(cfg["interval"], cfg["interval"])
             out[name] = {"value":c,"chg":chg,"pct":pct,"score":score,"action":action,
-                         "rsi":round(r,1),"trend":"↑ Above EMAs" if trend_up else "↓ Below EMAs"}
+                         "rsi":round(r,1),
+                         "trend":"↑ Above EMAs" if trend_up else "↓ Below EMAs",
+                         "interval": interval_label,
+                         "ema_fast": ema_f, "ema_slow": ema_s}
         except:
             out[name] = None
     return out
 
-indices = fetch_indices()
+indices = fetch_indices(mode_opt)
 ic1, ic2, ic3 = st.columns([2,2,6])
 for col, name in zip([ic1,ic2],["Nifty 50","Sensex"]):
     d = indices.get(name)
@@ -403,7 +518,9 @@ for col, name in zip([ic1,ic2],["Nifty 50","Sensex"]):
             sp = min(int(d["score"]/150*100),100)
             st.markdown(
                 f'<div style="background:#12122a;border:1px solid #1c1c36;border-radius:10px;padding:12px 16px;">'
-                f'<div style="color:#7a7a9a;font-size:11px;text-transform:uppercase;">{name}</div>'
+                f'<div style="color:#7a7a9a;font-size:11px;text-transform:uppercase;">'
+                f'{name} &nbsp;<span style="background:#1c1c36;padding:1px 6px;border-radius:3px;font-size:10px;">'
+                f'{d["interval"]} · EMA{d["ema_fast"]}/{d["ema_slow"]}</span></div>'
                 f'<div style="color:#f0f0f0;font-size:22px;font-weight:bold;">{d["value"]:,.1f}</div>'
                 f'<div style="color:{cc};font-size:13px;">{ar} {cs}</div>'
                 f'<div style="margin:8px 0 4px;background:#1c1c36;border-radius:4px;height:6px;">'
@@ -416,19 +533,7 @@ for col, name in zip([ic1,ic2],["Nifty 50","Sensex"]):
         else:
             st.markdown(f"**{name}:** unavailable")
 with ic3:
-    st.caption("📡 Auto-refreshes every 5 min.")
-
-# ── Session state ────────────────────────────────────────────────
-for key, default in [("results",[]),("scan_time",None),("rejected",0),("scan_mode","Swing")]:
-    if key not in st.session_state:
-        st.session_state[key] = default
-
-# ── Controls ─────────────────────────────────────────────────────
-c1, c2, c3, c4, c5, c6 = st.columns([2,1,1,2,2,2])
-with c1:
-    index_opt = st.selectbox("Index", list(SECTORS.keys()), label_visibility="collapsed")
-with c2:
-    mode_opt = st.selectbox("Mode", ["Swing","Intraday","Positional"], label_visibility="collapsed")
+    st.caption(f"📡 Index data matches selected mode ({mode_opt}). Auto-refreshes every 5 min.")
 with c3:
     scan_btn = st.button("🔍 SCAN", type="primary", use_container_width=True)
 with c4:
@@ -445,6 +550,8 @@ with c6:
 # Mode badge row
 mc = {"Intraday":"#e67e22","Swing":"#27ae60","Positional":"#2980b9"}
 mi = {"Intraday":"⚡","Swing":"📈","Positional":"🧘"}
+cfg_cur = MODE_CFG[mode_opt]
+interval_label = {"5m":"5min candles","1d":"Daily candles","1wk":"Weekly candles"}.get(cfg_cur["interval"], cfg_cur["interval"])
 last_info = (f"&nbsp;&nbsp;<span style='color:#7a7a9a;font-size:11px;'>"
              f"{st.session_state.scan_time} · Rejected: {st.session_state.rejected}</span>"
              if st.session_state.scan_time else "")
@@ -452,7 +559,9 @@ st.markdown(
     f'<div style="margin-bottom:8px;">'
     f'<span style="background:{mc.get(mode_opt,"#555")};color:#fff;'
     f'padding:3px 12px;border-radius:12px;font-size:12px;font-weight:bold;">'
-    f'{mi.get(mode_opt,"")} {mode_opt} Mode</span>{last_info}</div>',
+    f'{mi.get(mode_opt,"")} {mode_opt} · {interval_label} · '
+    f'EMA{cfg_cur["ema_fast"]}/{cfg_cur["ema_slow"]}'
+    f'</span>{last_info}</div>',
     unsafe_allow_html=True)
 
 # ── Scan ─────────────────────────────────────────────────────────
@@ -541,11 +650,13 @@ if results:
         chg   = r["%Change"]
         phase = r.get("Phase", PHASE_IDLE)
         entry_flag = " ⚡" if r["Entry"] != r["LTP"] else ""
+        setup_icon = {"fib":"🌀","breakout":"🚀","norm":"📊"}.get(r.get("Setup","norm"),"📊")
         rows.append({
             "#":       i+1,
             "Symbol":  r["Symbol"],
             "Score":   r["Score"],
             "Phase":   phase,
+            "Setup":   f'{setup_icon} {r.get("Setup","norm")}',
             "Action":  f"{action_icon(r['Action'])} {r['Action']}",
             "%Chg":    f"+{chg}%" if chg>=0 else f"{chg}%",
             "LTP":     fmt(r["LTP"]),
