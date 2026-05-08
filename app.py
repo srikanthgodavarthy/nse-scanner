@@ -598,31 +598,68 @@ if search_q:
 
 # ── Top 15 ───────────────────────────────────────────────────────
 if st.session_state.results:
-    top15 = [r for r in st.session_state.results if r["Score"] >= 70][:15]
-    if top15:
-        with st.expander("⭐ TOP 15 STRONG STOCKS", expanded=True):
+    all_results = st.session_state.results
+
+    # Actionable = phase is ENTRY, CONT, or BREAKOUT + BUY/STRONG BUY action
+    ACTIONABLE_PHASES = {PHASE_ENTRY, PHASE_CONT, PHASE_BRK}
+    actionable = [
+        r for r in all_results
+        if r.get("Phase") in ACTIONABLE_PHASES
+        and r["Action"] in ("BUY", "STRONG BUY")
+    ]
+    # Sort actionable: BREAKOUT first, then by score
+    phase_rank = {PHASE_BRK: 0, PHASE_CONT: 1, PHASE_ENTRY: 2}
+    actionable.sort(key=lambda x: (phase_rank.get(x.get("Phase"), 9), -x["Score"]))
+    top_act = actionable[:15]
+
+    # Watch list = high score but SETUP or IDLE — not ready yet
+    watchlist = [
+        r for r in all_results
+        if r.get("Phase") in (PHASE_SETUP, PHASE_IDLE)
+        and r["Score"] >= 70
+        and r["Action"] in ("BUY", "STRONG BUY")
+    ][:10]
+
+    def make_card(i, r, border_color, show_entry=True):
+        chg = r["%Change"]
+        cs  = f"+{chg}%" if chg>=0 else f"{chg}%"
+        cc  = "#2ecc71" if chg>=0 else "#e74c3c"
+        gl  = " 🌟" if r.get("InGolden") else ""
+        act = r["Action"]
+        ac  = "#ffd700" if act=="STRONG BUY" else "#2ecc71"
+        ph  = r.get("Phase", PHASE_IDLE)
+        pc  = PHASE_COLORS.get(ph, "#555")
+        st_icon = {"fib":"🌀","breakout":"🚀","norm":"📊"}.get(r.get("Setup","norm"),"📊")
+        entry_str = f'&#8377;{r["Entry"]:,}' if show_entry and r["Entry"] != r["LTP"] else ""
+        return (
+            f'<div style="background:#0a1a0a;border:1px solid {border_color};border-radius:8px;'
+            f'padding:10px 14px;min-width:140px;flex:1 1 140px;max-width:185px;">'
+            f'<div style="color:#f0f0f0;font-weight:bold;font-size:13px;">{i+1}. {r["Symbol"]}{gl}</div>'
+            f'<div style="color:{ac};font-size:11px;">{act} · Score {r["Score"]}</div>'
+            f'<div style="color:#f0f0f0;font-size:12px;">&#8377;{r["LTP"]:,} '
+            f'<span style="color:{cc}">{cs}</span></div>'
+            f'{"<div style=color:#aaa;font-size:11px;>⚡ Entry " + entry_str + "</div>" if entry_str else ""}'
+            f'<div style="margin-top:5px;display:flex;gap:4px;flex-wrap:wrap;">'
+            f'<span style="background:{pc};color:#fff;padding:1px 6px;border-radius:3px;font-size:10px;">{ph}</span>'
+            f'<span style="background:#1c1c36;color:#aaa;padding:1px 6px;border-radius:3px;font-size:10px;">{st_icon}</span>'
+            f'</div></div>'
+        )
+
+    if top_act:
+        with st.expander("🚀 READY TO TRADE — ENTRY / CONT / BREAKOUT", expanded=True):
             cards = '<div style="display:flex;flex-wrap:wrap;gap:8px;">'
-            for i, r in enumerate(top15):
-                chg = r["%Change"]
-                cs  = f"+{chg}%" if chg>=0 else f"{chg}%"
-                cc  = "#2ecc71" if chg>=0 else "#e74c3c"
-                gl  = " 🌟" if r.get("InGolden") else ""
-                act = r["Action"]
-                ac  = "#ffd700" if act=="STRONG BUY" else "#2ecc71"
-                ph  = r.get("Phase", PHASE_IDLE)
-                pc  = PHASE_COLORS.get(ph,"#555")
-                bg  = "#0a2e14" if r["Score"]>=100 else "#0d3d10"
-                cards += (
-                    f'<div style="background:{bg};border:1px solid #2ecc71;border-radius:8px;'
-                    f'padding:10px 14px;min-width:140px;flex:1 1 140px;max-width:185px;">'
-                    f'<div style="color:#f0f0f0;font-weight:bold;font-size:13px;">{i+1}. {r["Symbol"]}{gl}</div>'
-                    f'<div style="color:{ac};font-size:11px;">{act} · {r["Score"]}</div>'
-                    f'<div style="color:#f0f0f0;font-size:12px;">&#8377;{r["LTP"]:,} '
-                    f'<span style="color:{cc}">{cs}</span></div>'
-                    f'<div style="margin-top:4px;">'
-                    f'<span style="background:{pc};color:#fff;padding:1px 6px;border-radius:3px;font-size:10px;">{ph}</span>'
-                    f'</div></div>'
-                )
+            for i, r in enumerate(top_act):
+                cards += make_card(i, r, border_color="#00dd88", show_entry=True)
+            cards += '</div>'
+            st.markdown(cards, unsafe_allow_html=True)
+    else:
+        st.info("No stocks in ENTRY / CONT / BREAKOUT phase right now. Check SETUP watchlist below.")
+
+    if watchlist:
+        with st.expander("👁 WATCHLIST — High Score but Not Yet Ready (SETUP / IDLE)", expanded=False):
+            cards = '<div style="display:flex;flex-wrap:wrap;gap:8px;">'
+            for i, r in enumerate(watchlist):
+                cards += make_card(i, r, border_color="#b87333", show_entry=False)
             cards += '</div>'
             st.markdown(cards, unsafe_allow_html=True)
 
