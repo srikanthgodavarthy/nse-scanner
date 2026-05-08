@@ -579,9 +579,6 @@ for key, default in [("results",[]),("scan_time",None),("rejected",0),("scan_mod
     if key not in st.session_state:
         st.session_state[key] = default
 
-# ── Zerodha enctoken widget (one-time input, top of page) ─────────
-enctoken = _enctoken_widget()
-
 # ── Controls ─────────────────────────────────────────────────────
 c1, c2, c3, c4, c5, c6 = st.columns([2,1,1,2,2,2])
 with c1:
@@ -719,7 +716,9 @@ def _enctoken_widget():
                 st.rerun()
 
     return st.session_state.get("zd_enctoken", "")
-
+  
+# ── Zerodha enctoken widget (one-time input, top of page) ─────────
+enctoken = _enctoken_widget()
 
 # ── Options OI + Max Pain (NSE public API) ───────────────────────
 @st.cache_data(ttl=180)   # refresh every 3 min — OI data is near-real-time
