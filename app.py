@@ -9,6 +9,7 @@ Fixes applied:
   FIX-4: EMA/RSI/ATR computed once in score_stock, passed into detect_phase
   FIX-5: Fib SL uses max() not min() — was giving absurdly wide stops
   FIX-6: detect_phase receives pre-computed norm_bull so phase & action use identical inputs
+  FIX-7: _enctoken_widget defined before it is called (NameError fix)
 """
 
 import warnings
@@ -123,8 +124,6 @@ def _compute_targets(entry, sl, atr_val, fib, setup_type, sw_hi, sw_lo):
     return t1, t2, t3
 
 # ── FIX-3: Intraday daily context fetch ─────────────────────────
-# Momentum (1M/3M/6M) is meaningless on 5-min bars with daily thresholds.
-# For Intraday scans we fetch a small daily slice just for HTF momentum.
 @st.cache_data(ttl=900)
 def _fetch_daily_close(ticker):
     """Fetch 6 months of daily closes for HTF momentum — used by Intraday mode only."""
@@ -138,15 +137,12 @@ def _fetch_daily_close(ticker):
         return pd.Series(dtype=float)
 
 # ── FIX-4/6: detect_phase accepts pre-computed indicators ────────
-# score_stock computes everything once and passes it in.
-# This eliminates the double-EMA recalculation and ensures phase
-# and action score use identical norm_bull values.
 def detect_phase_and_entry(
     df, mode, *,
     c, e_fast_s, e_slow_s, atr_s, atr_val, atr_mean,
     v, vol_avg, fib, sw_hi, sw_lo, in_golden, near_e127, near_e161,
     norm_bull, trend_up, trend_down, trend_strong, score_th,
-    vdu_setup=False,   # Volume Dry-Up coil — enables early SETUP promotion
+    vdu_setup=False,
 ):
     cfg  = MODE_CFG[mode]
     close = df["Close"]
@@ -178,10 +174,6 @@ def detect_phase_and_entry(
 
     is_fib_buy = trend_up and in_golden
 
-    # ── Breakout confidence (weighted, not hard boolean) ──────────
-    # Each condition contributes a weight; breakout triggers when
-    # confidence >= BRK_CONF_MIN (0.65).  This avoids missing genuine
-    # breakouts that fail one minor condition (e.g. slight vol miss).
     BRK_CONF_MIN = 0.65
     brk_weights = {
         "price_above_high": (0.30, c > rolling_hi_brk + buf),
@@ -192,7 +184,6 @@ def detect_phase_and_entry(
         "vol_spike":        (0.10, vol_spike),
     }
     brk_confidence = sum(w for w, cond in brk_weights.values() if cond)
-    # exhaustion always vetoes — long upper wick on breakout bar = trap
     is_breakout = brk_confidence >= BRK_CONF_MIN and not is_exhaustion
 
     is_cont = (
@@ -205,7 +196,6 @@ def detect_phase_and_entry(
     trail_level = float(close.iloc[-10:].max()) - atr_val * 1.5
     trail_break = c < trail_level
 
-    # ── Phase priority ────────────────────────────────────────────
     if trend_down and ema_down:
         phase = PHASE_EXIT
         setup_type = "norm"
@@ -219,8 +209,6 @@ def detect_phase_and_entry(
         phase = PHASE_ENTRY
         setup_type = "fib" if is_fib_buy else "norm"
     elif (is_fib_buy or norm_bull >= score_th * 0.85 or vdu_setup) and trend_up:
-        # VDU (volume dry-up coil) surfaces the stock early as SETUP
-        # so traders can prepare an order before the expansion bar arrives.
         phase = PHASE_SETUP
         setup_type = "fib" if is_fib_buy else ("vdu" if vdu_setup else "norm")
     elif trail_break and trend_up:
@@ -230,7 +218,6 @@ def detect_phase_and_entry(
         phase = PHASE_IDLE
         setup_type = "norm"
 
-    # ── Entry price ───────────────────────────────────────────────
     entry_price = None
     if phase in (PHASE_ENTRY, PHASE_CONT, PHASE_BRK, PHASE_SETUP):
         prox = atr_val * 0.3
@@ -252,10 +239,6 @@ def detect_phase_and_entry(
 
 # ── Full stock scoring ────────────────────────────────────────────
 def score_stock(df, nifty_close, mode="Swing", daily_close=None):
-    """
-    daily_close: pre-fetched daily Close series (only used when mode==Intraday
-                 to compute HTF momentum on proper daily bars).
-    """
     try:
         cfg    = MODE_CFG[mode]
         close  = df["Close"]
@@ -266,7 +249,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None):
 
         c       = float(close.iloc[-1])
         prev    = float(close.iloc[-2])
-        # FIX-4: compute indicators once
         e_fast_s = ema(close, cfg["ema_fast"])
         e_slow_s = ema(close, cfg["ema_slow"])
         e20      = float(e_fast_s.iloc[-1])
@@ -289,7 +271,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None):
         trend_down   = (e200 is None or c < e200) and c < e20 and e20 < e50
         trend_strong = c > e20 and e20 > e50
 
-        # FIX-3: use daily_close for HTF momentum when in Intraday mode
         mom_src = daily_close if (mode == "Intraday" and daily_close is not None and len(daily_close) >= 21) else close
         mom_n   = len(mom_src)
         mom1 = (c - float(mom_src.iloc[-21]))  / float(mom_src.iloc[-21])  * 100 if mom_n >= 21  else 0
@@ -303,7 +284,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None):
         near_e127 = bool(fib and abs(c - fib["ext127"]) < prox)
         near_e161 = bool(fib and abs(c - fib["ext161"]) < prox)
 
-        # ── Volume Dry-Up (VDU) Detection ─────────────────────────────
         VDU_VOL_RATIO  = 0.70
         VDU_RANGE_MULT = 0.80
         vdu_vol_dry = False
@@ -317,49 +297,29 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None):
             vdu_coil  = (recent_hi - recent_lo) < atr_val * VDU_RANGE_MULT
         vdu_setup = bool(trend_up and vdu_vol_dry and vdu_coil)
 
-        # FIX-1: Positional qualified — penalty instead of hard gate
-        # Previously: if not qualified: return PHASE_IDLE, None, "norm"  ← killed all Positional results
-        # Now: score is penalised for unqualified stocks but they still appear
         qualified = strong_htf and trend_strong
 
-        # ── Bull score (max possible = 155 raw, maps to 100 norm) ───
-        # Each component is capped so no single factor can inflate the total.
-        # Weights: trend(25) + ema_align(20) + rsi(20) + volume(15) + price_vs_hh(20)
-        #        + short_momentum(10) + rel_strength(10) + htf/qualified(20)
-        #        + fib_golden(15) — penalties applied last.
-        # True reachable max without fib/penalties ≈ 140; with golden = 155.
         bull = 0
         bull += 25 if trend_up else 0
-        # EMA alignment — cap at 20 (was 30, caused inflation)
         bull += 20 if e20 > e50 else (10 if e20 > e50 * 0.995 else 0)
-        # RSI contribution — cap at 20
         bull += (20 if r >= 65 else 15) if r >= 60 else (8 if r > 50 else 0)
-        # Volume — cap at 15
         bull += 15 if v > vol_avg * 1.2 else (8 if v > vol_avg else 0)
-        # Price vs recent high — cap at 20
         bull += 20 if c > hh else (12 if c > hh * 0.98 else 0)
-        # Short-term momentum (3-bar)
         if n >= 3 and c > float(close.iloc[-3]):
             bull += 10
-        # Relative strength vs Nifty — cap at 10
         bull += 10 if rs > 0 else (3 if rs > -0.5 else 0)
-        # HTF / qualification bonus — FIX-1: penalty instead of hard gate
         if mode == "Positional":
             bull += 20 if qualified else -15
         else:
             bull += 20 if strong_htf else -10
-        # Fib golden zone bonus — reduced from 30 → 15 to prevent runaway scores
         bull += 15 if in_golden else 0
-        # Extension penalties (unchanged)
         if near_e127:
             bull -= 20
         elif near_e161:
             bull -= 30
 
-        # True theoretical max = 25+20+20+15+20+10+10+20+15 = 155
-        # norm_bull: 0-100 scale used by phase thresholds
         BULL_MAX  = 155
-        score     = max(0, bull)          # floor at 0 for display sanity
+        score     = max(0, bull)
         norm_bull = min(100.0, max(0.0, bull * 100 / BULL_MAX))
         score_th  = cfg["score_th"]
 
@@ -369,7 +329,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None):
             if s >= 60:  return "WATCH"
             return "SKIP"
 
-        # FIX-4/6: pass pre-computed values — no recalculation inside detect_phase
         phase, entry_price, setup_type = detect_phase_and_entry(
             df, mode,
             c=c, e_fast_s=e_fast_s, e_slow_s=e_slow_s,
@@ -385,14 +344,11 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None):
         ltp   = round(c, 2)
         entry = entry_price if entry_price else ltp
 
-        # ── SL (FIX-5: use max() not min() for fib SL) ───────────
         mult = cfg["atr_mult"]
         wide = cfg["atr_wide"]
         maxm = cfg["atr_max"]
 
         if setup_type == "fib" and fib:
-            # Pine: SL = tightest of (swing low, 61.8% - 0.5×ATR, entry - 0.8×ATR)
-            # FIX-5: was min() which picked the widest/lowest — should be max() for tightest
             fib_sl = max(float(sw_lo), fib["618"] - atr_val * 0.5)
             fib_sl = max(fib_sl, entry - atr_val * 0.8)
             sl = round(fib_sl, 2)
@@ -423,7 +379,7 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None):
             "T2":       t2,
             "T3":       t3,
             "InGolden": in_golden,
-            "VDU":      vdu_setup,        # Volume Dry-Up coil detected
+            "VDU":      vdu_setup,
         }
     except Exception:
         return None
@@ -436,12 +392,6 @@ def fetch_nifty(mode="Swing"):
     return df["Close"].dropna()
 
 def _market_regime(nifty_close):
-    """
-    Returns (market_bullish, regime_label).
-    market_bullish=True  → full scoring.
-    market_bullish=False → bearish; apply score haircut + surface a warning.
-    Gate: Nifty close > EMA50  AND  EMA20 > EMA50.
-    """
     if len(nifty_close) < 50:
         return True, "UNKNOWN"
     ema20_val = float(ema(nifty_close, 20).iloc[-1])
@@ -449,9 +399,7 @@ def _market_regime(nifty_close):
     bullish   = (float(nifty_close.iloc[-1]) > ema50_val) and (ema20_val > ema50_val)
     return bullish, "BULLISH" if bullish else "BEARISH"
 
-
 def _fetch_one(args):
-    """Worker for ThreadPoolExecutor — download OHLCV for a single ticker."""
     sym, mode, min_bars = args
     cfg    = MODE_CFG[mode]
     ticker = to_nse(sym)
@@ -472,14 +420,7 @@ def _fetch_one(args):
     except Exception:
         return sym, None
 
-
 def run_scan(symbols, mode, progress_bar, status_text):
-    """
-    Improvements applied here:
-      • Market regime filter  — bearish Nifty haircuts all scores by 15 %
-      • Async/parallel fetch  — ThreadPoolExecutor replaces sequential loop
-      • FIX-3 (HTF momentum) — daily_closes pre-fetched in parallel too
-    """
     import concurrent.futures
 
     cfg      = MODE_CFG[mode]
@@ -489,7 +430,6 @@ def run_scan(symbols, mode, progress_bar, status_text):
 
     nifty = fetch_nifty(mode)
 
-    # ── Market regime ─────────────────────────────────────────────
     market_bullish, regime_label = _market_regime(nifty)
     BEARISH_HAIRCUT = 0.85
     if not market_bullish:
@@ -499,7 +439,6 @@ def run_scan(symbols, mode, progress_bar, status_text):
             "Prefer WATCH/SETUP phases; avoid chasing breakouts."
         )
 
-    # ── Parallel OHLCV download ───────────────────────────────────
     status_text.text("Fetching OHLCV data in parallel…")
     data         = {}
     daily_closes = {}
@@ -512,16 +451,15 @@ def run_scan(symbols, mode, progress_bar, status_text):
         for fut in concurrent.futures.as_completed(futures):
             sym, df = fut.result()
             completed += 1
-            progress_bar.progress(completed / total * 0.6)   # 0–60 % for download
+            progress_bar.progress(completed / total * 0.6)
             if df is not None:
                 data[sym] = df
             else:
                 rejected += 1
 
-    # ── Daily HTF context (Intraday only, parallel) ───────────────
     if mode == "Intraday":
         status_text.text("Fetching daily context for HTF momentum…")
-        daily_args = [(sym, "Swing", 50) for sym in data]      # reuse Swing period/interval
+        daily_args = [(sym, "Swing", 50) for sym in data]
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             d_futures = {pool.submit(_fetch_one, a): a[0] for a in daily_args}
             for fut in concurrent.futures.as_completed(d_futures):
@@ -529,15 +467,13 @@ def run_scan(symbols, mode, progress_bar, status_text):
                 if df is not None:
                     daily_closes[sym] = df["Close"]
 
-    # ── Score ─────────────────────────────────────────────────────
     results = []
     n_data  = len(data)
     for i, (sym, df) in enumerate(data.items()):
-        progress_bar.progress(0.6 + (i + 1) / n_data * 0.4)   # 60–100 % for scoring
+        progress_bar.progress(0.6 + (i + 1) / n_data * 0.4)
         status_text.text(f"Scoring {i+1}/{n_data}  ▸  {sym}")
         res = score_stock(df, nifty, mode, daily_close=daily_closes.get(sym))
         if res:
-            # Apply market regime haircut to raw score
             if not market_bullish:
                 res["Score"] = int(res["Score"] * BEARISH_HAIRCUT)
                 res["Action"] = action_label_fn(res["Score"])
@@ -547,9 +483,7 @@ def run_scan(symbols, mode, progress_bar, status_text):
     results.sort(key=lambda x: x["Score"], reverse=True)
     return results, rejected
 
-
 def action_label_fn(s):
-    """Standalone action label used after regime haircut."""
     if s >= 100: return "STRONG BUY"
     if s >= 80:  return "BUY"
     if s >= 60:  return "WATCH"
@@ -563,43 +497,10 @@ def fmt(val):
 def action_icon(a):
     return {"STRONG BUY":"🟢","BUY":"🔵","WATCH":"🟡","SKIP":"🔴"}.get(a,"")
 
-# ── Streamlit UI ─────────────────────────────────────────────────
-st.set_page_config(page_title="NSE Master Scanner Pro", page_icon="📈",
-                   layout="wide", initial_sidebar_state="collapsed")
-st.markdown("""
-<style>
-body, .stApp { background-color:#0d0d1a; color:#f0f0f0; }
-.stDataFrame { font-size:13px; }
-div[data-testid="stMetricValue"] { color:#00b4d8; font-size:1.4rem; }
-</style>""", unsafe_allow_html=True)
-
-st.title("📈 NSE Master Scanner Pro  [Phase Engine v5]")
-
-for key, default in [("results",[]),("scan_time",None),("rejected",0),("scan_mode","Swing"),("zd_enctoken",""),("zd_ltp_cache",{})]:
-    if key not in st.session_state:
-        st.session_state[key] = default
-
-# ── Zerodha enctoken widget (one-time input, top of page) ─────────
-enctoken = _enctoken_widget()
-
-# ── Controls ─────────────────────────────────────────────────────
-c1, c2, c3, c4, c5, c6 = st.columns([2,1,1,2,2,2])
-with c1:
-    index_opt = st.selectbox("Index", list(SECTORS.keys()), label_visibility="collapsed")
-with c2:
-    mode_opt = st.selectbox("Mode", ["Swing","Intraday","Positional"], label_visibility="collapsed")
-
-
-
-# ── Zerodha enctoken live quotes ─────────────────────────────────
-# Uses Zerodha's internal quote endpoint (same one kite.zerodha.com uses).
-# Requires only a regular trading login — no Kite Connect subscription.
-# Token resets every day at ~6 AM IST when Zerodha rotates sessions.
-
+# ── Zerodha helpers ──────────────────────────────────────────────
 ZERODHA_QUOTE_URL = "https://api.kite.trade/quote"
 ZERODHA_LTP_URL   = "https://api.kite.trade/quote/ltp"
 
-# NSE instrument tokens for indices (fixed, don't change)
 ZERODHA_INDEX_TOKENS = {
     "Nifty 50":  "NSE:NIFTY 50",
     "Sensex":    "BSE:SENSEX",
@@ -613,9 +514,8 @@ def _zerodha_headers(enctoken):
         "X-Kite-Version": "3",
     }
 
-@st.cache_data(ttl=15)   # 15-sec cache — live quote
+@st.cache_data(ttl=15)
 def zd_fetch_index_quote(enctoken, instruments):
-    """Fetch live quotes for a list of instrument strings like ['NSE:NIFTY 50']."""
     import requests
     try:
         params = [("i", inst) for inst in instruments]
@@ -630,11 +530,6 @@ def zd_fetch_index_quote(enctoken, instruments):
 
 @st.cache_data(ttl=15)
 def zd_fetch_ltp_bulk(enctoken, instrument_list):
-    """
-    Fetch LTP for up to 500 instruments in one call.
-    instrument_list: ['NSE:RELIANCE', 'NSE:INFY', ...]
-    Returns dict {'NSE:RELIANCE': 2950.5, ...}
-    """
     import requests
     out = {}
     CHUNK = 500
@@ -654,11 +549,6 @@ def zd_fetch_ltp_bulk(enctoken, instrument_list):
     return out
 
 def zd_index_display(quote_data, instrument_key, name):
-    """
-    Extract display fields from Zerodha quote response for one index.
-    Returns dict compatible with fetch_indices() output format,
-    augmented with ohlc, week52_high/low, volume.
-    """
     d = quote_data.get(instrument_key)
     if not d:
         return None
@@ -678,6 +568,7 @@ def zd_index_display(quote_data, instrument_key, name):
         "source":   "Zerodha",
     }
 
+# ── FIX-7: _enctoken_widget defined HERE, before it is called ────
 def _enctoken_widget():
     """
     Renders the one-time enctoken input box.
@@ -720,18 +611,9 @@ def _enctoken_widget():
 
     return st.session_state.get("zd_enctoken", "")
 
-
 # ── Options OI + Max Pain (NSE public API) ───────────────────────
-@st.cache_data(ttl=180)   # refresh every 3 min — OI data is near-real-time
+@st.cache_data(ttl=180)
 def fetch_oi_data(symbol="NIFTY"):
-    """
-    Fetch weekly expiry OI data from NSE option chain API.
-    Returns dict with: expiry, spot, pcr, max_pain, call_wall, put_wall,
-    top_ce_strikes, top_pe_strikes, oi_table (DataFrame).
-    Falls back to None on any error (NSE blocks bots outside market hours).
-
-    symbol: "NIFTY" or "BANKNIFTY" (Sensex weekly = BANKEX on BSE, not on NSE OC).
-    """
     import requests, json
 
     headers = {
@@ -747,12 +629,9 @@ def fetch_oi_data(symbol="NIFTY"):
 
     session = requests.Session()
     try:
-        # Step 1: warm the cookie
         session.get("https://www.nseindia.com", headers=headers, timeout=8)
         session.get("https://www.nseindia.com/market-data/equity-derivatives-watch",
                     headers=headers, timeout=8)
-
-        # Step 2: fetch OC JSON
         url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
         resp = session.get(url, headers=headers, timeout=10)
         if resp.status_code != 200:
@@ -764,7 +643,7 @@ def fetch_oi_data(symbol="NIFTY"):
     try:
         records = data["records"]
         spot    = float(records["underlyingValue"])
-        expiries = records["expiryDates"]           # nearest = weekly
+        expiries = records["expiryDates"]
         weekly_expiry = expiries[0] if expiries else None
 
         rows = []
@@ -792,23 +671,17 @@ def fetch_oi_data(symbol="NIFTY"):
         total_pe = df_oi["PE_OI"].sum()
         pcr = round(total_pe / total_ce, 2) if total_ce > 0 else 0
 
-        # ── Max Pain: strike where total buyer loss is minimum ────
         pains = []
         for s in df_oi["Strike"]:
-            # CE buyers lose max(S - strike, 0) × CE_OI for all strikes < s
-            # PE buyers lose max(strike - S, 0) × PE_OI for all strikes > s
             ce_loss = ((df_oi["Strike"] - s).clip(lower=0) * df_oi["CE_OI"]).sum()
             pe_loss = ((s - df_oi["Strike"]).clip(lower=0) * df_oi["PE_OI"]).sum()
             pains.append(ce_loss + pe_loss)
         df_oi["TotalPain"] = pains
         max_pain_strike = int(df_oi.loc[df_oi["TotalPain"].idxmin(), "Strike"])
 
-        # ── Call wall = strike with highest CE OI ─────────────────
         call_wall = int(df_oi.loc[df_oi["CE_OI"].idxmax(), "Strike"])
-        # ── Put wall  = strike with highest PE OI ─────────────────
         put_wall  = int(df_oi.loc[df_oi["PE_OI"].idxmax(), "Strike"])
 
-        # Top 5 CE & PE strikes by OI (resistance / support levels)
         top_ce = df_oi.nlargest(5, "CE_OI")[["Strike","CE_OI","CE_Chg"]].to_dict("records")
         top_pe = df_oi.nlargest(5, "PE_OI")[["Strike","PE_OI","PE_Chg"]].to_dict("records")
 
@@ -827,22 +700,18 @@ def fetch_oi_data(symbol="NIFTY"):
     except Exception:
         return None
 
-
 def _oi_sentiment(pcr):
     if pcr >= 1.3:  return "Bullish 🟢", "#2ecc71"
     if pcr >= 0.9:  return "Neutral 🟡", "#f39c12"
     return "Bearish 🔴", "#e74c3c"
 
-
 def _render_oi_card(oi, index_name):
-    """Render OI + Max Pain section inside an expander for one index."""
     if oi is None:
         st.caption(f"⚠️ OI data unavailable for {index_name} — NSE API may be closed or rate-limited.")
         return
 
     sentiment_label, sentiment_color = _oi_sentiment(oi["pcr"])
 
-    # ── Row 1: key metrics ────────────────────────────────────────
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Expiry",     oi["expiry"])
     m2.metric("Spot",       f"₹{oi['spot']:,.0f}")
@@ -852,7 +721,6 @@ def _render_oi_card(oi, index_name):
     m4.metric("Call Wall",  f"₹{oi['call_wall']:,}")
     m5.metric("Put Wall",   f"₹{oi['put_wall']:,}")
 
-    # ── Row 2: PCR + sentiment ────────────────────────────────────
     st.markdown(
         f'<div style="margin:6px 0 10px;">'
         f'<span style="color:#7a7a9a;font-size:12px;">PCR: </span>'
@@ -864,7 +732,6 @@ def _render_oi_card(oi, index_name):
         unsafe_allow_html=True,
     )
 
-    # ── Row 3: OI walls table ─────────────────────────────────────
     tc1, tc2 = st.columns(2)
     with tc1:
         st.markdown("**📞 Top CE OI (Resistance)**")
@@ -891,7 +758,6 @@ def _render_oi_card(oi, index_name):
             })
         st.dataframe(pd.DataFrame(pe_rows), hide_index=True, use_container_width=True)
 
-    # ── Row 4: interpretation tip ─────────────────────────────────
     pain_dist = oi["max_pain"] - int(oi["spot"])
     tip = ""
     if abs(pain_dist) <= 100:
@@ -902,8 +768,7 @@ def _render_oi_card(oi, index_name):
         tip = f"⬇️ Max Pain is ₹{pain_dist:+,} below spot — options writers may drag price down."
     st.caption(tip)
 
-
-# ── Nifty & Sensex (mode-aware) ───────────────────────────────────
+# ── Index fetch (mode-aware) ─────────────────────────────────────
 @st.cache_data(ttl=300)
 def fetch_indices(mode="Swing"):
     cfg      = MODE_CFG[mode]
@@ -946,6 +811,34 @@ def fetch_indices(mode="Swing"):
             out[name] = None
     return out
 
+# ════════════════════════════════════════════════════════════════
+# ── Streamlit UI  (all definitions above this line) ─────────────
+# ════════════════════════════════════════════════════════════════
+st.set_page_config(page_title="NSE Master Scanner Pro", page_icon="📈",
+                   layout="wide", initial_sidebar_state="collapsed")
+st.markdown("""
+<style>
+body, .stApp { background-color:#0d0d1a; color:#f0f0f0; }
+.stDataFrame { font-size:13px; }
+div[data-testid="stMetricValue"] { color:#00b4d8; font-size:1.4rem; }
+</style>""", unsafe_allow_html=True)
+
+st.title("📈 NSE Master Scanner Pro  [Phase Engine v5]")
+
+for key, default in [("results",[]),("scan_time",None),("rejected",0),("scan_mode","Swing"),("zd_enctoken",""),("zd_ltp_cache",{})]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# ── Zerodha enctoken widget — FIX-7: now defined above, safe to call ──
+enctoken = _enctoken_widget()
+
+# ── Controls ─────────────────────────────────────────────────────
+c1, c2, c3, c4, c5, c6 = st.columns([2,1,1,2,2,2])
+with c1:
+    index_opt = st.selectbox("Index", list(SECTORS.keys()), label_visibility="collapsed")
+with c2:
+    mode_opt = st.selectbox("Mode", ["Swing","Intraday","Positional"], label_visibility="collapsed")
+
 indices = fetch_indices(mode_opt)
 
 # ── OI data ───────────────────────────────────────────────────────
@@ -968,11 +861,9 @@ for col, name, oi_sym in zip(
         [ic1, ic2],
         ["Nifty 50", "Sensex"],
         [oi_nifty, oi_sensex]):
-    # Prefer Zerodha live quote; fall back to yfinance
     zd = zd_index_data.get(name)
     d  = indices.get(name)
     with col:
-        # Resolve display values
         if zd:
             ltp_val = zd["value"]
             chg_val = zd["chg"]
@@ -1003,14 +894,12 @@ for col, name, oi_sym in zip(
         cc  = "#2ecc71" if chg_val >= 0 else "#e74c3c"
         ar  = "▲" if chg_val >= 0 else "▼"
 
-        # Score/action/RSI from yfinance (technical — not available from Zerodha quote)
         act = d["action"] if d else "—"
         rsi_val = d["rsi"]  if d else "—"
         trend_s = d["trend"] if d else ""
         ac  = "#ffd700" if act=="STRONG BUY" else ("#2ecc71" if act=="BUY" else ("#f39c12" if act=="WATCH" else "#e74c3c"))
         sp  = min(int(d["score"]/150*100), 100) if d else 0
 
-        # OI badge
         oi_badge = ""
         if oi_sym:
             s_label, s_col = _oi_sentiment(oi_sym["pcr"])
@@ -1058,7 +947,7 @@ for col, name, oi_sym in zip(
             + oi_badge +
             f'</div>', unsafe_allow_html=True)
 
-# FIX-2: caption
+# FIX-2: corrected caption
 with ic3:
     live_note = "🟢 **Live via Zerodha** (15-sec refresh)" if enctoken else "📡 yfinance (5-min cache)"
     st.caption(f"{live_note} · OI refreshes every 3 min · Technical scores via yfinance")
@@ -1122,7 +1011,6 @@ if scan_btn:
     st.session_state.scan_mode = mode_opt
     st.session_state.scan_time = datetime.now().strftime("%H:%M:%S") + f" ({index_opt} · {mode_opt})"
 
-    # ── Enrich LTP from Zerodha if token is available ─────────────
     if enctoken and results:
         stat.text("Fetching live LTP from Zerodha…")
         instruments = [f"NSE:{r['Symbol']}" for r in results]
