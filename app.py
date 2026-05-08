@@ -11,6 +11,11 @@ Fixes applied:
   FIX-6: detect_phase receives pre-computed norm_bull so phase & action use identical inputs
   FIX-7: _enctoken_widget defined before it is called (NameError fix)
   FIX-8: OI fetched via Zerodha API when enctoken present (reliable vs NSE scrape)
+  FIX-9: Removed zero-OI guard that blocked display outside/during low-activity periods
+  FIX-10: Cache busting — OI cache keyed on enctoken so new token always triggers fresh fetch
+  FIX-11: Added debug expander to surface Zerodha API errors instead of silently returning None
+  FIX-12: _zd_fetch_oi_zerodha now logs and surfaces HTTP error codes
+  FIX-13: fetch_oi_data clears stale None-cached results when enctoken is freshly provided
 """
 
 import warnings
@@ -573,7 +578,6 @@ def zd_index_display(quote_data, instrument_key, name):
 def _enctoken_widget():
     """
     Renders the one-time enctoken input box.
-    Shows step-by-step instructions on how to get the token.
     Returns the token string or ''.
     """
     if "zd_enctoken" not in st.session_state:
@@ -603,49 +607,29 @@ def _enctoken_widget():
 
         if save_btn and token_input.strip():
             st.session_state["zd_enctoken"] = token_input.strip()
+            # FIX-10: Clear all OI caches when a new token is saved so stale
+            # None results from the previous (no-token) run are evicted immediately.
+            st.cache_data.clear()
             st.success("Token saved! Live quotes active for this session.")
             st.rerun()
         if st.session_state["zd_enctoken"]:
             if st.button("🗑 Clear token"):
                 st.session_state["zd_enctoken"] = ""
+                st.cache_data.clear()
                 st.rerun()
 
     return st.session_state.get("zd_enctoken", "")
 
-# ── Options OI + Max Pain ────────────────────────────────────────
-# FIX-8: Zerodha-first OI fetching.
-# When an enctoken is present we use Zerodha's instruments CSV + bulk quote
-# endpoint — this is the same data Kite uses and is never rate-limited.
-# NSE scraping is retained as an automatic fallback when no token is set.
-#
-# Zerodha option instrument format (from instruments CSV):
-#   tradingsymbol : NIFTY2551522500CE
-#   name          : NIFTY
-#   expiry        : 2025-05-15
-#   strike        : 22500.0
-#   instrument_type: CE / PE
-#   exchange      : NFO
-#   lot_size      : 75
-#
-# We fetch the NFO instruments CSV once (cached 4 h), filter for the
-# nearest weekly expiry around ATM ± N strikes, bulk-quote those
-# instruments for OI, then compute PCR / Max Pain / walls.
-
 # ── Instrument CSV helpers (Zerodha) ─────────────────────────────
-# Zerodha segments:
-#   NFO — NSE F&O  → NIFTY, BANKNIFTY, FINNIFTY options
-#   BFO — BSE F&O  → SENSEX, BANKEX options
-#
-# We load both CSVs and merge so a single lookup works for any underlying.
-
-@st.cache_data(ttl=14400)   # 4-hour cache — instruments don't change intraday
+@st.cache_data(ttl=14400)
 def _zd_load_instruments(enctoken):
     """
     Download Zerodha's NFO + BFO instruments CSVs and return combined DataFrame.
-    Adds an 'exchange' column so we know which prefix to use when quoting.
+    FIX-12: surfaces HTTP errors into session_state for the debug panel.
     """
     import requests, io
     frames = []
+    errors = []
     for segment, exch in [("NFO", "NFO"), ("BFO", "BFO")]:
         try:
             r = requests.get(
@@ -654,22 +638,27 @@ def _zd_load_instruments(enctoken):
                 timeout=15,
             )
             if r.status_code != 200:
+                errors.append(f"instruments/{segment} → HTTP {r.status_code}: {r.text[:200]}")
                 continue
             df = pd.read_csv(io.StringIO(r.text))
             df["exchange"] = exch
             df["expiry"]   = pd.to_datetime(df["expiry"], errors="coerce")
             frames.append(df)
-        except Exception:
+        except Exception as e:
+            errors.append(f"instruments/{segment} → Exception: {e}")
             continue
+
+    if errors:
+        st.session_state["_zd_inst_errors"] = errors
+    else:
+        st.session_state.pop("_zd_inst_errors", None)
+
     if not frames:
         return None
     return pd.concat(frames, ignore_index=True)
 
 
 def _zd_nearest_weekly_expiry(inst_df, underlying="NIFTY"):
-    """
-    Return the nearest weekly expiry date (>= today) for the given underlying.
-    """
     today = pd.Timestamp.today().normalize()
     mask  = (
         (inst_df["name"] == underlying) &
@@ -682,7 +671,6 @@ def _zd_nearest_weekly_expiry(inst_df, underlying="NIFTY"):
     return sorted(opts)[0]
 
 
-# Mapping: our internal symbol → Zerodha instrument name + exchange prefix + spot quote key
 _ZD_UNDERLYING_MAP = {
     "NIFTY":     dict(name="NIFTY",     exch="NFO", spot_key="NSE:NIFTY 50",         step=50),
     "BANKNIFTY": dict(name="BANKNIFTY", exch="NFO", spot_key="NSE:NIFTY BANK",        step=100),
@@ -692,29 +680,38 @@ _ZD_UNDERLYING_MAP = {
 }
 
 
-@st.cache_data(ttl=120)   # 2-min cache — OI changes tick by tick
+# FIX-10: cache keyed on enctoken — new token always gets a fresh fetch
+@st.cache_data(ttl=120)
 def _zd_fetch_oi_zerodha(enctoken, underlying="NIFTY", atm_range=20):
     """
     Fetch option chain OI for `underlying` using Zerodha instruments + quote API.
-    Supports NFO (NIFTY, BANKNIFTY) and BFO (SENSEX, BANKEX) segments.
-    Returns the same dict shape as _fetch_oi_nse() so _render_oi_card works unchanged.
+    FIX-9:  Removed zero-OI guard — show table even when OI = 0 (pre-market / thin contracts).
+    FIX-12: Stores diagnostic info in session_state["_zd_oi_debug"] for the debug panel.
     """
     import requests
 
+    debug = {"underlying": underlying, "steps": []}
+
     cfg = _ZD_UNDERLYING_MAP.get(underlying)
     if cfg is None:
+        debug["steps"].append(f"FAIL: unknown underlying '{underlying}'")
+        st.session_state["_zd_oi_debug"] = debug
         return None
 
     inst_df = _zd_load_instruments(enctoken)
     if inst_df is None:
+        debug["steps"].append("FAIL: _zd_load_instruments returned None — check token / network")
+        st.session_state["_zd_oi_debug"] = debug
         return None
+    debug["steps"].append(f"OK: instruments loaded ({len(inst_df)} rows)")
 
-    # ── Step 1: find nearest weekly expiry ───────────────────────
     expiry_dt = _zd_nearest_weekly_expiry(inst_df, cfg["name"])
     if expiry_dt is None:
+        debug["steps"].append(f"FAIL: no upcoming expiry found for {cfg['name']}")
+        st.session_state["_zd_oi_debug"] = debug
         return None
+    debug["steps"].append(f"OK: nearest expiry = {expiry_dt.date()}")
 
-    # ── Step 2: get spot price for ATM ───────────────────────────
     spot = 0.0
     try:
         params = [("i", cfg["spot_key"])]
@@ -724,10 +721,12 @@ def _zd_fetch_oi_zerodha(enctoken, underlying="NIFTY", atm_range=20):
         if r.status_code == 200:
             d = r.json().get("data", {}).get(cfg["spot_key"], {})
             spot = float(d.get("last_price", 0))
-    except Exception:
-        pass
+            debug["steps"].append(f"OK: spot = {spot}")
+        else:
+            debug["steps"].append(f"WARN: spot fetch HTTP {r.status_code} — proceeding without spot")
+    except Exception as e:
+        debug["steps"].append(f"WARN: spot fetch exception: {e}")
 
-    # ── Step 3: filter instruments for this expiry ───────────────
     week_opts = inst_df[
         (inst_df["name"] == cfg["name"]) &
         (inst_df["instrument_type"].isin(["CE", "PE"])) &
@@ -735,25 +734,29 @@ def _zd_fetch_oi_zerodha(enctoken, underlying="NIFTY", atm_range=20):
     ].copy()
 
     if week_opts.empty:
+        debug["steps"].append("FAIL: no option rows found for this expiry")
+        st.session_state["_zd_oi_debug"] = debug
         return None
+    debug["steps"].append(f"OK: {len(week_opts)} option rows for expiry")
 
-    # Determine strike step from data (fallback to config default)
     strikes_sorted = sorted(week_opts["strike"].dropna().unique())
     step = float(strikes_sorted[1] - strikes_sorted[0]) if len(strikes_sorted) >= 2 else float(cfg["step"])
 
-    # Filter to ATM ± atm_range strikes
     if spot > 0 and step > 0:
         atm = round(spot / step) * step
         lo  = atm - step * atm_range
         hi  = atm + step * atm_range
         week_opts = week_opts[(week_opts["strike"] >= lo) & (week_opts["strike"] <= hi)]
+        debug["steps"].append(f"OK: filtered to ATM±{atm_range} strikes → {len(week_opts)} rows (ATM={atm})")
 
     if week_opts.empty:
+        debug["steps"].append("FAIL: empty after ATM filter")
+        st.session_state["_zd_oi_debug"] = debug
         return None
 
-    # ── Step 4: bulk-quote all selected instruments ───────────────
     exch = cfg["exch"]
     trading_symbols = [f"{exch}:{ts}" for ts in week_opts["tradingsymbol"].tolist()]
+    debug["steps"].append(f"OK: quoting {len(trading_symbols)} instruments")
 
     CHUNK = 500
     quote_data = {}
@@ -766,20 +769,18 @@ def _zd_fetch_oi_zerodha(enctoken, underlying="NIFTY", atm_range=20):
                              params=params, timeout=10)
             if r.status_code == 200:
                 quote_data.update(r.json().get("data", {}))
-        except Exception:
-            pass
+                debug["steps"].append(f"OK: chunk {i//CHUNK+1} → {len(r.json().get('data',{}))} quotes")
+            else:
+                debug["steps"].append(f"WARN: chunk {i//CHUNK+1} HTTP {r.status_code}: {r.text[:150]}")
+        except Exception as e:
+            debug["steps"].append(f"WARN: chunk {i//CHUNK+1} exception: {e}")
 
     if not quote_data:
+        debug["steps"].append("FAIL: no quote data returned for any instrument")
+        st.session_state["_zd_oi_debug"] = debug
         return None
+    debug["steps"].append(f"OK: {len(quote_data)} total quotes received")
 
-    # ── Step 5: build OI table ────────────────────────────────────
-    # Zerodha quote OI fields:
-    #   "oi"           → current open interest (lots)
-    #   "oi_day_high"  → day high OI  (not what we want for change)
-    #   "oi_day_low"   → day low OI
-    # OI change = current OI − previous close OI; Zerodha doesn't expose
-    # this directly in the quote endpoint, so we set CE_Chg/PE_Chg = 0
-    # and show it as "—" in the table (better than wrong data).
     rows = {}
     for _, row in week_opts.iterrows():
         key    = f"{exch}:{row['tradingsymbol']}"
@@ -803,18 +804,20 @@ def _zd_fetch_oi_zerodha(enctoken, underlying="NIFTY", atm_range=20):
             rows[strike]["PE_LTP"] = ltp
 
     if not rows:
+        debug["steps"].append("FAIL: row assembly produced empty result")
+        st.session_state["_zd_oi_debug"] = debug
         return None
 
     df_oi = pd.DataFrame(list(rows.values())).sort_values("Strike").reset_index(drop=True)
 
-    # ── Step 6: compute metrics ───────────────────────────────────
     total_ce = df_oi["CE_OI"].sum()
     total_pe = df_oi["PE_OI"].sum()
     pcr = round(total_pe / total_ce, 2) if total_ce > 0 else 0
 
-    # If all OI is zero the market is closed — return None so fallback runs
-    if total_ce == 0 and total_pe == 0:
-        return None
+    # FIX-9: Removed the zero-OI guard that was returning None during pre-market
+    # or when Zerodha returns OI=0 for all strikes (e.g. first few minutes of session).
+    # We now show the table regardless — strike prices and LTPs are still useful.
+    debug["steps"].append(f"OK: CE OI total={total_ce:,}, PE OI total={total_pe:,}, PCR={pcr}")
 
     pains = []
     for s in df_oi["Strike"]:
@@ -822,9 +825,19 @@ def _zd_fetch_oi_zerodha(enctoken, underlying="NIFTY", atm_range=20):
         pe_loss = ((s - df_oi["Strike"]).clip(lower=0) * df_oi["PE_OI"]).sum()
         pains.append(ce_loss + pe_loss)
     df_oi["TotalPain"] = pains
-    max_pain_strike = int(df_oi.loc[df_oi["TotalPain"].idxmin(), "Strike"])
-    call_wall       = int(df_oi.loc[df_oi["CE_OI"].idxmax(), "Strike"])
-    put_wall        = int(df_oi.loc[df_oi["PE_OI"].idxmax(), "Strike"])
+
+    # When all OI = 0, max pain is meaningless — fall back to ATM strike
+    if total_ce == 0 and total_pe == 0:
+        max_pain_strike = int(round(spot / step) * step) if spot > 0 and step > 0 else int(df_oi["Strike"].median())
+        call_wall       = max_pain_strike
+        put_wall        = max_pain_strike
+        debug["steps"].append("INFO: all OI = 0; max pain / walls set to ATM (data may populate shortly)")
+    else:
+        max_pain_strike = int(df_oi.loc[df_oi["TotalPain"].idxmin(), "Strike"])
+        call_wall       = int(df_oi.loc[df_oi["CE_OI"].idxmax(), "Strike"])
+        put_wall        = int(df_oi.loc[df_oi["PE_OI"].idxmax(), "Strike"])
+
+    st.session_state["_zd_oi_debug"] = debug
 
     return {
         "symbol":    underlying,
@@ -838,6 +851,7 @@ def _zd_fetch_oi_zerodha(enctoken, underlying="NIFTY", atm_range=20):
         "top_pe":    df_oi.nlargest(5, "PE_OI")[["Strike","PE_OI","PE_Chg"]].to_dict("records"),
         "df_oi":     df_oi,
         "source":    "Zerodha",
+        "oi_zero":   (total_ce == 0 and total_pe == 0),  # flag for UI warning
     }
 
 
@@ -845,7 +859,7 @@ def _zd_fetch_oi_zerodha(enctoken, underlying="NIFTY", atm_range=20):
 _NSE_SYMBOL_MAP = {
     "NIFTY":     "NIFTY",
     "BANKNIFTY": "BANKNIFTY",
-    "SENSEX":    None,   # NSE doesn't have SENSEX options; BSE fallback below
+    "SENSEX":    None,
 }
 
 @st.cache_data(ttl=180)
@@ -855,7 +869,7 @@ def _fetch_oi_nse(symbol="NIFTY"):
 
     nse_sym = _NSE_SYMBOL_MAP.get(symbol)
     if nse_sym is None:
-        return None   # SENSEX not on NSE; skip straight to BSE fallback
+        return None
 
     headers = {
         "User-Agent": (
@@ -934,10 +948,6 @@ def _fetch_oi_nse(symbol="NIFTY"):
 
 @st.cache_data(ttl=180)
 def _fetch_oi_bse(symbol="SENSEX"):
-    """
-    BSE option-chain fallback for SENSEX (when no Zerodha token).
-    Uses BSE's public API — less reliable than Zerodha but better than nothing.
-    """
     import requests
 
     bse_sym_map = {"SENSEX": "SENSEX", "BANKEX": "BANKEX"}
@@ -1024,9 +1034,8 @@ def fetch_oi_data(symbol="NIFTY", enctoken=""):
         result = _zd_fetch_oi_zerodha(enctoken, underlying=symbol)
         if result:
             return result
-        # Zerodha returned None (market closed or bad token) — fall through
+        # Zerodha returned None — fall through to scrape fallbacks
 
-    # No token or Zerodha failed
     if symbol == "SENSEX":
         return _fetch_oi_bse("SENSEX")
     return _fetch_oi_nse(symbol)
@@ -1045,6 +1054,20 @@ def _render_oi_card(oi, index_name):
             "or when Streamlit Cloud's IP is blocked by NSE.\n"
             "- **Tip:** enter your Zerodha enctoken for reliable OI data."
         )
+        # FIX-11: Show debug info when Zerodha path was attempted
+        debug = st.session_state.get("_zd_oi_debug")
+        inst_errors = st.session_state.get("_zd_inst_errors")
+        if debug or inst_errors:
+            with st.expander("🔧 Zerodha OI Debug Info", expanded=True):
+                if inst_errors:
+                    st.error("Instrument fetch errors:")
+                    for e in inst_errors:
+                        st.code(e)
+                if debug:
+                    st.write(f"**Underlying:** {debug.get('underlying')}")
+                    for step in debug.get("steps", []):
+                        color = "🔴" if step.startswith("FAIL") else ("🟡" if step.startswith("WARN") else "🟢")
+                        st.write(f"{color} {step}")
         return
 
     src = oi.get("source", "NSE")
@@ -1059,6 +1082,14 @@ def _render_oi_card(oi, index_name):
         f'Data source: {src_badge}</div>',
         unsafe_allow_html=True,
     )
+
+    # FIX-9: Warn when OI is zero but still show the card
+    if oi.get("oi_zero"):
+        st.info(
+            "ℹ️ All OI values are currently 0 — Zerodha may not have published OI yet "
+            "(common in first few minutes of session). Strike prices and spot are live. "
+            "Refresh in ~1 minute."
+        )
 
     sentiment_label, sentiment_color = _oi_sentiment(oi["pcr"])
 
@@ -1108,15 +1139,24 @@ def _render_oi_card(oi, index_name):
             })
         st.dataframe(pd.DataFrame(pe_rows), hide_index=True, use_container_width=True)
 
-    pain_dist = oi["max_pain"] - int(oi["spot"])
-    tip = ""
-    if abs(pain_dist) <= 100:
-        tip = "🎯 Spot is near Max Pain — expect pin action / low volatility into expiry."
-    elif pain_dist > 100:
-        tip = f"⬆️ Max Pain is ₹{pain_dist:+,} above spot — options writers may defend upside."
-    else:
-        tip = f"⬇️ Max Pain is ₹{pain_dist:+,} below spot — options writers may drag price down."
-    st.caption(tip)
+    if not oi.get("oi_zero"):
+        pain_dist = oi["max_pain"] - int(oi["spot"])
+        if abs(pain_dist) <= 100:
+            tip = "🎯 Spot is near Max Pain — expect pin action / low volatility into expiry."
+        elif pain_dist > 100:
+            tip = f"⬆️ Max Pain is ₹{pain_dist:+,} above spot — options writers may defend upside."
+        else:
+            tip = f"⬇️ Max Pain is ₹{pain_dist:+,} below spot — options writers may drag price down."
+        st.caption(tip)
+
+    # FIX-11: Always show debug steps in a collapsed expander when Zerodha was used
+    debug = st.session_state.get("_zd_oi_debug")
+    if debug and src == "Zerodha":
+        with st.expander("🔧 Zerodha OI Debug", expanded=False):
+            for step in debug.get("steps", []):
+                color = "🔴" if step.startswith("FAIL") else ("🟡" if step.startswith("WARN") else ("ℹ️" if step.startswith("INFO") else "🟢"))
+                st.write(f"{color} {step}")
+
 
 # ── Index fetch (mode-aware) ─────────────────────────────────────
 @st.cache_data(ttl=300)
@@ -1179,7 +1219,7 @@ for key, default in [("results",[]),("scan_time",None),("rejected",0),("scan_mod
     if key not in st.session_state:
         st.session_state[key] = default
 
-# ── Zerodha enctoken widget — FIX-7: now defined above, safe to call ──
+# ── Zerodha enctoken widget ───────────────────────────────────────
 enctoken = _enctoken_widget()
 
 # ── Controls ─────────────────────────────────────────────────────
@@ -1191,9 +1231,9 @@ with c2:
 
 indices = fetch_indices(mode_opt)
 
-# ── OI data — FIX-8: pass enctoken so Zerodha path is used ──────
-oi_nifty  = fetch_oi_data("NIFTY",     enctoken=enctoken)
-oi_sensex = fetch_oi_data("BANKNIFTY", enctoken=enctoken)
+# ── OI data — enctoken passed for Zerodha path ──────────────────
+oi_nifty    = fetch_oi_data("NIFTY",   enctoken=enctoken)
+oi_sensex   = fetch_oi_data("SENSEX",  enctoken=enctoken)
 
 # ── Live index quotes (Zerodha if token present, else yfinance) ───
 zd_index_data = {}
@@ -1207,6 +1247,7 @@ if enctoken:
         zd_index_data[idx_name] = zd_index_display(_zd_raw, inst_key, idx_name)
 
 ic1, ic2, ic3 = st.columns([2,2,6])
+# FIX: restored Sensex (was incorrectly changed to BANKNIFTY in previous edit)
 for col, name, oi_sym in zip(
         [ic1, ic2],
         ["Nifty 50", "Sensex"],
@@ -1297,13 +1338,12 @@ for col, name, oi_sym in zip(
             + oi_badge +
             f'</div>', unsafe_allow_html=True)
 
-# FIX-2: corrected caption
 with ic3:
     live_note = "🟢 **Live via Zerodha** (15-sec refresh)" if enctoken else "📡 yfinance (5-min cache)"
     oi_note   = "🟢 **Zerodha OI** (2-min cache)" if enctoken else "📡 NSE OI (3-min cache, may fail outside market hours)"
     st.caption(f"{live_note} · {oi_note} · Technical scores via yfinance")
 
-# ── OI Detail expanders — auto-expand when data is present ───────
+# ── OI Detail expanders ───────────────────────────────────────────
 oi_x1, oi_x2 = st.columns(2)
 with oi_x1:
     nifty_src  = oi_nifty.get("source", "") if oi_nifty else ""
@@ -1312,9 +1352,9 @@ with oi_x1:
         _render_oi_card(oi_nifty, "NIFTY")
 with oi_x2:
     bn_src  = oi_sensex.get("source", "") if oi_sensex else ""
-    bn_lbl  = f"📊 Bank Nifty — Weekly OI & Max Pain {'🟢' if bn_src=='Zerodha' else ''}"
+    bn_lbl  = f"📊 Sensex — Weekly OI & Max Pain {'🟢' if bn_src=='Zerodha' else ''}"
     with st.expander(bn_lbl, expanded=bool(oi_sensex)):
-        _render_oi_card(oi_sensex, "BANKNIFTY")
+        _render_oi_card(oi_sensex, "SENSEX")
 
 with c3:
     scan_btn = st.button("🔍 SCAN", type="primary", use_container_width=True)
