@@ -1863,6 +1863,19 @@ with tab_scanner:
             .set_properties(**{
                 "font-family": "JetBrains Mono, monospace",
                 "font-size": "11px",
+            .format({
+                "Score": "{:.0f}",
+                "Conf%": "{:.0f}",
+                "RSI": "{:.0f}",
+                "RS_Rank": "{:.0f}",
+                "LTP": "₹{:.2f}",
+                "Entry": "₹{:.2f}",
+                "SL": "₹{:.2f}",
+                "T1": "₹{:.2f}",
+                "T2": "₹{:.2f}",
+                "T3": "₹{:.2f}",
+                "Liq₹Cr": "{:.0f}",
+                "ExtN": "{:.0f}",
             })
         )
 
