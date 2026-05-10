@@ -1845,13 +1845,13 @@ with tab_scanner:
         if top_act:
             with st.expander(f"READY TO TRADE — {len(top_act)} stocks in ENTRY / CONT / BREAKOUT", expanded=True):
                 cards_html = ""
-                  <div style="
-                  display:flex;
-                  flex-wrap:wrap;
-                  gap:12px;
-                  align-items:flex-start;
-                  ">
-                  """
+                <div style="
+                display:flex;
+                flex-wrap:wrap;
+                gap:12px;
+                align-items:flex-start;
+                ">
+                """
                 for i, r in enumerate(top_act):
                     cards_html += make_card(i, r, "#22c55e55", show_entry=True)
                 cards_html += "</div>"
@@ -1874,13 +1874,13 @@ with tab_scanner:
             with st.expander(f"WATCHLIST — {len(watchlist)} high-score, not yet ready", expanded=False):
                 cards_html = ""
                 <div style="
-                  display:flex;
-                  flex-wrap:wrap;
-                  gap:12px;
-                  align-items:flex-start;
-                  ">
-                  """
-                  for i, r in enumerate(watchlist):
+                display:flex;
+                flex-wrap:wrap;
+                gap:12px;
+                align-items:flex-start;
+                ">
+                """
+                for i, r in enumerate(watchlist):
                     cards_html += make_card(i, r, "#f59e0b55", show_entry=False)
                 st.markdown(cards_html, unsafe_allow_html=True)
 
