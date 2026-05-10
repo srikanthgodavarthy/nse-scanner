@@ -1849,7 +1849,7 @@ with tab_scanner:
                 display:flex;
                 flex-wrap:wrap;
                 gap:12px;
-                align-items:flex-start;
+                align-items:stretch;
                 ">
                 """
                 for i, r in enumerate(top_act):
@@ -1877,7 +1877,7 @@ with tab_scanner:
                 display:flex;
                 flex-wrap:wrap;
                 gap:12px;
-                align-items:flex-start;
+                align-items:stretch;
                 ">
                 """
                 for i, r in enumerate(watchlist):
