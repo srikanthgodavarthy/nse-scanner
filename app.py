@@ -1,5 +1,5 @@
 """
-NSE Master Scanner Pro — Streamlit Edition v9
+BULL SUTRA Pro — v9
 ═══════════════════════════════════════════════
 UI FIXES FROM v8
 ────────────────
@@ -178,9 +178,6 @@ def fmt(val):
         return "—"
     return f"₹{val:,.2f}"
 
-def action_icon(a):
-    return {"STRONG BUY":"🟢","BUY":"🔵","WATCH":"🟡","SKIP":"🔴"}.get(a,"")
-
 
 # ═══════════════════════════════════════════════════════════════════
 # SIGNAL VALIDITY HELPERS
@@ -242,9 +239,42 @@ def vix_target_mult(vix_val):
 # LIQUIDITY FILTER
 # ═══════════════════════════════════════════════════════════════════
 def liquidity_ok(df, min_cr=LIQUIDITY_MIN_CR):
+    """
+    Computes average daily traded value in crores.
+    Scales rolling window to approximate 1 trading day regardless of bar size:
+      Daily bars  → rolling(20) = 20 days  → already in daily units
+      5-min bars  → rolling(75) = 75 bars ≈ 1 trading day (375 min / 5)
+      15-min bars → rolling(25) = 25 bars ≈ 1 trading day (375 min / 15)
+    Then sums within that window to get a single day equivalent,
+    then takes a 20-day average for smoothing.
+    """
     try:
-        traded = df["Close"] * df["Volume"]
-        avg_cr = float(traded.rolling(20).mean().iloc[-1]) / 1e7
+        traded    = df["Close"] * df["Volume"]
+        n_rows    = len(df)
+        # Detect bar size from index frequency or row spacing
+        if n_rows >= 2:
+            idx = df.index
+            try:
+                delta_min = (idx[1] - idx[0]).total_seconds() / 60
+            except Exception:
+                delta_min = 1440  # assume daily
+        else:
+            delta_min = 1440
+
+        if delta_min <= 5:
+            bars_per_day = 75      # 375 min / 5
+        elif delta_min <= 15:
+            bars_per_day = 25      # 375 min / 15
+        elif delta_min <= 30:
+            bars_per_day = 13
+        elif delta_min < 240:
+            bars_per_day = 7
+        else:
+            bars_per_day = 1       # daily or weekly
+
+        # Sum traded value over one-day window, then 20-day rolling mean
+        daily_traded = traded.rolling(bars_per_day).sum()
+        avg_cr = float(daily_traded.rolling(20).mean().iloc[-1]) / 1e7
         return avg_cr >= min_cr, round(avg_cr, 1)
     except Exception:
         return True, 0.0
@@ -304,17 +334,18 @@ def prefetch_htf_parallel(symbols: list, mode: str, status_text, progress_bar) -
 # RELATIVE STRENGTH — 52-WEEK PERCENTILE RANK
 # ═══════════════════════════════════════════════════════════════════
 def compute_rs_ranks(sym_returns: dict) -> dict:
+    """IBD-style 52w percentile rank. Uses bisect_left so ties get
+    the lowest rank (conservative — doesn't overstate RS for identical returns)."""
+    import bisect
     if not sym_returns:
         return {}
-    syms    = list(sym_returns.keys())
-    returns = [sym_returns[s] for s in syms]
-    sorted_returns = sorted(returns)
-    n = len(sorted_returns)
+    syms           = list(sym_returns.keys())
+    sorted_returns = sorted(sym_returns.values())
+    n              = len(sorted_returns)
     ranks = {}
     for sym in syms:
-        r   = sym_returns[sym]
-        pos = sorted_returns.index(r)
-        ranks[sym] = round(pos / max(n - 1, 1) * 100)
+        pos          = bisect.bisect_left(sorted_returns, sym_returns[sym])
+        ranks[sym]   = round(pos / max(n - 1, 1) * 100)
     return ranks
 
 def _52w_return(close_series: pd.Series) -> float:
@@ -493,7 +524,6 @@ def detect_exhaustion(close, high, low, volume, rsi_series,
     if n >= 10:
         lookback  = min(cfg["div_bars"], n-1)
         rsi_win   = rsi_series.iloc[-lookback:]
-        price_win = close.iloc[-lookback:]
         rsi_peak  = float(rsi_win.max())
         rsi_peak_idx = rsi_win.idxmax()
         price_at_peak = float(close[rsi_peak_idx])
@@ -713,19 +743,6 @@ def _compute_targets(entry, sl, atr_val, fib, setup_type, sw_hi, sw_lo,
 # ═══════════════════════════════════════════════════════════════════
 # FETCH HELPERS
 # ═══════════════════════════════════════════════════════════════════
-@st.cache_data(ttl=900)
-def _fetch_daily_close(ticker):
-    for attempt in range(3):
-        try:
-            df = yf.download(ticker, period="6mo", interval="1d",
-                             auto_adjust=True, progress=False, threads=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            return df["Close"].dropna()
-        except Exception:
-            time.sleep(1.5**attempt)
-    return pd.Series(dtype=float)
-
 def _fetch_one(args):
     sym, mode, min_bars = args
     cfg    = MODE_CFG[mode]
@@ -750,6 +767,7 @@ def _fetch_one(args):
                 time.sleep(1.5**attempt + random.uniform(0, 0.5))
     return sym, None
 
+@st.cache_data(ttl=300)
 def fetch_nifty(mode="Swing"):
     cfg = MODE_CFG[mode]
     df  = yf.download("^NSEI", period=cfg["period"], interval=cfg["interval"], progress=False)
@@ -907,7 +925,7 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         ltp   = round(c, 2)
         entry = entry_price if entry_price else ltp
 
-        mult = cfg["atr_mult"]; wide = cfg["atr_wide"]; maxm = cfg["atr_max"]
+        mult = cfg["atr_mult"]; wide = cfg["atr_wide"]; closest = cfg["atr_max"]
         if setup_type == "fib" and fib:
             fib_sl = max(float(sw_lo), fib["618"] - atr_val*0.5)
             fib_sl = max(fib_sl, entry - atr_val*0.8)
@@ -915,10 +933,11 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         elif setup_type == "breakout":
             sl = round(entry - atr_val*(1.5 if mode=="Intraday" else 2.0), 2)
         else:
-            raw_sl = entry - atr_val*mult
-            min_sl = entry - atr_val*wide
-            max_sl = entry - atr_val*maxm
-            sl = round(max(min_sl, min(raw_sl, max_sl)), 2)
+            raw_sl      = entry - atr_val*mult      # preferred SL distance
+            furthest_sl = entry - atr_val*wide      # floor: SL can't be this far
+            closest_sl  = entry - atr_val*closest   # ceiling: SL can't be this tight
+            # Clamp: SL must be between closest_sl and furthest_sl
+            sl = round(max(furthest_sl, min(raw_sl, closest_sl)), 2)
 
         min_risk = atr_val * 0.5
         if entry - sl < min_risk:
@@ -1037,7 +1056,7 @@ def run_scan(symbols, mode, progress_bar, status_text,
     cfg      = MODE_CFG[mode]
     rejected = 0
     total    = len(symbols)
-    min_bars = 30 if mode == "Intraday" else 50
+    min_bars = 60 if mode == "Intraday" else 50
 
     nifty = fetch_nifty(mode)
     market_bullish, regime_label = _market_regime(nifty)
@@ -1204,7 +1223,7 @@ def _oi_sentiment(pcr):
 def fetch_indices(mode="Swing"):
     cfg = MODE_CFG[mode]
     ema_f = cfg["ema_fast"]; ema_s = cfg["ema_slow"]; rsi_l = cfg["rsi_len"]
-    min_bars = 30 if mode == "Intraday" else 50
+    min_bars = 60 if mode == "Intraday" else 50
     out = {}
     index_map = [
         ("Nifty 50",   "^NSEI"),
@@ -1395,6 +1414,9 @@ div[data-testid="stAlert"] { border-radius: 6px; font-size: 13px; font-family: v
 for key, default in [
     ("results",[]), ("scan_time",None), ("rejected",0), ("liq_skipped",0),
     ("scan_mode","Swing"), ("signal_log",[]), ("phase_history",{}),
+    # Settings — persisted so Detail/Scanner tabs always have valid values
+    ("account_size", 500000), ("risk_pct", 0.02),
+    ("phase_filter", "All Phases"), ("show_illiquid", False), ("min_liq_cr", 5.0),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -1403,7 +1425,7 @@ for key, default in [
 st.markdown(
     '<div style="display:flex;align-items:baseline;gap:12px;margin-bottom:4px;">'
     '<h1 style="font-family:Syne,sans-serif;font-size:22px;margin:0;'
-    'color:#f59e0b;letter-spacing:-0.5px;">NSE MASTER SCANNER</h1>'
+    'color:#f59e0b;letter-spacing:-0.5px;">BULL SUTRA</h1>'
     '<span style="font-family:JetBrains Mono,monospace;font-size:11px;'
     'color:#3a3a60;letter-spacing:2px;">PRO · v9</span>'
     '</div>',
@@ -1461,15 +1483,17 @@ with tab_settings:
     st.subheader("Scanner Settings")
     sc1, sc2 = st.columns(2)
     with sc1:
-        min_liq_cr = st.slider("Min Liquidity (₹ Cr daily traded value)", 1.0, 50.0, 5.0, 1.0)
-        phase_filter = st.selectbox("Phase Filter (Scanner)",
-            ["All Phases","ENTRY","SETUP","CONT","BREAKOUT","IDLE","EXIT"])
-        show_illiquid = st.checkbox("Show illiquid stocks (below liquidity floor)", value=False)
+        st.session_state.min_liq_cr = st.slider("Min Liquidity (₹ Cr daily traded value)", 1.0, 50.0, float(st.session_state.min_liq_cr), 1.0)
+        st.session_state.phase_filter = st.selectbox("Phase Filter (Scanner)",
+            ["All Phases","ENTRY","SETUP","CONT","BREAKOUT","IDLE","EXIT"],
+            index=["All Phases","ENTRY","SETUP","CONT","BREAKOUT","IDLE","EXIT"].index(
+                st.session_state.get("phase_filter","All Phases")))
+        st.session_state.show_illiquid = st.checkbox("Show illiquid stocks (below liquidity floor)", value=st.session_state.show_illiquid)
         st.markdown("---")
         st.markdown("**Position Sizing**")
-        account_size = st.number_input("Account Size (₹)", min_value=10000,
-                                       max_value=10_000_000, value=500000, step=10000)
-        risk_pct_input = st.slider("Risk per trade (%)", 0.5, 5.0, 2.0, 0.5) / 100.0
+        st.session_state.account_size = st.number_input("Account Size (₹)", min_value=10000,
+                                       max_value=10_000_000, value=int(st.session_state.account_size), step=10000)
+        st.session_state.risk_pct = st.slider("Risk per trade (%)", 0.5, 5.0, float(st.session_state.risk_pct*100), 0.5) / 100.0
     with sc2:
         st.markdown("**Action Thresholds**")
         st.markdown("""
@@ -1502,7 +1526,7 @@ if scan_btn:
     with st.spinner(f"Scanning {universe_opt} ({n} stocks) · {mode_opt} · {est}"):
         results, rejected, liq_skipped = run_scan(
             symbols, mode_opt, prog, stat,
-            vix_val=vix_val, min_liq_cr=min_liq_cr,
+            vix_val=vix_val, min_liq_cr=st.session_state.min_liq_cr,
         )
     st.session_state.results     = results
     st.session_state.rejected    = rejected
@@ -1639,11 +1663,11 @@ with tab_scanner:
     elif filter_opt == "WATCH + BUY":
         results = [r for r in results if r["Action"] in ("WATCH","BUY","STRONG BUY")]
 
-    _phase_filter = phase_filter if "phase_filter" in dir() else "All Phases"
+    _phase_filter = st.session_state.get("phase_filter", "All Phases")
     if _phase_filter != "All Phases":
         results = [r for r in results if r.get("Phase") == _phase_filter]
 
-    _show_illiquid = show_illiquid if "show_illiquid" in dir() else False
+    _show_illiquid = st.session_state.get("show_illiquid", False)
     if not _show_illiquid:
         results = [r for r in results if r.get("LiquidityOK", True)]
 
@@ -1766,88 +1790,56 @@ with tab_scanner:
                 if is_stale else ""
             )
 
-            return f"""
-<div style="background:#111120;border:1px solid {border_color};border-radius:12px;
-     margin-bottom:10px;overflow:hidden;">
-
-  <!-- HEADER -->
-  <div style="display:flex;align-items:center;padding:12px 16px 10px;
-       border-bottom:1px solid #1e1e40;gap:10px;">
-    <div style="background:{num_bg};color:{num_txt};font-family:JetBrains Mono,monospace;
-         font-size:12px;font-weight:700;padding:4px 8px;border-radius:6px;min-width:32px;
-         text-align:center;">{i+1:02d}</div>
-    <div style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:16px;font-weight:700;
-         letter-spacing:-0.3px;flex:1;">{r["Symbol"]}{golden_badge}</div>
-    <span style="background:{act_bg};border:1px solid {act_brd};color:{act_txt};
-         padding:4px 10px;border-radius:5px;font-size:11px;font-weight:700;
-         font-family:DM Sans,sans-serif;">{act}</span>
-    <span style="background:#1e1e40;color:#6b7090;font-family:JetBrains Mono,monospace;
-         font-size:11px;padding:4px 8px;border-radius:5px;">{r["Score"]}</span>
-    <span style="color:#3a3a60;font-size:14px;cursor:pointer;">🔖</span>
-    {stale_html}
-  </div>
-
-  <!-- BODY: left price | right badges -->
-  <div style="display:flex;gap:0;padding:14px 16px;">
-
-    <!-- Left: price block -->
-    <div style="flex:0 0 45%;padding-right:16px;border-right:1px solid #1e1e40;">
-      <div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:26px;
-           font-weight:600;line-height:1;">{f'₹{r["LTP"]:,.2f}'}</div>
-      <div style="font-family:JetBrains Mono,monospace;color:{cc};font-size:13px;
-           margin-top:4px;font-weight:500;">{cs} {arr}</div>
-      {(f'<div style="font-family:JetBrains Mono,monospace;color:#f59e0b;font-size:12px;margin-top:5px;">⚡ {entry_str}</div>' if entry_str else "")}
-    </div>
-
-    <!-- Right: phase + conf + RS + ext warnings -->
-    <div style="flex:1;padding-left:16px;">
-      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-        <!-- Phase badge -->
-        <span style="background:{pc};color:{ph_txt};padding:6px 12px;border-radius:6px;
-             font-size:11px;font-weight:700;font-family:DM Sans,sans-serif;
-             display:flex;align-items:center;gap:4px;">{phase_icon} {ph}{(' ' + ph_arrow) if ph_arrow else ''}</span>
-        <!-- Confidence badge -->
-        <span style="background:#1e1e40;border:1px solid {conf_col}55;
-             padding:6px 10px;border-radius:6px;font-size:10px;font-weight:600;
-             font-family:DM Sans,sans-serif;display:flex;flex-direction:column;
-             align-items:center;line-height:1.3;">
-          <span style="color:#6b7090;font-size:9px;">{conf_lbl}</span>
-          <span style="color:{conf_col};">{conf}%</span>
-        </span>
-        <!-- RS badge -->
-        <span style="background:#1e1e40;border:1px solid {rs_col}55;
-             padding:6px 10px;border-radius:6px;font-size:12px;font-weight:700;
-             font-family:JetBrains Mono,monospace;color:{rs_col};">RS{rsr}</span>
-      </div>
-      {ext_html}
-    </div>
-  </div>
-
-  <!-- FOOTER: stats bar -->
-  <div style="display:flex;align-items:center;padding:9px 16px;
-       border-top:1px solid #1e1e40;background:#0d0d1a;gap:0;">
-    <div style="flex:1;display:flex;flex-direction:column;align-items:flex-start;">
-      <span style="color:#6b7090;font-size:9px;font-family:DM Sans,sans-serif;text-transform:uppercase;letter-spacing:0.5px;">RSI</span>
-      <span style="color:#e8e8f4;font-size:12px;font-family:JetBrains Mono,monospace;font-weight:500;">{rsi_val}</span>
-    </div>
-    <div style="width:1px;background:#1e1e40;height:28px;margin:0 4px;"></div>
-    <div style="flex:1;display:flex;flex-direction:column;align-items:flex-start;">
-      <span style="color:#6b7090;font-size:9px;font-family:DM Sans,sans-serif;text-transform:uppercase;letter-spacing:0.5px;">Trend</span>
-      <span style="color:{trend_col};font-size:12px;font-family:DM Sans,sans-serif;font-weight:600;">{trend_label}</span>
-    </div>
-    <div style="width:1px;background:#1e1e40;height:28px;margin:0 4px;"></div>
-    <div style="flex:1;display:flex;flex-direction:column;align-items:flex-start;">
-      <span style="color:#6b7090;font-size:9px;font-family:DM Sans,sans-serif;text-transform:uppercase;letter-spacing:0.5px;">Volume</span>
-      <span style="color:#e8e8f4;font-size:12px;font-family:DM Sans,sans-serif;font-weight:500;">{vol_label}</span>
-    </div>
-    <div style="width:1px;background:#1e1e40;height:28px;margin:0 4px;"></div>
-    <div style="flex:1;display:flex;flex-direction:column;align-items:flex-start;">
-      <span style="color:#6b7090;font-size:9px;font-family:DM Sans,sans-serif;text-transform:uppercase;letter-spacing:0.5px;">Sector</span>
-      <span style="color:#e8e8f4;font-size:12px;font-family:DM Sans,sans-serif;font-weight:500;">{sector}</span>
-    </div>
-  </div>
-
-</div>"""
+            # Build card as a list of strings, join at end — avoids triple-quote/comment issues
+            ltp_str    = f'&#8377;{r["LTP"]:,.2f}'
+            entry_div  = (f'<div style="font-family:JetBrains Mono,monospace;color:#f59e0b;font-size:12px;margin-top:5px;">&#9889; {entry_str}</div>' if entry_str else "")
+            ph_txt_full = f'{phase_icon} {ph}' + (f' {ph_arrow}' if ph_arrow else '')
+            conf_badge = (
+                f'<span style="background:#1e1e40;border:1px solid {conf_col}55;padding:6px 10px;border-radius:6px;font-size:10px;font-weight:600;font-family:DM Sans,sans-serif;">'
+                f'<span style="color:#6b7090;font-size:9px;display:block;">{conf_lbl}</span>'
+                f'<span style="color:{conf_col};font-weight:700;">{conf}%</span></span>'
+            )
+            parts = [
+                f'<div style="background:#111120;border:1px solid {border_color};border-radius:12px;margin-bottom:10px;overflow:hidden;">',
+                # header
+                f'<div style="display:flex;align-items:center;padding:12px 16px 10px;border-bottom:1px solid #1e1e40;gap:10px;">',
+                f'<div style="background:{num_bg};color:{num_txt};font-family:JetBrains Mono,monospace;font-size:12px;font-weight:700;padding:4px 8px;border-radius:6px;min-width:32px;text-align:center;">{i+1:02d}</div>',
+                f'<div style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:16px;font-weight:700;letter-spacing:-0.3px;flex:1;">{r["Symbol"]}{golden_badge}</div>',
+                f'<span style="background:{act_bg};border:1px solid {act_brd};color:{act_txt};padding:4px 10px;border-radius:5px;font-size:11px;font-weight:700;font-family:DM Sans,sans-serif;">{act}</span>',
+                f'<span style="background:#1e1e40;color:#6b7090;font-family:JetBrains Mono,monospace;font-size:11px;padding:4px 8px;border-radius:5px;">{r["Score"]}</span>',
+                stale_html,
+                '</div>',
+                # body
+                '<div style="display:flex;padding:14px 16px;gap:0;">',
+                # left price
+                f'<div style="flex:0 0 45%;padding-right:16px;border-right:1px solid #1e1e40;">',
+                f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:26px;font-weight:600;line-height:1;">{ltp_str}</div>',
+                f'<div style="font-family:JetBrains Mono,monospace;color:{cc};font-size:13px;margin-top:4px;font-weight:500;">{cs} {arr}</div>',
+                entry_div,
+                '</div>',
+                # right badges
+                '<div style="flex:1;padding-left:16px;">',
+                '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">',
+                f'<span style="background:{pc};color:{ph_txt};padding:6px 12px;border-radius:6px;font-size:11px;font-weight:700;font-family:DM Sans,sans-serif;">{ph_txt_full}</span>',
+                conf_badge,
+                f'<span style="background:#1e1e40;border:1px solid {rs_col}55;padding:6px 10px;border-radius:6px;font-size:12px;font-weight:700;font-family:JetBrains Mono,monospace;color:{rs_col};">RS{rsr}</span>',
+                '</div>',
+                ext_html,
+                '</div>',
+                '</div>',
+                # footer
+                '<div style="display:flex;align-items:center;padding:9px 16px;border-top:1px solid #1e1e40;background:#0d0d1a;">',
+                f'<div style="flex:1;"><span style="color:#6b7090;font-size:9px;display:block;text-transform:uppercase;letter-spacing:0.5px;">RSI</span><span style="color:#e8e8f4;font-size:12px;font-family:JetBrains Mono,monospace;">{rsi_val}</span></div>',
+                '<div style="width:1px;background:#1e1e40;height:28px;margin:0 6px;"></div>',
+                f'<div style="flex:1;"><span style="color:#6b7090;font-size:9px;display:block;text-transform:uppercase;letter-spacing:0.5px;">Trend</span><span style="color:{trend_col};font-size:12px;font-weight:600;">{trend_label}</span></div>',
+                '<div style="width:1px;background:#1e1e40;height:28px;margin:0 6px;"></div>',
+                f'<div style="flex:1;"><span style="color:#6b7090;font-size:9px;display:block;text-transform:uppercase;letter-spacing:0.5px;">Volume</span><span style="color:#e8e8f4;font-size:12px;">{vol_label}</span></div>',
+                '<div style="width:1px;background:#1e1e40;height:28px;margin:0 6px;"></div>',
+                f'<div style="flex:1;"><span style="color:#6b7090;font-size:9px;display:block;text-transform:uppercase;letter-spacing:0.5px;">Sector</span><span style="color:#e8e8f4;font-size:12px;">{sector}</span></div>',
+                '</div>',
+                '</div>',
+            ]
+            return "".join(parts)
 
         if top_act:
             with st.expander(f"READY TO TRADE — {len(top_act)} stocks in ENTRY / CONT / BREAKOUT", expanded=True):
@@ -1935,9 +1927,9 @@ with tab_scanner:
 
         styled = (
             df_display.style
-            .applymap(color_extn, subset=["ExtN"])
-            .applymap(color_action, subset=["Action"])
-            .applymap(color_pct, subset=["%Chg"])
+            .map(color_extn, subset=["ExtN"])
+            .map(color_action, subset=["Action"])
+            .map(color_pct, subset=["%Chg"])
             .set_properties(**{
                 "font-family": "JetBrains Mono, monospace",
                 "font-size": "11px",
@@ -2169,8 +2161,8 @@ with tab_detail:
             # Position sizing
             st.markdown("---")
             with st.expander("Position Sizing (Volatility-Normalized)", expanded=True):
-                _acct_size = account_size if "account_size" in dir() else 500000
-                _risk_pct  = risk_pct_input if "risk_pct_input" in dir() else 0.02
+                _acct_size = st.session_state.get("account_size", 500000)
+                _risk_pct  = st.session_state.get("risk_pct", 0.02)
                 ps = position_size(
                     account_size = _acct_size,
                     entry        = r["Entry"],
