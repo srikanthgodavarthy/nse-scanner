@@ -1360,7 +1360,7 @@ div[data-baseweb="select"] { background: var(--bg-surface) !important; }
 div[data-testid="stMetricValue"] {
   color: var(--amber);
   font-family: var(--mono);
-  font-size: 1.4rem;
+  font-size: 1.7rem;
   font-weight: 500;
 }
 div[data-testid="stMetricLabel"] { color: var(--text-muted); font-size: 11px; }
@@ -1368,7 +1368,7 @@ div[data-testid="stMetricDelta"] { font-family: var(--mono); font-size: 12px; }
 
 /* ── DataFrame ── */
 .stDataFrame {
-  font-size: 12px;
+  font-size: 14px;
   font-family: var(--mono);
   border-radius: 8px;
   overflow: hidden;
@@ -1377,7 +1377,7 @@ div[data-testid="stMetricDelta"] { font-family: var(--mono); font-size: 12px; }
 .stDataFrame thead th {
   background: var(--bg-elevated) !important;
   color: var(--text-muted) !important;
-  font-size: 10px !important;
+  font-size: 12px !important;
   text-transform: uppercase;
   letter-spacing: 0.5px;
   border-bottom: 1px solid var(--bg-border) !important;
@@ -1392,7 +1392,7 @@ div[data-testid="stMetricDelta"] { font-family: var(--mono); font-size: 12px; }
   border: 1px solid var(--bg-border) !important;
   border-radius: 6px !important;
   font-family: var(--sans) !important;
-  font-size: 13px !important;
+  font-size: 15px !important;
   color: var(--text-primary) !important;
 }
 .streamlit-expanderContent {
