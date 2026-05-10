@@ -1249,7 +1249,7 @@ def fetch_indices(mode="Swing"):
 # UI-2: REDESIGNED CSS — Dark terminal aesthetic, amber accents
 # ═══════════════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="NSE Master Scanner Pro",
+    page_title="BULLSUTRA  Pro",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="collapsed",
