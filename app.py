@@ -1800,7 +1800,8 @@ with tab_scanner:
                 f'<span style="color:{conf_col};font-weight:700;">{conf}%</span></span>'
             )
             parts = [
-                f'<div style="background:#111120;border:1px solid {border_color};border-radius:12px;margin-bottom:10px;overflow:hidden;">',
+                #f'<div style="background:#111120;border:1px solid {border_color};border-radius:12px;margin-bottom:10px;overflow:hidden;">',
+                f'<div style="background:#111120;border:1px solid {border_color};border-radius:12px;overflow:hidden;width:360px;min-width:320px;max-width:380px;flex:1 1 360px;">',
                 # header
                 f'<div style="display:flex;align-items:center;padding:12px 16px 10px;border-bottom:1px solid #1e1e40;gap:10px;">',
                 f'<div style="background:{num_bg};color:{num_txt};font-family:JetBrains Mono,monospace;font-size:12px;font-weight:700;padding:4px 8px;border-radius:6px;min-width:32px;text-align:center;">{i+1:02d}</div>',
@@ -1844,8 +1845,16 @@ with tab_scanner:
         if top_act:
             with st.expander(f"READY TO TRADE — {len(top_act)} stocks in ENTRY / CONT / BREAKOUT", expanded=True):
                 cards_html = ""
+                  <div style="
+                  display:flex;
+                  flex-wrap:wrap;
+                  gap:12px;
+                  align-items:flex-start;
+                  ">
+                  """
                 for i, r in enumerate(top_act):
                     cards_html += make_card(i, r, "#22c55e55", show_entry=True)
+                cards_html += "</div>"
                 st.markdown(cards_html, unsafe_allow_html=True)
                 st.markdown(
                     '<div style="text-align:center;color:#3a3a60;font-size:10px;'
@@ -1864,7 +1873,14 @@ with tab_scanner:
         if watchlist:
             with st.expander(f"WATCHLIST — {len(watchlist)} high-score, not yet ready", expanded=False):
                 cards_html = ""
-                for i, r in enumerate(watchlist):
+                <div style="
+                  display:flex;
+                  flex-wrap:wrap;
+                  gap:12px;
+                  align-items:flex-start;
+                  ">
+                  """
+                  for i, r in enumerate(watchlist):
                     cards_html += make_card(i, r, "#f59e0b55", show_entry=False)
                 st.markdown(cards_html, unsafe_allow_html=True)
 
