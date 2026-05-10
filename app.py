@@ -1857,9 +1857,9 @@ with tab_scanner:
 
         styled = (
             df_display.style
-            .applymap(color_extn, subset=["ExtN"])
-            .applymap(color_action, subset=["Action"])
-            .applymap(color_pct, subset=["%Chg"])
+            .map(color_extn, subset=["ExtN"])
+            .map(color_action, subset=["Action"])
+            .map(color_pct, subset=["%Chg"])
             .set_properties(**{
                 "font-family": "JetBrains Mono, monospace",
                 "font-size": "11px",
