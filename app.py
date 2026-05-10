@@ -1844,7 +1844,7 @@ with tab_scanner:
 
         if top_act:
             with st.expander(f"READY TO TRADE — {len(top_act)} stocks in ENTRY / CONT / BREAKOUT", expanded=True):
-                cards_html = ""
+                cards_html = """
                 <div style="
                 display:flex;
                 flex-wrap:wrap;
@@ -1872,7 +1872,7 @@ with tab_scanner:
         ][:10]
         if watchlist:
             with st.expander(f"WATCHLIST — {len(watchlist)} high-score, not yet ready", expanded=False):
-                cards_html = ""
+                cards_html = """
                 <div style="
                 display:flex;
                 flex-wrap:wrap;
