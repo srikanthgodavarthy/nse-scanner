@@ -1,49 +1,36 @@
 """
-NSE Master Scanner Pro — Streamlit Edition v8
+    ╭──╮
+╭──╯  ╰──╮
+│  █ █ █ │
+╰────────╯
+ BullSutra Pro — v9
 ═══════════════════════════════════════════════
-CHANGES FROM v7
-───────────────
-FIX-1  HTF PARALLEL PRE-FETCH
-       htf_trend() was called inside score_stock() causing N×2 sequential
-       yfinance downloads during scoring. Now run_scan() pre-fetches all
-       HTF data in a parallel ThreadPoolExecutor pass BEFORE scoring, and
-       passes htf_up directly into score_stock(). ~60-80% scan time saved.
+UI FIXES FROM v8
+────────────────
+UI-1  BADGE TEXT CONTRAST
+      Green/teal badges now use dark text (deep green/teal) instead of
+      white, which was invisible. All colored badge text uses the 800-stop
+      of its color ramp for proper contrast.
 
-FIX-2  fetch_indices() / OI PAIRING FIXED
-       Sensex card now pairs with NIFTY OI (not BANKNIFTY). BankNifty gets
-       its own dedicated third card with BANKNIFTY OI. Index data is now
-       correctly labelled and paired.
+UI-2  COMPLETE UI REDESIGN
+      Dark terminal-inspired aesthetic with amber/gold accents.
+      Sharp, data-dense layout with proper visual hierarchy.
+      Custom CSS variables, monospace numbers, clear section dividers.
 
-FIX-3  RELATIVE STRENGTH UPGRADED (52w percentile rank)
-       Old RS = simple 6-bar return diff vs Nifty.
-       New RS = IBD-style 52-week percentile rank (0-100) that measures
-       where the stock's 1-year performance sits relative to ALL stocks in
-       the scanned universe. Emits RS_Rank (0-100) for display alongside
-       raw RS diff. RS_Rank >= 80 → strong relative strength bonus.
+UI-3  SECTOR REMOVED FROM TABLE
+      Sector column dropped — redundant with the breadth heatmap view.
 
-FIX-4  PHASE TRANSITION MEMORY
-       st.session_state["phase_history"] stores {sym: [(ts, phase), …]}.
-       Transitions are detected per-symbol and annotated with arrows in
-       the scanner table. Consecutive SETUP→ENTRY→CONT→BREAKOUT progressions
-       score a bonus (+5 conf). Regressive transitions (BREAKOUT→SETUP) are
-       flagged with ⚠. Last-seen phase is shown in the Detail tab.
+UI-4  REDUNDANT CONF COLUMN REMOVED
+      Table shows only "Conf%" (numeric). The text label (HIGH/MED/LOW/WEAK)
+      is embedded in the card view only, not duplicated in the table.
 
-FIX-5  VOLATILITY-NORMALIZED POSITION SIZING
-       New function position_size() uses the Van Tharp / 2%-risk method:
-           shares = floor((account × risk_pct) / (entry - sl))
-       Then applies an ATR-normalisation factor:
-           vix_adj = clamp(20 / vix, 0.5, 1.5)   # smaller size in high VIX
-           atr_adj = clamp(atr_mean / atr_val, 0.6, 1.4)  # smaller when volatile
-       Displayed in Detail tab as "Suggested Qty" for user's account size.
-
-FIX-6  TIME-DECAYED SIGNAL VALIDITY
-       Every logged signal carries a validity_hours value based on mode:
-           Intraday   →  4 h
-           Swing      →  72 h (3 trading days)
-           Positional →  240 h (2 weeks)
-       Analytics tab shows EXPIRED badges and excludes stale signals from
-       active win-rate. Scanner cards show a ⏱ STALE badge when the signal
-       from the previous scan was logged >validity_hours ago.
+UI-5  EXTN HEATMAP COLORING
+      ExtN column background is heatmapped:
+        0  → transparent (clean)
+        1  → amber tint
+        2  → orange tint
+        3+ → red tint
+      Applied via st.dataframe column styling callback.
 """
 
 import warnings
@@ -111,7 +98,7 @@ MODE_CFG = {
                        atr_mult=1.5, atr_wide=3.0, atr_max=1.0,
                        mom1_th=2,  mom3_th=5,  mom6_th=8,  score_th=65, rsi_len=14,
                        htf_period="3mo", htf_interval="15m",
-                       validity_hours=4),          # FIX-6: signal validity
+                       validity_hours=4),
     "Swing":      dict(period="1y",  interval="1d",  ema_fast=50, ema_slow=200,
                        atr_mult=2.5, atr_wide=4.0, atr_max=1.5,
                        mom1_th=3,  mom3_th=7,  mom6_th=10, score_th=70, rsi_len=21,
@@ -140,7 +127,6 @@ PHASE_COLORS = {
     PHASE_BRK:   "#00dd88", PHASE_EXIT:  "#cc4444",
 }
 
-# FIX-4: phase ordering for progression detection
 PHASE_ORDER = {PHASE_IDLE:0, PHASE_SETUP:1, PHASE_ENTRY:2,
                PHASE_CONT:3, PHASE_BRK:4, PHASE_EXIT:-1}
 
@@ -201,10 +187,9 @@ def action_icon(a):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# FIX-6: SIGNAL VALIDITY HELPERS
+# SIGNAL VALIDITY HELPERS
 # ═══════════════════════════════════════════════════════════════════
 def signal_is_stale(logged_at_iso: str, mode: str) -> bool:
-    """Return True if the signal is older than mode's validity window."""
     try:
         validity_h = MODE_CFG[mode].get("validity_hours", 72)
         logged_at  = datetime.fromisoformat(logged_at_iso)
@@ -213,7 +198,6 @@ def signal_is_stale(logged_at_iso: str, mode: str) -> bool:
         return False
 
 def signal_age_label(logged_at_iso: str, mode: str) -> str:
-    """Return human-readable age string and stale flag."""
     try:
         validity_h = MODE_CFG[mode].get("validity_hours", 72)
         logged_at  = datetime.fromisoformat(logged_at_iso)
@@ -271,11 +255,10 @@ def liquidity_ok(df, min_cr=LIQUIDITY_MIN_CR):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# FIX-1: HTF — PARALLEL PRE-FETCH (called from run_scan, not score_stock)
+# HTF — PARALLEL PRE-FETCH
 # ═══════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=900)
 def _fetch_htf_cached(ticker: str, period: str, interval: str) -> pd.DataFrame:
-    """Cached HTF OHLCV download. Called from pre-fetch pass."""
     for attempt in range(3):
         try:
             df = yf.download(ticker, period=period, interval=interval,
@@ -288,7 +271,6 @@ def _fetch_htf_cached(ticker: str, period: str, interval: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 def _htf_trend_from_df(df: pd.DataFrame, mode: str):
-    """Compute HTF trend from a pre-fetched DataFrame. No I/O."""
     if df.empty or len(df) < 20:
         return True, "HTF-UNKNOWN"
     cl   = df["Close"]
@@ -298,13 +280,7 @@ def _htf_trend_from_df(df: pd.DataFrame, mode: str):
     up   = c > ef > es
     return up, ("HTF↑" if up else "HTF↓")
 
-def prefetch_htf_parallel(symbols: list, mode: str,
-                           status_text, progress_bar) -> dict:
-    """
-    FIX-1: Pre-fetch HTF data for all symbols in parallel.
-    Returns {sym: (htf_up: bool, htf_label: str)}.
-    This eliminates N sequential blocking fetches inside score_stock().
-    """
+def prefetch_htf_parallel(symbols: list, mode: str, status_text, progress_bar) -> dict:
     import concurrent.futures
     cfg     = MODE_CFG[mode]
     results = {}
@@ -329,15 +305,9 @@ def prefetch_htf_parallel(symbols: list, mode: str,
 
 
 # ═══════════════════════════════════════════════════════════════════
-# FIX-3: RELATIVE STRENGTH — 52-WEEK PERCENTILE RANK
+# RELATIVE STRENGTH — 52-WEEK PERCENTILE RANK
 # ═══════════════════════════════════════════════════════════════════
 def compute_rs_ranks(sym_returns: dict) -> dict:
-    """
-    IBD-style RS Rank: for each symbol, compute where its 52w return
-    sits relative to all other symbols in the scanned universe (0–100).
-    sym_returns = {sym: float_52w_return_pct}
-    Returns {sym: int_rank_0_100}
-    """
     if not sym_returns:
         return {}
     syms    = list(sym_returns.keys())
@@ -347,12 +317,11 @@ def compute_rs_ranks(sym_returns: dict) -> dict:
     ranks = {}
     for sym in syms:
         r   = sym_returns[sym]
-        pos = sorted_returns.index(r)   # position in sorted list
+        pos = sorted_returns.index(r)
         ranks[sym] = round(pos / max(n - 1, 1) * 100)
     return ranks
 
 def _52w_return(close_series: pd.Series) -> float:
-    """Simple 52-week (252 trading day) return percentage."""
     if len(close_series) < 10:
         return 0.0
     lookback = min(252, len(close_series) - 1)
@@ -364,13 +333,9 @@ def _52w_return(close_series: pd.Series) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# FIX-4: PHASE TRANSITION MEMORY
+# PHASE TRANSITION MEMORY
 # ═══════════════════════════════════════════════════════════════════
 def record_phase_transition(sym: str, new_phase: str):
-    """
-    Append new_phase to phase_history[sym] if it changed.
-    Returns (changed: bool, arrow: str, is_progression: bool, is_regression: bool)
-    """
     if "phase_history" not in st.session_state:
         st.session_state["phase_history"] = {}
     history = st.session_state["phase_history"]
@@ -386,7 +351,6 @@ def record_phase_transition(sym: str, new_phase: str):
     if changed:
         ts = datetime.now().isoformat()
         history[sym].append((ts, new_phase))
-        # Keep last 10 transitions
         history[sym] = history[sym][-10:]
 
         if prev_phase is not None:
@@ -405,10 +369,6 @@ def record_phase_transition(sym: str, new_phase: str):
     return changed, arrow, is_prog, is_regr
 
 def phase_transition_conf_bonus(sym: str) -> int:
-    """
-    FIX-4: +5 confidence bonus if last 3 transitions form a clean
-    SETUP→ENTRY→CONT or ENTRY→CONT→BREAKOUT progression.
-    """
     history = st.session_state.get("phase_history", {})
     if sym not in history or len(history[sym]) < 3:
         return 0
@@ -421,7 +381,6 @@ def phase_transition_conf_bonus(sym: str) -> int:
     return 5 if last3 in progressions else 0
 
 def get_phase_arrow(sym: str) -> str:
-    """Return the most recent transition arrow for display."""
     history = st.session_state.get("phase_history", {})
     if sym not in history or len(history[sym]) < 2:
         return ""
@@ -439,46 +398,22 @@ def get_phase_arrow(sym: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# FIX-5: VOLATILITY-NORMALIZED POSITION SIZING
+# VOLATILITY-NORMALIZED POSITION SIZING
 # ═══════════════════════════════════════════════════════════════════
-def position_size(
-    account_size: float,
-    entry: float,
-    sl: float,
-    atr_val: float,
-    atr_mean: float,
-    vix_val: float | None,
-    risk_pct: float = 0.02,
-) -> dict:
-    """
-    Van Tharp 2%-risk method with ATR and VIX normalization.
-
-    Base qty = floor((account × risk_pct) / risk_per_share)
-    VIX adj  = clamp(20 / vix, 0.5, 1.5)   → smaller size in high VIX
-    ATR adj  = clamp(atr_mean / atr_val, 0.6, 1.4) → smaller when ATR is expanded
-    Final qty = floor(base × vix_adj × atr_adj)
-
-    Returns dict with all components for transparency.
-    """
+def position_size(account_size, entry, sl, atr_val, atr_mean, vix_val, risk_pct=0.02):
     risk_per_share = max(entry - sl, 0.01)
     base_qty       = int((account_size * risk_pct) / risk_per_share)
-
-    # VIX adjustment
     if vix_val and vix_val > 0:
         vix_adj = float(np.clip(20.0 / vix_val, 0.5, 1.5))
     else:
         vix_adj = 1.0
-
-    # ATR normalisation: if current ATR is expanded vs mean, shrink size
     if atr_mean > 0:
         atr_adj = float(np.clip(atr_mean / atr_val, 0.6, 1.4))
     else:
         atr_adj = 1.0
-
     final_qty    = max(1, int(base_qty * vix_adj * atr_adj))
     capital_used = round(final_qty * entry, 2)
     max_loss     = round(final_qty * risk_per_share, 2)
-
     return {
         "base_qty":     base_qty,
         "vix_adj":      round(vix_adj, 2),
@@ -524,7 +459,7 @@ def detect_exhaustion(close, high, low, volume, rsi_series,
     rsi_now = float(rsi_series.iloc[-1])
     if rsi_now > rsi_ceil:
         flags["rsi_overheat"] = True
-        labels.append("Too hot to buy")
+        labels.append("Too hot")
 
     atr_val = float(atr_s.iloc[-1])
     if atr_mean > 0 and atr_val > atr_mean * cfg["atr_exp"]:
@@ -538,14 +473,14 @@ def detect_exhaustion(close, high, low, volume, rsi_series,
         act_3b     = abs(float(close.iloc[-1]) - float(close.iloc[-4])) / float(close.iloc[-4])
         if exp_3b > 0 and act_3b > cfg["parab"] * exp_3b:
             flags["parabolic"] = True
-            labels.append("Moving too fast")
+            labels.append("Parabolic")
 
     e_fast_now = float(e_fast_s.iloc[-1])
     if atr_val > 0:
         ema_dist_atrs = (c - e_fast_now) / atr_val
         if ema_dist_atrs > cfg["ema_dist"]:
             flags["ema_distance"] = True
-            labels.append("Far from average price")
+            labels.append("EMA overext")
 
     wick_thresh = 0.35 if (c > 0 and atr_val/c > 0.03) else 0.30
 
@@ -557,7 +492,7 @@ def detect_exhaustion(close, high, low, volume, rsi_series,
             upper_wick = float(high.iloc[-1]) - c
             if bar_range > 0 and (upper_wick / bar_range) > wick_thresh:
                 flags["climactic_volume"] = True
-                labels.append("Panic buying spike")
+                labels.append("Vol climax")
 
     if n >= 10:
         lookback  = min(cfg["div_bars"], n-1)
@@ -571,7 +506,7 @@ def detect_exhaustion(close, high, low, volume, rsi_series,
                 and c > price_at_peak
                 and rsi_win.idxmax() != rsi_win.index[-1]):
             flags["mom_exhaustion"] = True
-            labels.append("Buyers losing steam")
+            labels.append("Mom fade")
 
     if n >= 20:
         lookback = min(cfg["div_bars"]*2, n-2)
@@ -588,7 +523,7 @@ def detect_exhaustion(close, high, low, volume, rsi_series,
             rh1, rh2 = float(r_slice.iloc[p1]), float(r_slice.iloc[p2])
             if ph2 > ph1 and rh2 < rh1 - 2 and (len(h_slice)-1-p2) <= 5:
                 flags["bearish_div"] = True
-                labels.append("Price up but strength fading")
+                labels.append("Bear div")
 
     penalty = sum(EXT_PENALTIES[k] for k, v in flags.items() if v)
     n_flags = sum(flags.values())
@@ -621,12 +556,9 @@ def ext_action_cap(action, n_flags, vix_val=None):
 # ═══════════════════════════════════════════════════════════════════
 # CONFIDENCE MODEL
 # ═══════════════════════════════════════════════════════════════════
-def compute_confidence(
-    *, norm_bull, phase, trend_up, trend_strong, vol_confirmed,
-    ema_stack, htf_aligned, regime_bullish, ext_n, vix_val,
-    phase_bonus=0,    # FIX-4: phase progression bonus
-    rs_rank=50,       # FIX-3: RS rank component
-):
+def compute_confidence(*, norm_bull, phase, trend_up, trend_strong, vol_confirmed,
+                       ema_stack, htf_aligned, regime_bullish, ext_n, vix_val,
+                       phase_bonus=0, rs_rank=50):
     c = 0.0
     c += {PHASE_BRK: 20, PHASE_CONT: 17, PHASE_ENTRY: 13,
           PHASE_SETUP: 7, PHASE_IDLE: 2, PHASE_EXIT: 0}.get(phase, 0)
@@ -638,11 +570,9 @@ def compute_confidence(
     c -= min(5, ext_n * 2)
     if vix_val is not None and vix_val > VIX_CAUTION:
         c -= 5
-    # FIX-3: RS rank bonus (up to +5 for top-decile RS)
     if rs_rank >= 90:   c += 5
     elif rs_rank >= 80: c += 3
     elif rs_rank <= 20: c -= 3
-    # FIX-4: phase progression bonus
     c += phase_bonus
     return round(min(100, max(0, c)), 1)
 
@@ -845,10 +775,7 @@ def _market_regime(nifty_close):
 # ═══════════════════════════════════════════════════════════════════
 def score_stock(df, nifty_close, mode="Swing", daily_close=None,
                 market_bullish=True, vix_val=None, min_liquidity_cr=LIQUIDITY_MIN_CR,
-                sym=None,
-                htf_up=True,        # FIX-1: pre-fetched HTF result
-                rs_rank=50,         # FIX-3: pre-computed RS rank
-               ):
+                sym=None, htf_up=True, rs_rank=50):
     try:
         cfg   = MODE_CFG[mode]
         close = df["Close"]
@@ -877,7 +804,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
 
         above_ema50 = c > float(ema(close, 50).iloc[-1])
 
-        # FIX-3: use 52w return for raw RS diff display (rank computed externally)
         rs_raw = 0.0
         if n >= 6 and len(nifty_close) >= 6:
             rs_raw = ((c - float(close.iloc[-6])) / float(close.iloc[-6]) -
@@ -896,9 +822,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         mom3 = (c - float(mom_src.iloc[-63]))  / float(mom_src.iloc[-63])  * 100 if mom_n >= 63  else 0
         mom6 = (c - float(mom_src.iloc[-126])) / float(mom_src.iloc[-126]) * 100 if mom_n >= 126 else 0
         strong_htf = mom1 > cfg["mom1_th"] and mom3 > cfg["mom3_th"] and mom6 > cfg["mom6_th"]
-
-        # FIX-1: htf_up is now passed in from pre-fetched parallel data
-        # (no blocking download here)
 
         sw_hi, sw_lo, fib, fib_rng = fib_levels(df, lookback=30)
         prox      = atr_val * 0.3
@@ -936,7 +859,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         bull += 15 if c > hh else (9 if c > hh*0.98 else 0)
         if n >= 3 and c > float(close.iloc[-3]):
             bull += 8
-        # FIX-3: RS rank bonus replaces simple raw-diff bonus
         bull += 7 if rs_rank >= 80 else (3 if rs_rank >= 60 else (0 if rs_rank >= 40 else -3))
         if mode == "Positional":
             bull += 15 if qualified else -15
@@ -973,13 +895,11 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         phase, _ = ext_phase_override(phase, ext_flags, ext_n, mode)
         act       = ext_action_cap(act, ext_n, vix_val)
 
-        # FIX-4: phase transition memory
         phase_bonus = 0
         if sym:
             record_phase_transition(sym, phase)
             phase_bonus = phase_transition_conf_bonus(sym)
 
-        # FIX-3 + FIX-4: confidence with RS rank and phase bonus
         confidence = compute_confidence(
             norm_bull=norm_bull, phase=phase, trend_up=trend_up,
             trend_strong=trend_strong, vol_confirmed=vol_confirmed,
@@ -1036,7 +956,7 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
             "LiquidityOK": liq_ok,
             "RSI":         round(r, 1),
             "RS":          round(rs_raw, 2),
-            "RS_Rank":     rs_rank,         # FIX-3
+            "RS_Rank":     rs_rank,
             "ExtN":        ext_n,
             "ExtLabels":   ext_labels,
             "ExtFlags":    ext_flags,
@@ -1045,7 +965,7 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
             "VolConf":     vol_confirmed,
             "ATR":         round(atr_val, 2),
             "ATR_Mean":    round(atr_mean, 2),
-            "PhaseBonus":  phase_bonus,     # FIX-4
+            "PhaseBonus":  phase_bonus,
         }
     except Exception:
         return None
@@ -1112,7 +1032,7 @@ def _breadth_signal(pct_ema50, ad_ratio, pct_brk):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# RUN SCAN — v8 with all parallel passes
+# RUN SCAN
 # ═══════════════════════════════════════════════════════════════════
 def run_scan(symbols, mode, progress_bar, status_text,
              vix_val=None, min_liq_cr=LIQUIDITY_MIN_CR):
@@ -1129,10 +1049,9 @@ def run_scan(symbols, mode, progress_bar, status_text,
     if not market_bullish:
         st.warning(
             f"⚠️ **Market Regime: {regime_label}** — EMA20 below EMA50. "
-            "Scores haircut 15 %. Targets compressed. Continuation gate tightened."
+            "Scores haircut 15%. Targets compressed."
         )
 
-    # ── PASS 1: OHLCV fetch (parallel) ────────────────────────────
     status_text.text("Pass 1/3: Fetching OHLCV data…")
     data         = {}
     daily_closes = {}
@@ -1165,22 +1084,16 @@ def run_scan(symbols, mode, progress_bar, status_text,
                 if df is not None:
                     daily_closes[sym] = df["Close"]
 
-    # ── FIX-1: PASS 2: HTF pre-fetch (parallel, replaces per-stock fetches) ──
     status_text.text("Pass 2/3: Pre-fetching HTF data (parallel)…")
     progress_bar.progress(0.40)
-    htf_map = prefetch_htf_parallel(
-        list(data.keys()), mode, status_text, progress_bar
-    )
-    # htf_map = {sym: (htf_up: bool, htf_label: str)}
+    htf_map = prefetch_htf_parallel(list(data.keys()), mode, status_text, progress_bar)
 
-    # ── FIX-3: PASS 2b: compute 52w returns → RS ranks ────────────
     status_text.text("Pass 2b/3: Computing RS ranks…")
     sym_52w_returns = {}
     for sym, df in data.items():
         sym_52w_returns[sym] = _52w_return(df["Close"])
     rs_rank_map = compute_rs_ranks(sym_52w_returns)
 
-    # ── PASS 3: SCORE ──────────────────────────────────────────────
     results     = []
     n_data      = len(data)
     liq_skipped = 0
@@ -1189,8 +1102,8 @@ def run_scan(symbols, mode, progress_bar, status_text,
         progress_bar.progress(0.65 + (i+1)/n_data * 0.35)
         status_text.text(f"Pass 3/3: Scoring {i+1}/{n_data}  ▸  {sym}")
 
-        htf_up, _ = htf_map.get(sym, (True, "HTF-UNKNOWN"))  # FIX-1
-        rs_rank   = rs_rank_map.get(sym, 50)                  # FIX-3
+        htf_up, _ = htf_map.get(sym, (True, "HTF-UNKNOWN"))
+        rs_rank   = rs_rank_map.get(sym, 50)
 
         res = score_stock(
             df, nifty, mode,
@@ -1199,8 +1112,8 @@ def run_scan(symbols, mode, progress_bar, status_text,
             vix_val        = vix_val,
             min_liquidity_cr = min_liq_cr,
             sym            = sym,
-            htf_up         = htf_up,    # FIX-1: pre-fetched
-            rs_rank        = rs_rank,   # FIX-3: pre-computed
+            htf_up         = htf_up,
+            rs_rank        = rs_rank,
         )
         if res:
             res["Regime"] = regime_label
@@ -1286,22 +1199,20 @@ def fetch_oi_data(symbol="NIFTY"):
     except Exception: return None
 
 def _oi_sentiment(pcr):
-    if pcr >= 1.3: return "Bullish 🟢", "#2ecc71"
-    if pcr >= 0.9: return "Neutral 🟡", "#f39c12"
-    return "Bearish 🔴", "#e74c3c"
+    if pcr >= 1.3: return "Bullish", "#16a34a"
+    if pcr >= 0.9: return "Neutral", "#d97706"
+    return "Bearish", "#dc2626"
 
 
-# FIX-2: fetch_indices now returns 3 items: Nifty50, BankNifty, Sensex
 @st.cache_data(ttl=300)
 def fetch_indices(mode="Swing"):
     cfg = MODE_CFG[mode]
     ema_f = cfg["ema_fast"]; ema_s = cfg["ema_slow"]; rsi_l = cfg["rsi_len"]
     min_bars = 30 if mode == "Intraday" else 50
     out = {}
-    # FIX-2: correct ticker mapping — add BankNifty
     index_map = [
         ("Nifty 50",   "^NSEI"),
-        ("BankNifty",  "^NSEBANK"),   # FIX-2: was missing; Sensex was wrongly getting BankNifty OI
+        ("BankNifty",  "^NSEBANK"),
         ("Sensex",     "^BSESN"),
     ]
     for name, ticker in index_map:
@@ -1339,7 +1250,7 @@ def fetch_indices(mode="Swing"):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# STREAMLIT UI
+# UI-2: REDESIGNED CSS — Dark terminal aesthetic, amber accents
 # ═══════════════════════════════════════════════════════════════════
 st.set_page_config(
     page_title="NSE Master Scanner Pro",
@@ -1350,35 +1261,156 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-body, .stApp {font-family:'Inter',sans-serif;}
-h1,h2,h3 {font-family:'Inter',sans-serif;}
-.stDataFrame { font-size:12px; }
-div[data-testid="stMetricValue"] { color:#00c9ff; font-size:1.3rem; font-family:'Syne',sans-serif; }
-div[data-testid="stMetricLabel"] { color:#6060a0; font-size:11px; }
-.stTabs [data-baseweb="tab-list"] { gap:4px; background:#0e0e20; border-radius:8px; padding:4px; }
-.stTabs [data-baseweb="tab"] { background:#0e0e20; color:#6060a0; border-radius:6px;
-    font-family:'Syne',sans-serif; font-size:13px; padding:6px 18px; }
-.stTabs [aria-selected="true"] { background:#1a1a3a !important; color:#00c9ff !important; }
-.stButton>button { font-family:'Syne',sans-serif; font-weight:700; letter-spacing:.5px; }
-.stSelectbox label, .stRadio label { color:#6060a0; font-size:11px; }
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Syne:wght@600;700;800&family=DM+Sans:wght@400;500;600&display=swap');
+
+/* ── Root palette ── */
+:root {
+  --bg-base:     #09090f;
+  --bg-surface:  #111120;
+  --bg-elevated: #171730;
+  --bg-border:   #1e1e40;
+  --amber:       #f59e0b;
+  --amber-dim:   #92600a;
+  --amber-glow:  rgba(245,158,11,0.12);
+  --green-vivid: #22c55e;
+  --green-dark:  #14532d;   /* UI-1: dark text for green badges */
+  --green-dim:   rgba(34,197,94,0.12);
+  --red-vivid:   #ef4444;
+  --red-dark:    #7f1d1d;
+  --blue-vivid:  #3b82f6;
+  --teal-vivid:  #14b8a6;
+  --teal-dark:   #134e4a;   /* UI-1: dark text for teal badges */
+  --text-primary: #e8e8f4;
+  --text-muted:  #6b7090;
+  --text-dim:    #3a3a60;
+  --mono: 'JetBrains Mono', monospace;
+  --sans: 'DM Sans', sans-serif;
+  --display: 'Syne', sans-serif;
+}
+
+/* ── Base ── */
+body, .stApp { background: var(--bg-base) !important; font-family: var(--sans); }
+.main .block-container { padding-top: 1.2rem; padding-bottom: 1rem; max-width: 1400px; }
+h1,h2,h3 { font-family: var(--display); }
+
+/* ── Tabs ── */
+.stTabs [data-baseweb="tab-list"] {
+  gap: 2px;
+  background: var(--bg-surface);
+  border: 1px solid var(--bg-border);
+  border-radius: 8px;
+  padding: 4px;
+  margin-bottom: 16px;
+}
+.stTabs [data-baseweb="tab"] {
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: 6px;
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 6px 16px;
+  border: none;
+  letter-spacing: 0.3px;
+}
+.stTabs [aria-selected="true"] {
+  background: var(--amber-glow) !important;
+  color: var(--amber) !important;
+  border: 1px solid var(--amber-dim) !important;
+}
+
+/* ── Buttons ── */
+.stButton > button {
+  font-family: var(--display);
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 1px;
+  background: var(--amber) !important;
+  color: #09090f !important;
+  border: none !important;
+  border-radius: 6px;
+  padding: 8px 24px;
+  transition: filter 0.15s;
+}
+.stButton > button:hover { filter: brightness(1.1); }
+
+/* ── Inputs & selects ── */
+.stSelectbox > div > div,
+.stTextInput > div > div > input,
+.stRadio > div { font-family: var(--sans); font-size: 13px; }
+.stRadio label { color: var(--text-muted) !important; }
+div[data-baseweb="select"] { background: var(--bg-surface) !important; }
+
+/* ── Metrics ── */
+div[data-testid="stMetricValue"] {
+  color: var(--amber);
+  font-family: var(--mono);
+  font-size: 1.4rem;
+  font-weight: 500;
+}
+div[data-testid="stMetricLabel"] { color: var(--text-muted); font-size: 11px; }
+div[data-testid="stMetricDelta"] { font-family: var(--mono); font-size: 12px; }
+
+/* ── DataFrame ── */
+.stDataFrame {
+  font-size: 12px;
+  font-family: var(--mono);
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--bg-border) !important;
+}
+.stDataFrame thead th {
+  background: var(--bg-elevated) !important;
+  color: var(--text-muted) !important;
+  font-size: 10px !important;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid var(--bg-border) !important;
+}
+.stDataFrame tbody tr:nth-child(odd)  { background: var(--bg-surface) !important; }
+.stDataFrame tbody tr:nth-child(even) { background: var(--bg-base) !important; }
+.stDataFrame tbody tr:hover { background: var(--bg-elevated) !important; }
+
+/* ── Expander ── */
+.streamlit-expanderHeader {
+  background: var(--bg-surface) !important;
+  border: 1px solid var(--bg-border) !important;
+  border-radius: 6px !important;
+  font-family: var(--sans) !important;
+  font-size: 13px !important;
+  color: var(--text-primary) !important;
+}
+.streamlit-expanderContent {
+  background: var(--bg-base) !important;
+  border: 1px solid var(--bg-border) !important;
+  border-top: none !important;
+}
+
+/* ── Alerts ── */
+div[data-testid="stAlert"] { border-radius: 6px; font-size: 13px; font-family: var(--sans); }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: var(--bg-base); }
+::-webkit-scrollbar-thumb { background: var(--bg-border); border-radius: 2px; }
 </style>""", unsafe_allow_html=True)
 
 # ── Session state init ────────────────────────────────────────────
 for key, default in [
     ("results",[]), ("scan_time",None), ("rejected",0), ("liq_skipped",0),
-    ("scan_mode","Swing"), ("signal_log",[]),
-    ("phase_history",{}),    # FIX-4
+    ("scan_mode","Swing"), ("signal_log",[]), ("phase_history",{}),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
 # ── Header ────────────────────────────────────────────────────────
 st.markdown(
-    '<h1 style="font-family:Syne,sans-serif;font-size:26px;margin-bottom:0;'
-    'background:linear-gradient(90deg,#00c9ff,#92fe9d);-webkit-background-clip:text;'
-    '-webkit-text-fill-color:transparent;">📈 NSE Master Scanner Pro  '
-    '<span style="font-size:14px;opacity:.6">[Phase Engine v8]</span></h1>',
+    '<div style="display:flex;align-items:baseline;gap:12px;margin-bottom:4px;">'
+    '<h1 style="font-family:Syne,sans-serif;font-size:22px;margin:0;'
+    'color:#f59e0b;letter-spacing:-0.5px;">NSE MASTER SCANNER</h1>'
+    '<span style="font-family:JetBrains Mono,monospace;font-size:11px;'
+    'color:#3a3a60;letter-spacing:2px;">PRO · v9</span>'
+    '</div>',
     unsafe_allow_html=True,
 )
 
@@ -1389,27 +1421,32 @@ with gc1:
 with gc2:
     mode_opt = st.radio("Mode", ["Swing","Intraday","Positional"], horizontal=True)
 with gc3:
-    scan_btn = st.button("🔍 SCAN", type="primary", use_container_width=True)
+    scan_btn = st.button("SCAN", type="primary", use_container_width=True)
 with gc4:
-    filter_opt = st.selectbox("Action Filter",
+    filter_opt = st.selectbox("Filter",
         ["BUY + STRONG BUY","STRONG BUY only","WATCH + BUY","All Results"],
         label_visibility="collapsed")
 with gc5:
-    search_q = st.text_input("Symbol search", placeholder="e.g. RELIANCE",
+    search_q = st.text_input("Search symbol", placeholder="e.g. RELIANCE",
                               label_visibility="collapsed")
 
-# ── VIX ──────────────────────────────────────────────────────────
+# ── VIX banner ───────────────────────────────────────────────────
 vix_val, vix_label = fetch_vix()
-vix_color = {"CALM":"#2ecc71","CAUTION":"#f39c12","STRESS":"#e74c3c","UNKNOWN":"#7a7a9a"}.get(vix_label,"#7a7a9a")
+vix_color = {"CALM":"#22c55e","CAUTION":"#f59e0b","STRESS":"#ef4444","UNKNOWN":"#6b7090"}.get(vix_label,"#6b7090")
+# UI-1: dark text on colored badge, not white
+vix_text_color = {"CALM":"#14532d","CAUTION":"#78350f","STRESS":"#7f1d1d","UNKNOWN":"#374151"}.get(vix_label,"#374151")
 
 st.markdown(
-    f'<div style="display:flex;gap:12px;align-items:center;margin-bottom:6px;">'
-    f'<span style="background:{vix_color}22;border:1px solid {vix_color}55;'
-    f'padding:2px 10px;border-radius:4px;font-size:11px;color:{vix_color};">'
-    f'🌡 India VIX {vix_val if vix_val else "N/A"} — {vix_label}</span>'
-    + (f'<span style="color:#e74c3c;font-size:11px;">⚠ VIX>{VIX_STRESS}: STRONG BUY blocked · targets compressed</span>'
+    f'<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;">'
+    f'<span style="background:{vix_color}22;border:1px solid {vix_color}44;'
+    f'padding:3px 10px;border-radius:4px;font-size:11px;color:{vix_color};'
+    f'font-family:JetBrains Mono,monospace;font-weight:500;">'
+    f'VIX {vix_val if vix_val else "—"} · {vix_label}</span>'
+    + (f'<span style="color:#ef4444;font-size:11px;font-family:DM Sans,sans-serif;">'
+       f'⚠ High VIX: STRONG BUY blocked · targets compressed</span>'
        if (vix_val and vix_val >= VIX_STRESS) else "")
-    + (f'<span style="color:#f39c12;font-size:11px;">⚡ VIX>{VIX_CAUTION}: targets compressed · SL widened</span>'
+    + (f'<span style="color:#f59e0b;font-size:11px;font-family:DM Sans,sans-serif;">'
+       f'⚡ Elevated VIX: targets compressed · SL widened</span>'
        if (vix_val and VIX_CAUTION <= vix_val < VIX_STRESS) else "")
     + f'</div>',
     unsafe_allow_html=True,
@@ -1417,7 +1454,7 @@ st.markdown(
 
 # ── Tabs ─────────────────────────────────────────────────────────
 tab_scanner, tab_breadth, tab_detail, tab_analytics, tab_settings = st.tabs([
-    "📡 Scanner", "📊 Breadth Engine", "🔍 Detail", "📈 Analytics", "⚙ Settings",
+    "Scanner", "Breadth Engine", "Detail", "Analytics", "Settings",
 ])
 
 
@@ -1432,16 +1469,13 @@ with tab_settings:
         phase_filter = st.selectbox("Phase Filter (Scanner)",
             ["All Phases","ENTRY","SETUP","CONT","BREAKOUT","IDLE","EXIT"])
         show_illiquid = st.checkbox("Show illiquid stocks (below liquidity floor)", value=False)
-        # FIX-5: account size for position sizing
         st.markdown("---")
-        st.markdown("**Position Sizing (FIX-5)**")
+        st.markdown("**Position Sizing**")
         account_size = st.number_input("Account Size (₹)", min_value=10000,
                                        max_value=10_000_000, value=500000, step=10000)
         risk_pct_input = st.slider("Risk per trade (%)", 0.5, 5.0, 2.0, 0.5) / 100.0
     with sc2:
-        st.markdown("**VIX Thresholds**")
-        st.caption(f"Caution: {VIX_CAUTION}  ·  Stress: {VIX_STRESS}")
-        st.markdown("**Scoring Reference**")
+        st.markdown("**Action Thresholds**")
         st.markdown("""
 | Score | Action |
 |---|---|
@@ -1450,19 +1484,14 @@ with tab_settings:
 | ≥ 42 | WATCH |
 | < 42 | SKIP |
         """)
-        st.markdown("**Signal Validity Windows (FIX-6)**")
+        st.markdown("**Signal Validity**")
         st.markdown("""
-| Mode | Validity |
+| Mode | Window |
 |---|---|
-| Intraday | 4 hours |
-| Swing | 72 hours (3 days) |
-| Positional | 240 hours (2 weeks) |
+| Intraday | 4 h |
+| Swing | 72 h |
+| Positional | 240 h |
         """)
-        st.markdown("**RS Rank (FIX-3)**")
-        st.caption(
-            "RS Rank 0–100 = where this stock's 52-week return sits vs the scanned universe. "
-            "80+ = top quintile. 20- = bottom quintile."
-        )
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1486,7 +1515,6 @@ if scan_btn:
     st.session_state.scan_time   = (
         datetime.now().strftime("%H:%M:%S") + f" ({universe_opt} · {mode_opt})"
     )
-    # FIX-6: log signals with validity metadata
     ts = datetime.now().isoformat()
     validity_h = MODE_CFG[mode_opt]["validity_hours"]
     for r in results:
@@ -1498,13 +1526,13 @@ if scan_btn:
                 "phase":          r.get("Phase"),
                 "score":          r["Score"],
                 "confidence":     r.get("Confidence", 0),
-                "rs_rank":        r.get("RS_Rank", 50),   # FIX-3
+                "rs_rank":        r.get("RS_Rank", 50),
                 "entry":          r.get("Entry"),
                 "sl":             r.get("SL"),
                 "t1":             r.get("T1"),
                 "ltp_at_signal":  r.get("LTP"),
                 "mode":           mode_opt,
-                "validity_hours": validity_h,              # FIX-6
+                "validity_hours": validity_h,
                 "outcome":        "Pending",
             })
     prog.empty(); stat.empty()
@@ -1518,62 +1546,93 @@ if scan_btn:
 # SCANNER TAB
 # ═══════════════════════════════════════════════════════════════════
 with tab_scanner:
-    # FIX-2: fetch 3 indices, pair each with correct OI
     indices      = fetch_indices(mode_opt)
     oi_nifty     = fetch_oi_data("NIFTY")
     oi_banknifty = fetch_oi_data("BANKNIFTY")
 
-    # FIX-2: 3 index cards, correctly paired
     ic1, ic2, ic3 = st.columns(3)
     index_card_cfg = [
         ("Nifty 50",  ic1, oi_nifty),
         ("BankNifty", ic2, oi_banknifty),
-        ("Sensex",    ic3, None),          # FIX-2: Sensex has no NSE OI feed
+        ("Sensex",    ic3, None),
     ]
 
     for name, col, oi_data in index_card_cfg:
         d = indices.get(name)
         with col:
             if not d:
-                st.markdown(f"**{name}:** unavailable"); continue
-            chg_val=d["chg"]; pct_val=d["pct"]; ltp_val=d["value"]
-            cs  = f"+{chg_val:,.1f} (+{pct_val:.2f}%)" if chg_val>=0 else f"{chg_val:,.1f} ({pct_val:.2f}%)"
-            cc  = "#2ecc71" if chg_val>=0 else "#e74c3c"
-            ar  = "▲" if chg_val>=0 else "▼"
+                st.markdown(f"<div style='color:#6b7090;font-size:12px;'>{name}: unavailable</div>",
+                            unsafe_allow_html=True)
+                continue
+
+            chg_val = d["chg"]; pct_val = d["pct"]; ltp_val = d["value"]
+            cs = f"+{pct_val:.2f}%" if chg_val >= 0 else f"{pct_val:.2f}%"
+            cc = "#22c55e" if chg_val >= 0 else "#ef4444"
+            ar = "▲" if chg_val >= 0 else "▼"
             act = d["action"]
-            ac  = ("#ffd700" if act=="STRONG BUY" else "#2ecc71" if act=="BUY"
-                   else "#f39c12" if act=="WATCH" else "#e74c3c")
-            sp  = int(min(d["score"],100))
+            # UI-1: score bar color + DISTINCT text color on colored backgrounds
+            score_bar_color = (
+                "#f59e0b" if act == "STRONG BUY" else
+                "#22c55e" if act == "BUY" else
+                "#f59e0b" if act == "WATCH" else
+                "#6b7090"
+            )
+            act_text_color = (
+                "#78350f" if act == "STRONG BUY" else  # amber-dark on amber
+                "#14532d" if act == "BUY" else          # green-dark on green
+                "#78350f" if act == "WATCH" else
+                "#e8e8f4"
+            )
+            sp = int(min(d["score"], 100))
+
             oi_badge = ""
             if oi_data:
-                s_label,s_col = _oi_sentiment(oi_data["pcr"])
-                pd_ = oi_data["max_pain"]-int(ltp_val)
-                pa  = "⬆️" if pd_>0 else ("⬇️" if pd_<0 else "🎯")
-                lbl = name
+                s_label, s_col = _oi_sentiment(oi_data["pcr"])
+                # UI-1: ensure text is dark on the colored sentiment badge
+                s_text = "#14532d" if "Bullish" in s_label else ("#78350f" if "Neutral" in s_label else "#7f1d1d")
+                pd_ = oi_data["max_pain"] - int(ltp_val)
+                pa = "↑" if pd_ > 0 else ("↓" if pd_ < 0 else "=")
                 oi_badge = (
-                    f'<div style="margin-top:5px;padding:4px 7px;background:#0a0a18;'
-                    f'border-radius:4px;border:1px solid #1c1c36;font-size:10px;">'
-                    f'<span style="color:#6060a0;">{lbl} PCR: </span>'
-                    f'<span style="color:{s_col};font-weight:bold;">{oi_data["pcr"]} {s_label}</span>'
-                    f'  MaxPain: <span style="color:#e0c97f;">₹{oi_data["max_pain"]:,} {pa}{pd_:+,}</span>'
-                    f'  CWall:<span style="color:#e74c3c;">₹{oi_data["call_wall"]:,}</span>'
-                    f'  PWall:<span style="color:#2ecc71;">₹{oi_data["put_wall"]:,}</span></div>'
+                    f'<div style="margin-top:6px;padding:5px 8px;background:#09090f;'
+                    f'border-radius:5px;border:1px solid #1e1e40;font-family:JetBrains Mono,monospace;">'
+                    f'<span style="color:#6b7090;font-size:9px;">PCR </span>'
+                    f'<span style="background:{s_col}22;border:1px solid {s_col}44;'
+                    f'color:{s_col};padding:1px 5px;border-radius:3px;font-size:9px;font-weight:600;">'
+                    f'{oi_data["pcr"]} {s_label}</span>'
+                    f'<span style="color:#6b7090;font-size:9px;margin-left:6px;">Pain </span>'
+                    f'<span style="color:#f59e0b;font-size:9px;font-weight:600;">'
+                    f'₹{oi_data["max_pain"]:,} {pa}{abs(pd_):,}</span>'
+                    f'<br><span style="color:#ef4444;font-size:9px;">C▶₹{oi_data["call_wall"]:,}  </span>'
+                    f'<span style="color:#22c55e;font-size:9px;">P▶₹{oi_data["put_wall"]:,}</span>'
+                    f'</div>'
                 )
+
             st.markdown(
-                f'<div style="background:#0e0e22;border:1px solid #1c1c36;border-radius:10px;padding:12px 14px;">'
-                f'<div style="color:#6060a0;font-size:10px;">{name}</div>'
-                f'<div style="color:#e8e8f0;font-size:20px;font-weight:bold;font-family:Syne,sans-serif;">'
+                f'<div style="background:#111120;border:1px solid #1e1e40;'
+                f'border-radius:10px;padding:14px 16px;">'
+                f'<div style="font-family:DM Sans,sans-serif;color:#6b7090;'
+                f'font-size:10px;text-transform:uppercase;letter-spacing:1px;">{name}</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;'
+                f'font-size:22px;font-weight:600;margin:4px 0 2px;">'
                 f'{ltp_val:,.1f}</div>'
-                f'<div style="color:{cc};font-size:12px;">{ar} {cs}</div>'
-                f'<div style="margin:6px 0 3px;background:#1c1c36;border-radius:3px;height:5px;">'
-                f'<div style="background:{ac};width:{sp}%;height:5px;border-radius:3px;"></div></div>'
-                f'<div style="color:{ac};font-size:11px;">{act} · {d["score"]}</div>'
-                f'<div style="color:#6060a0;font-size:10px;">{d["trend"]} · RSI {d["rsi"]}</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:{cc};font-size:12px;">'
+                f'{ar} {cs}</div>'
+                f'<div style="margin:8px 0 4px;background:#1e1e40;border-radius:3px;height:3px;">'
+                f'<div style="background:{score_bar_color};width:{sp}%;height:3px;'
+                f'border-radius:3px;transition:width 0.3s;"></div></div>'
+                f'<div style="display:flex;align-items:center;gap:6px;margin-top:4px;">'
+                f'<span style="background:{score_bar_color}22;border:1px solid {score_bar_color}44;'
+                f'color:{score_bar_color};padding:2px 7px;border-radius:3px;'
+                f'font-size:10px;font-weight:600;font-family:DM Sans,sans-serif;">{act}</span>'
+                f'<span style="font-family:JetBrains Mono,monospace;color:#3a3a60;font-size:10px;">'
+                f'RSI {d["rsi"]} · {d["trend"]}</span>'
+                f'</div>'
                 + oi_badge + '</div>',
                 unsafe_allow_html=True,
             )
 
-    st.markdown("---")
+    st.markdown('<div style="border-top:1px solid #1e1e40;margin:16px 0;"></div>',
+                unsafe_allow_html=True)
 
     # ── Apply filters ─────────────────────────────────────────────
     results = list(st.session_state.results)
@@ -1584,8 +1643,9 @@ with tab_scanner:
     elif filter_opt == "WATCH + BUY":
         results = [r for r in results if r["Action"] in ("WATCH","BUY","STRONG BUY")]
 
-    if "phase_filter" in dir() and phase_filter != "All Phases":
-        results = [r for r in results if r.get("Phase") == phase_filter]
+    _phase_filter = phase_filter if "phase_filter" in dir() else "All Phases"
+    if _phase_filter != "All Phases":
+        results = [r for r in results if r.get("Phase") == _phase_filter]
 
     _show_illiquid = show_illiquid if "show_illiquid" in dir() else False
     if not _show_illiquid:
@@ -1605,78 +1665,121 @@ with tab_scanner:
         actionable.sort(key=lambda x: (phase_rank.get(x.get("Phase"),9), -x["Score"]))
         top_act = actionable[:15]
 
-        # FIX-6: build stale set from signal log
         scan_mode_now = st.session_state.scan_mode
         stale_syms = set()
         for entry in st.session_state.signal_log:
             if signal_is_stale(entry["timestamp"], entry.get("mode", scan_mode_now)):
                 stale_syms.add(entry["symbol"])
 
+        def _action_colors(act):
+            """UI-1: return (bg_color, border_color, text_color) with proper contrast."""
+            if act == "STRONG BUY":
+                return "#f59e0b22", "#f59e0b55", "#f59e0b"
+            if act == "BUY":
+                return "#22c55e1a", "#22c55e44", "#22c55e"
+            if act == "WATCH":
+                return "#f59e0b11", "#f59e0b33", "#d97706"
+            return "#6b709011", "#6b709033", "#6b7090"
+
         def make_card(i, r, border_color, show_entry=True):
-            chg = r["%Change"]; cs = f"+{chg}%" if chg>=0 else f"{chg}%"
-            cc  = "#2ecc71" if chg>=0 else "#e74c3c"
+            chg = r["%Change"]
+            cs  = f"+{chg}%" if chg >= 0 else f"{chg}%"
+            cc  = "#22c55e" if chg >= 0 else "#ef4444"
             act = r["Action"]
-            ac  = "#ffd700" if act=="STRONG BUY" else "#2ecc71"
-            ph  = r.get("Phase",PHASE_IDLE)
-            pc  = PHASE_COLORS.get(ph,"#555")
-            st_icon = {"fib":"🌀","breakout":"🚀","norm":"📊","vdu":"🔕"}.get(r.get("Setup","norm"),"📊")
-            conf = r.get("Confidence",0)
+            act_bg, act_brd, act_txt = _action_colors(act)
+            ph  = r.get("Phase", PHASE_IDLE)
+            pc  = PHASE_COLORS.get(ph, "#555")
+            # UI-1: dark text on bright phase backgrounds
+            ph_txt_map = {
+                "#00dd88": "#064e3b",  # BREAKOUT green → dark green
+                "#22aa55": "#064e3b",  # CONT green → dark green
+                "#2255cc": "#1e1b4b",  # ENTRY blue → dark blue
+                "#b87333": "#431407",  # SETUP amber → dark
+                "#555577": "#c4c6d0",  # IDLE → light
+                "#cc4444": "#7f1d1d",  # EXIT → dark red
+            }
+            ph_txt = ph_txt_map.get(pc, "#e8e8f4")
+            conf = r.get("Confidence", 0)
             conf_lbl, conf_col = confidence_label(conf)
-            entry_str = f'₹{r["Entry"]:,}' if show_entry and r["Entry"]!=r["LTP"] else ""
-            ext_n = r.get("ExtN",0)
-            ext_labels = r.get("ExtLabels",[])
+            # UI-1: dark text for confidence badge
+            conf_txt_map = {"HIGH":"#14532d","MED":"#78350f","LOW":"#7c2d12","WEAK":"#7f1d1d"}
+            conf_txt = conf_txt_map.get(conf_lbl, "#e8e8f4")
+            entry_str = f'₹{r["Entry"]:,}' if show_entry and r["Entry"] != r["LTP"] else ""
+            ext_n = r.get("ExtN", 0)
+            ext_labels = r.get("ExtLabels", [])
             ext_badge = ""
             if ext_n > 0:
-                ec = "#cc4444" if ext_n>=3 else "#e67e22"
+                ec = "#ef444422" if ext_n >= 3 else "#f59e0b22"
+                ec_brd = "#ef4444" if ext_n >= 3 else "#f59e0b"
+                ec_txt = "#ef4444" if ext_n >= 3 else "#d97706"
                 ext_badge = (
-                    f'<div style="margin-top:4px;background:{ec}22;border:1px solid {ec}55;'
-                    f'border-radius:3px;padding:2px 4px;font-size:9px;color:{ec};">'
+                    f'<div style="margin-top:4px;background:{ec};border:1px solid {ec_brd}44;'
+                    f'border-radius:3px;padding:2px 5px;font-size:9px;color:{ec_txt};'
+                    f'font-family:JetBrains Mono,monospace;">'
                     f'⚠ {" · ".join(ext_labels[:2])}</div>'
                 )
             liq_badge = (
-                '<div style="margin-top:2px;font-size:9px;color:#e67e22;">💧 Low liquidity</div>'
-                if not r.get("LiquidityOK",True) else ""
+                '<div style="margin-top:2px;font-size:9px;color:#d97706;">low liq</div>'
+                if not r.get("LiquidityOK", True) else ""
             )
-            # FIX-4: phase transition arrow
-            ph_arrow  = get_phase_arrow(r["Symbol"])
-            # FIX-6: stale badge
+            ph_arrow = get_phase_arrow(r["Symbol"])
             stale_badge = (
-                '<div style="margin-top:2px;font-size:9px;color:#888;">⏱ Signal expired</div>'
+                '<div style="margin-top:2px;font-size:9px;color:#6b7090;">⏱ expired</div>'
                 if r["Symbol"] in stale_syms else ""
             )
-            # FIX-3: RS rank badge
             rsr = r.get("RS_Rank", 50)
-            rs_col = "#2ecc71" if rsr>=80 else ("#f39c12" if rsr>=60 else "#e74c3c")
-            rs_badge = (
-                f'<span style="background:{rs_col}22;border:1px solid {rs_col}55;color:{rs_col};'
-                f'padding:1px 4px;border-radius:3px;font-size:9px;">RS {rsr}</span>'
-            )
+            rs_col = "#22c55e" if rsr >= 80 else ("#d97706" if rsr >= 60 else "#6b7090")
+            rs_txt = "#14532d" if rsr >= 80 else ("#78350f" if rsr >= 60 else "#4b5563")  # UI-1
+
             return (
-                f'<div style="background:#0a0a1e;border:1px solid {border_color};border-radius:8px;'
-                f'padding:10px 12px;min-width:140px;flex:1 1 140px;max-width:200px;">'
-                f'<div style="color:#e8e8f0;font-weight:bold;font-size:12px;font-family:Syne,sans-serif;">'
-                f'{i+1}. {r["Symbol"]}{"🌟" if r.get("InGolden") else ""}'
-                + (f' <span style="color:#92fe9d;font-size:10px;">{ph_arrow}</span>' if ph_arrow else "")
+                f'<div style="background:#111120;border:1px solid {border_color};'
+                f'border-radius:8px;padding:10px 12px;min-width:150px;flex:1 1 150px;max-width:210px;">'
+                # Symbol row
+                f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;'
+                f'font-weight:600;font-size:12px;display:flex;align-items:center;gap:4px;">'
+                f'{i+1}. {r["Symbol"]}'
+                + (f'<span style="font-size:9px;color:#22c55e;margin-left:2px;">🌟</span>' if r.get("InGolden") else "")
+                + (f'<span style="color:#22c55e;font-size:10px;margin-left:2px;">{ph_arrow}</span>' if ph_arrow else "")
                 + f'</div>'
-                f'<div style="color:{ac};font-size:10px;">{act} · {r["Score"]}</div>'
-                f'<div style="color:#e8e8f0;font-size:12px;">₹{r["LTP"]:,} <span style="color:{cc}">{cs}</span></div>'
-                + (f'<div style="color:#aaa;font-size:10px;">⚡ {entry_str}</div>' if entry_str else "")
-                + f'<div style="margin-top:4px;display:flex;gap:3px;flex-wrap:wrap;">'
-                f'<span style="background:{pc};color:#fff;padding:1px 5px;border-radius:3px;font-size:9px;">{ph}</span>'
-                f'<span style="background:{conf_col}33;border:1px solid {conf_col}66;color:{conf_col};'
-                f'padding:1px 5px;border-radius:3px;font-size:9px;">{conf_lbl} {conf}%</span>'
-                f'<span style="background:#1c1c36;color:#aaa;padding:1px 5px;border-radius:3px;font-size:9px;">{st_icon}</span>'
-                + rs_badge
-                + ('<span style="background:#4a3000;color:#ffa500;padding:1px 5px;border-radius:3px;font-size:9px;">VDU</span>'
+                # Action badge
+                f'<div style="margin:4px 0;">'
+                f'<span style="background:{act_bg};border:1px solid {act_brd};'
+                f'color:{act_txt};padding:2px 6px;border-radius:3px;'
+                f'font-size:9px;font-weight:600;font-family:DM Sans,sans-serif;">{act}</span>'
+                f'<span style="font-family:JetBrains Mono,monospace;color:#6b7090;'
+                f'font-size:9px;margin-left:4px;">{r["Score"]}</span>'
+                f'</div>'
+                # LTP + change
+                f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:13px;">'
+                f'₹{r["LTP"]:,} <span style="color:{cc};font-size:10px;">{cs}</span></div>'
+                + (f'<div style="font-family:JetBrains Mono,monospace;color:#f59e0b;'
+                   f'font-size:10px;margin-top:2px;">⚡ {entry_str}</div>' if entry_str else "")
+                # Badges row
+                + f'<div style="margin-top:5px;display:flex;gap:3px;flex-wrap:wrap;align-items:center;">'
+                # Phase badge - UI-1: dark text
+                f'<span style="background:{pc};color:{ph_txt};'
+                f'padding:2px 6px;border-radius:3px;font-size:9px;'
+                f'font-weight:600;font-family:DM Sans,sans-serif;">{ph}</span>'
+                # Confidence badge - UI-1: dark text on colored bg
+                f'<span style="background:{conf_col}22;border:1px solid {conf_col}44;'
+                f'color:{conf_col};padding:2px 5px;border-radius:3px;'
+                f'font-size:9px;font-family:DM Sans,sans-serif;">{conf_lbl} {conf}%</span>'
+                # RS badge
+                f'<span style="background:{rs_col}1a;border:1px solid {rs_col}33;'
+                f'color:{rs_col};padding:2px 5px;border-radius:3px;font-size:9px;'
+                f'font-family:JetBrains Mono,monospace;">RS{rsr}</span>'
+                + ('<span style="background:#f59e0b22;border:1px solid #f59e0b44;'
+                   'color:#d97706;padding:2px 5px;border-radius:3px;'
+                   'font-size:9px;font-family:DM Sans,sans-serif;">VDU</span>'
                    if r.get("VDU") else "")
                 + "</div>" + ext_badge + liq_badge + stale_badge + "</div>"
             )
 
         if top_act:
-            with st.expander("🚀 READY TO TRADE — ENTRY / CONT / BREAKOUT", expanded=True):
-                cards = '<div style="display:flex;flex-wrap:wrap;gap:7px;">'
-                for i,r in enumerate(top_act):
-                    cards += make_card(i, r, "#00dd88", show_entry=True)
+            with st.expander(f"READY TO TRADE — {len(top_act)} stocks in ENTRY / CONT / BREAKOUT", expanded=True):
+                cards = '<div style="display:flex;flex-wrap:wrap;gap:8px;padding:4px 0;">'
+                for i, r in enumerate(top_act):
+                    cards += make_card(i, r, "#22c55e44", show_entry=True)
                 cards += "</div>"
                 st.markdown(cards, unsafe_allow_html=True)
         else:
@@ -1684,14 +1787,14 @@ with tab_scanner:
 
         watchlist = [
             r for r in st.session_state.results
-            if r.get("Phase") in (PHASE_SETUP,PHASE_IDLE)
-            and r["Score"]>=58 and r["Action"] in ("BUY","STRONG BUY")
+            if r.get("Phase") in (PHASE_SETUP, PHASE_IDLE)
+            and r["Score"] >= 58 and r["Action"] in ("BUY","STRONG BUY")
         ][:10]
         if watchlist:
-            with st.expander("👁 WATCHLIST — High Score, Not Yet Ready", expanded=False):
-                cards = '<div style="display:flex;flex-wrap:wrap;gap:7px;">'
-                for i,r in enumerate(watchlist):
-                    cards += make_card(i, r, "#b87333", show_entry=False)
+            with st.expander(f"WATCHLIST — {len(watchlist)} high-score, not yet ready", expanded=False):
+                cards = '<div style="display:flex;flex-wrap:wrap;gap:8px;padding:4px 0;">'
+                for i, r in enumerate(watchlist):
+                    cards += make_card(i, r, "#f59e0b44", show_entry=False)
                 cards += "</div>"
                 st.markdown(cards, unsafe_allow_html=True)
 
@@ -1699,56 +1802,89 @@ with tab_scanner:
     if results:
         rows = []
         for i, r in enumerate(results):
-            chg        = r["%Change"]
-            phase      = r.get("Phase",PHASE_IDLE)
-            setup_icon = {"fib":"🌀","breakout":"🚀","norm":"📊","vdu":"🔕"}.get(r.get("Setup","norm"),"📊")
-            conf       = r.get("Confidence",0)
-            conf_lbl, _ = confidence_label(conf)
-            ph_arrow   = get_phase_arrow(r["Symbol"])   # FIX-4
+            chg      = r["%Change"]
+            phase    = r.get("Phase", PHASE_IDLE)
+            setup_icon = {"fib":"Fib","breakout":"BRK","norm":"std","vdu":"VDU"}.get(r.get("Setup","norm"),"std")
+            conf     = r.get("Confidence", 0)
+            ph_arrow = get_phase_arrow(r["Symbol"])
             rows.append({
-                "#":         i+1,
-                "Symbol":    r["Symbol"],
-                "Sector":    r.get("Sector","Other"),
-                "Score":     r["Score"],
-                "Conf%":     conf,
-                "Confidence":conf_lbl,
-                "Phase":     f'{phase}{" "+ph_arrow if ph_arrow else ""}',  # FIX-4
-                "Setup":     f'{setup_icon} {r.get("Setup","norm")}',
-                "Action":    f"{action_icon(r['Action'])} {r['Action']}",
-                "%Chg":      f"+{chg}%" if chg>=0 else f"{chg}%",
-                "RSI":       r.get("RSI","—"),
-                "RS_Rank":   r.get("RS_Rank",50),          # FIX-3
-                "LTP":       fmt(r["LTP"]),
-                "Entry":     fmt(r["Entry"]) + (" ⚡" if r["Entry"]!=r["LTP"] else ""),
-                "SL":        fmt(r["SL"]),
-                "T1":        fmt(r["T1"]),
-                "T2":        fmt(r["T2"]),
-                "T3":        fmt(r["T3"]),
-                "Liq₹Cr":   r.get("AvgTradedCr","—"),
-                "Golden":    "🌟" if r.get("InGolden") else "",
-                "VDU":       "🔕" if r.get("VDU") else "",
-                "HTF":       "↑" if r.get("HTFUp",True) else "↓",
-                "Regime":    r.get("Regime","—"),
-                "ExtN":      r.get("ExtN",0),
-                "ExtWarn":   " · ".join(r.get("ExtLabels",[])) or "—",
+                "#":       i + 1,
+                "Symbol":  r["Symbol"],
+                # UI-3: Sector removed
+                "Score":   r["Score"],
+                # UI-4: Only Conf% (numeric), no text label column
+                "Conf%":   conf,
+                "Phase":   f'{phase}{" "+ph_arrow if ph_arrow else ""}',
+                "Setup":   setup_icon,
+                "Action":  r["Action"],
+                "%Chg":    f"+{chg}%" if chg >= 0 else f"{chg}%",
+                "RSI":     r.get("RSI", "—"),
+                "RS_Rank": r.get("RS_Rank", 50),
+                "LTP":     fmt(r["LTP"]),
+                "Entry":   fmt(r["Entry"]) + (" ⚡" if r["Entry"] != r["LTP"] else ""),
+                "SL":      fmt(r["SL"]),
+                "T1":      fmt(r["T1"]),
+                "T2":      fmt(r["T2"]),
+                "T3":      fmt(r["T3"]),
+                "Liq₹Cr": r.get("AvgTradedCr", "—"),
+                "HTF":     "↑" if r.get("HTFUp", True) else "↓",
+                # UI-5: ExtN as integer for heatmap styling
+                "ExtN":    r.get("ExtN", 0),
+                "Ext":     " ".join(r.get("ExtLabels", [])) or "—",
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=480)
-        st.caption(
-            "Score 0-100 · Conf% = confidence · RS_Rank = 52w return percentile vs universe (80+=top quintile) · "
-            "Phase ↗/↘ = transition direction (FIX-4) · HTF ↑/↓ = weekly trend · "
-            "Liq₹Cr = avg daily traded value · ExtN = warnings (0=clear · 3+=skip)"
+
+        df_display = pd.DataFrame(rows)
+
+        # UI-5: ExtN heatmap via Styler
+        def color_extn(val):
+            if val == 0:   return "background-color: transparent; color: #6b7090"
+            if val == 1:   return "background-color: #78350f44; color: #f59e0b"
+            if val == 2:   return "background-color: #9a3412aa; color: #fb923c"
+            return              "background-color: #7f1d1d; color: #fca5a5; font-weight: 600"
+
+        def color_action(val):
+            if val == "STRONG BUY": return "color: #f59e0b; font-weight: 600"
+            if val == "BUY":        return "color: #22c55e"
+            if val == "WATCH":      return "color: #d97706"
+            return "color: #6b7090"
+
+        def color_pct(val):
+            if isinstance(val, str) and val.startswith("+"):
+                return "color: #22c55e; font-family: JetBrains Mono, monospace"
+            if isinstance(val, str) and val.startswith("-"):
+                return "color: #ef4444; font-family: JetBrains Mono, monospace"
+            return ""
+
+        styled = (
+            df_display.style
+            .applymap(color_extn, subset=["ExtN"])
+            .applymap(color_action, subset=["Action"])
+            .applymap(color_pct, subset=["%Chg"])
+            .set_properties(**{
+                "font-family": "JetBrains Mono, monospace",
+                "font-size": "11px",
+            })
+        )
+
+        st.dataframe(styled, use_container_width=True, hide_index=True, height=480)
+
+        st.markdown(
+            '<div style="font-size:10px;color:#3a3a60;font-family:JetBrains Mono,monospace;'
+            'margin-top:4px;">Score 0-100 · Conf% = confidence · RS_Rank = 52w percentile '
+            '(80+=top) · HTF ↑/↓ = weekly · Liq₹Cr = avg daily value · ExtN 0=clean 3+=skip</div>',
+            unsafe_allow_html=True,
         )
 
         buy_rows = [r for r in results if r["Action"] in ("BUY","STRONG BUY")]
         if buy_rows:
-            csv = pd.DataFrame(buy_rows).drop(columns=["ExtFlags"],errors="ignore").to_csv(index=False)
+            csv = pd.DataFrame(buy_rows).drop(columns=["ExtFlags"], errors="ignore").to_csv(index=False)
             ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-            st.download_button("💾 Export BUY results", csv,
-                               f"NSE_Scan_{st.session_state.scan_mode}_{ts}.csv","text/csv")
+            st.download_button("Export BUY results", csv,
+                               f"NSE_Scan_{st.session_state.scan_mode}_{ts}.csv", "text/csv")
     elif st.session_state.results:
         st.warning("No stocks match current filters.")
     else:
-        st.info("👆 Select Universe + Mode, then press SCAN.")
+        st.info("Select Universe + Mode, then press SCAN.")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1763,10 +1899,10 @@ with tab_breadth:
         b_sig, b_col = breadth["breadth_signal"]
 
         st.markdown(
-            f'<div style="background:{b_col}11;border:1px solid {b_col}44;border-radius:8px;'
-            f'padding:10px 16px;margin-bottom:12px;">'
-            f'<span style="font-family:Syne,sans-serif;font-size:16px;color:{b_col};">'
-            f'Market Breadth: {b_sig}</span></div>',
+            f'<div style="background:{b_col}11;border:1px solid {b_col}33;border-radius:8px;'
+            f'padding:10px 16px;margin-bottom:14px;">'
+            f'<span style="font-family:Syne,sans-serif;font-size:15px;color:{b_col};">'
+            f'Market Breadth: <strong>{b_sig}</strong></span></div>',
             unsafe_allow_html=True,
         )
 
@@ -1784,93 +1920,96 @@ with tab_breadth:
 
         interp_lines = []
         if pct_ema >= 70:
-            interp_lines.append("✅ **Strong internal trend** — 70%+ above EMA50. Breakouts likely to sustain.")
+            interp_lines.append("✅ **Strong internal trend** — 70%+ above EMA50.")
         elif pct_ema >= 50:
             interp_lines.append("🟡 **Mixed breadth** — about half the market participating. Be selective.")
         else:
-            interp_lines.append("🔴 **Weak breadth** — majority below EMA50. Avoid chasing breakouts.")
+            interp_lines.append("🔴 **Weak breadth** — majority below EMA50. Avoid chasing.")
 
         if adr >= 2.0:
             interp_lines.append("✅ **A/D ratio strong** — broad advancing participation.")
         elif adr < 0.8:
-            interp_lines.append("🔴 **Declining dominance** — wait for A/D to recover before new longs.")
+            interp_lines.append("🔴 **Declining dominance** — wait for A/D recovery before new longs.")
 
         if brk_pct >= 5:
-            interp_lines.append(f"✅ **Breakout breadth healthy** ({brk_pct}% in BREAKOUT).")
+            interp_lines.append(f"✅ **Breakout breadth healthy** ({brk_pct}%).")
         elif brk_pct < 1:
-            interp_lines.append("🔴 **No breakout breadth** — avoid momentum trades until breadth improves.")
+            interp_lines.append("🔴 **No breakout breadth** — avoid momentum until breadth improves.")
 
         if vix_val:
             if vix_val >= VIX_STRESS:
-                interp_lines.append(f"🔴 **VIX {vix_val} — STRESS**: Targets auto-compressed. STRONG BUY blocked.")
+                interp_lines.append(f"🔴 **VIX {vix_val} STRESS** — STRONG BUY blocked. Targets compressed.")
             elif vix_val >= VIX_CAUTION:
-                interp_lines.append(f"🟡 **VIX {vix_val} — CAUTION**: Targets compressed 25%, SL widened 20%.")
+                interp_lines.append(f"🟡 **VIX {vix_val} CAUTION** — Targets compressed 25%, SL widened.")
             else:
-                interp_lines.append(f"✅ **VIX {vix_val} — CALM**: Normal risk parameters.")
+                interp_lines.append(f"✅ **VIX {vix_val} CALM** — Normal risk parameters.")
 
         st.markdown("\n\n".join(interp_lines))
         st.markdown("---")
-        st.subheader("📊 Sector Heatmap")
+        st.subheader("Sector Heatmap")
 
         sector_data = breadth["sector_avg"]
         if sector_data:
             sec_df = pd.DataFrame([
                 {"Sector": k, "Avg Score": v,
                  "Count": sum(1 for r in all_results if r.get("Sector")==k)}
-                for k,v in sorted(sector_data.items(), key=lambda x:-x[1])
+                for k, v in sorted(sector_data.items(), key=lambda x: -x[1])
             ])
-            hm_html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;">'
+            hm_html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px;">'
             for _, row in sec_df.iterrows():
                 score = row["Avg Score"]
-                bar_col = ("#2ecc71" if score>=70 else "#f39c12" if score>=55 else "#e74c3c")
+                bar_col = "#22c55e" if score >= 70 else ("#d97706" if score >= 55 else "#ef4444")
                 pct = min(100, score)
                 hm_html += (
-                    f'<div style="background:#0e0e22;border:1px solid #1c1c36;border-radius:6px;padding:8px 10px;">'
-                    f'<div style="color:#e8e8f0;font-size:11px;font-weight:bold;">{row["Sector"]}</div>'
-                    f'<div style="color:#6060a0;font-size:10px;">{int(row["Count"])} stocks</div>'
-                    f'<div style="background:#1c1c36;border-radius:3px;height:6px;margin:5px 0;">'
-                    f'<div style="background:{bar_col};width:{pct}%;height:6px;border-radius:3px;"></div></div>'
-                    f'<div style="color:{bar_col};font-size:13px;font-weight:bold;font-family:Syne,sans-serif;">{score}</div>'
+                    f'<div style="background:#111120;border:1px solid #1e1e40;'
+                    f'border-radius:7px;padding:10px 12px;">'
+                    f'<div style="color:#e8e8f4;font-size:11px;font-weight:600;'
+                    f'font-family:DM Sans,sans-serif;">{row["Sector"]}</div>'
+                    f'<div style="color:#6b7090;font-size:10px;'
+                    f'font-family:JetBrains Mono,monospace;">{int(row["Count"])} stocks</div>'
+                    f'<div style="background:#1e1e40;border-radius:2px;height:4px;margin:6px 0;">'
+                    f'<div style="background:{bar_col};width:{pct}%;height:4px;border-radius:2px;"></div></div>'
+                    f'<div style="color:{bar_col};font-size:15px;font-weight:600;'
+                    f'font-family:JetBrains Mono,monospace;">{score}</div>'
                     f'</div>'
                 )
             hm_html += "</div>"
             st.markdown(hm_html, unsafe_allow_html=True)
 
         st.markdown("---")
-        st.subheader("📉 A/D Distribution")
         dist_data   = {"Advancing": breadth["advancing"], "Unchanged": breadth["unchanged"], "Declining": breadth["declining"]}
-        dist_colors = {"Advancing":"#2ecc71","Unchanged":"#f39c12","Declining":"#e74c3c"}
+        dist_colors = {"Advancing":"#22c55e","Unchanged":"#d97706","Declining":"#ef4444"}
         total_shown = sum(dist_data.values())
         dist_html = '<div style="display:flex;gap:8px;">'
         for label, count in dist_data.items():
             pct2 = round(count/total_shown*100,1) if total_shown else 0
             col  = dist_colors[label]
             dist_html += (
-                f'<div style="flex:1;background:#0e0e22;border:1px solid {col}44;'
-                f'border-radius:6px;padding:10px;text-align:center;">'
-                f'<div style="color:{col};font-size:20px;font-weight:bold;font-family:Syne,sans-serif;">{count}</div>'
-                f'<div style="color:#6060a0;font-size:11px;">{label}</div>'
-                f'<div style="color:{col};font-size:11px;">{pct2}%</div>'
+                f'<div style="flex:1;background:#111120;border:1px solid {col}33;'
+                f'border-radius:7px;padding:12px;text-align:center;">'
+                f'<div style="color:{col};font-size:22px;font-weight:600;'
+                f'font-family:JetBrains Mono,monospace;">{count}</div>'
+                f'<div style="color:#6b7090;font-size:11px;font-family:DM Sans,sans-serif;">{label}</div>'
+                f'<div style="color:{col};font-size:11px;'
+                f'font-family:JetBrains Mono,monospace;">{pct2}%</div>'
                 f'</div>'
             )
         dist_html += "</div>"
         st.markdown(dist_html, unsafe_allow_html=True)
 
-        # FIX-3: RS rank distribution
+        # RS rank distribution
         st.markdown("---")
-        st.subheader("📈 RS Rank Distribution (FIX-3)")
-        rs_buckets = {"Top (80-100)":0, "Upper (60-79)":0, "Mid (40-59)":0,
-                      "Lower (20-39)":0, "Bottom (0-19)":0}
+        st.subheader("RS Rank Distribution")
+        rs_buckets = {"Top 80-100":0, "Upper 60-79":0, "Mid 40-59":0, "Lower 20-39":0, "Bottom 0-19":0}
         for r in all_results:
             rk = r.get("RS_Rank", 50)
-            if rk >= 80:   rs_buckets["Top (80-100)"]   += 1
-            elif rk >= 60: rs_buckets["Upper (60-79)"]  += 1
-            elif rk >= 40: rs_buckets["Mid (40-59)"]    += 1
-            elif rk >= 20: rs_buckets["Lower (20-39)"]  += 1
-            else:           rs_buckets["Bottom (0-19)"] += 1
+            if rk >= 80:   rs_buckets["Top 80-100"]   += 1
+            elif rk >= 60: rs_buckets["Upper 60-79"]  += 1
+            elif rk >= 40: rs_buckets["Mid 40-59"]    += 1
+            elif rk >= 20: rs_buckets["Lower 20-39"]  += 1
+            else:           rs_buckets["Bottom 0-19"] += 1
         rs_cols = st.columns(5)
-        rs_bcolors = ["#2ecc71","#92fe9d","#f39c12","#e67e22","#e74c3c"]
-        for col, (label, cnt), color in zip(rs_cols, rs_buckets.items(), rs_bcolors):
+        for col, (label, cnt) in zip(rs_cols, rs_buckets.items()):
             col.metric(label, cnt)
 
 
@@ -1883,53 +2022,64 @@ with tab_detail:
         st.info("Run a scan first.")
     else:
         sel = st.selectbox("Select stock", [r["Symbol"] for r in all_results])
-        r   = next((x for x in all_results if x["Symbol"]==sel), None)
+        r   = next((x for x in all_results if x["Symbol"] == sel), None)
         if r:
-            phase = r.get("Phase",PHASE_IDLE)
+            phase = r.get("Phase", PHASE_IDLE)
             chg   = r["%Change"]
-            conf  = r.get("Confidence",0)
+            conf  = r.get("Confidence", 0)
             conf_lbl, conf_col = confidence_label(conf)
 
-            # Phase timeline with FIX-4 history
-            phases_order = [PHASE_IDLE,PHASE_SETUP,PHASE_ENTRY,PHASE_CONT,PHASE_BRK,PHASE_EXIT]
-            history = st.session_state.get("phase_history",{}).get(sel,[])
+            # Phase timeline
+            phases_order = [PHASE_IDLE, PHASE_SETUP, PHASE_ENTRY, PHASE_CONT, PHASE_BRK, PHASE_EXIT]
+            history = st.session_state.get("phase_history", {}).get(sel, [])
+
             ph_html = '<div style="display:flex;gap:5px;margin-bottom:12px;flex-wrap:wrap;">'
             for ph in phases_order:
-                active = ph==phase
-                bg   = PHASE_COLORS[ph] if active else "#1c1c36"
-                brd  = f"2px solid {PHASE_COLORS[ph]}" if active else "2px solid #222"
-                fw   = "bold" if active else "normal"
+                active = ph == phase
+                bg   = PHASE_COLORS[ph] if active else "#1e1e40"
+                brd  = f"1px solid {PHASE_COLORS[ph]}" if active else "1px solid #1e1e40"
+                # UI-1: dark text on bright active phase bg
+                txt_active = {
+                    "#00dd88":"#064e3b", "#22aa55":"#064e3b",
+                    "#2255cc":"#dbeafe", "#b87333":"#431407",
+                    "#555577":"#c4c6d0", "#cc4444":"#fee2e2",
+                }.get(PHASE_COLORS[ph], "#e8e8f4")
                 ph_html += (
-                    f'<div style="background:{bg};border:{brd};color:#fff;'
-                    f'padding:4px 11px;border-radius:5px;font-size:11px;font-weight:{fw};">'
+                    f'<div style="background:{bg};border:{brd};'
+                    f'color:{"" + txt_active if active else "#6b7090"};'
+                    f'padding:4px 12px;border-radius:5px;font-size:11px;'
+                    f'font-weight:{"600" if active else "400"};'
+                    f'font-family:DM Sans,sans-serif;">'
                     f'{ph}{"  ◀" if active else ""}</div>'
                 )
             ph_html += "</div>"
             st.markdown(ph_html, unsafe_allow_html=True)
 
-            # FIX-4: show phase transition log
             if len(history) >= 2:
                 transitions = []
                 for j in range(1, len(history)):
                     prev_ts, prev_ph = history[j-1]
                     curr_ts, curr_ph = history[j]
                     arrow = "↗" if PHASE_ORDER.get(curr_ph,0) > PHASE_ORDER.get(prev_ph,0) else "↘"
-                    transitions.append(f'{prev_ph} {arrow} {curr_ph}  <span style="color:#555;font-size:10px;">({curr_ts[:16]})</span>')
+                    transitions.append(
+                        f'{prev_ph} {arrow} {curr_ph}'
+                        f'  <span style="color:#3a3a60;font-size:10px;">({curr_ts[:16]})</span>'
+                    )
                 st.markdown(
-                    '<details><summary style="color:#6060a0;font-size:11px;cursor:pointer;">'
-                    f'🔄 Phase History ({len(history)} states)</summary>'
-                    '<div style="font-size:11px;color:#a0a0c0;padding:6px 0;">'
-                    + "<br>".join(transitions) +
-                    '</div></details>',
+                    '<details><summary style="color:#6b7090;font-size:11px;cursor:pointer;">'
+                    f'Phase History ({len(history)} states)</summary>'
+                    '<div style="font-size:11px;color:#6b7090;padding:6px 0;'
+                    'font-family:JetBrains Mono,monospace;">'
+                    + "<br>".join(transitions) + '</div></details>',
                     unsafe_allow_html=True,
                 )
 
             d1,d2,d3,d4,d5 = st.columns(5)
-            d1.metric("LTP",         fmt(r["LTP"]),  f"{'+' if chg>=0 else ''}{chg}%")
-            d2.metric("Entry ⚡",    fmt(r["Entry"]))
-            d3.metric("Stop Loss",   fmt(r["SL"]))
-            d4.metric("Score",       r["Score"])
-            d5.metric("Confidence",  f"{conf}% ({conf_lbl})")
+            d1.metric("LTP",        fmt(r["LTP"]),  f"{'+' if chg>=0 else ''}{chg}%")
+            d2.metric("Entry ⚡",   fmt(r["Entry"]))
+            d3.metric("Stop Loss",  fmt(r["SL"]))
+            d4.metric("Score",      r["Score"])
+            d5.metric("Confidence", f"{conf}% ({conf_lbl})")
 
             t1c,t2c,t3c,r1c = st.columns(4)
             t1c.metric("T1", fmt(r["T1"]))
@@ -1938,9 +2088,9 @@ with tab_detail:
             risk = round(r["Entry"] - r["SL"], 2) if r.get("Entry") and r.get("SL") else 0
             r1c.metric("Risk/Share", fmt(risk))
 
-            # FIX-5: position sizing block
+            # Position sizing
             st.markdown("---")
-            with st.expander("💰 Position Sizing (FIX-5: Volatility-Normalized)", expanded=True):
+            with st.expander("Position Sizing (Volatility-Normalized)", expanded=True):
                 _acct_size = account_size if "account_size" in dir() else 500000
                 _risk_pct  = risk_pct_input if "risk_pct_input" in dir() else 0.02
                 ps = position_size(
@@ -1953,27 +2103,24 @@ with tab_detail:
                     risk_pct     = _risk_pct,
                 )
                 ps1,ps2,ps3,ps4 = st.columns(4)
-                ps1.metric("Suggested Qty",   ps["final_qty"],
-                           help="Base qty adjusted for VIX and ATR expansion")
-                ps2.metric("Capital Used",    fmt(ps["capital_used"]))
-                ps3.metric("Max Loss",        fmt(ps["max_loss"]),
-                           help=f"{_risk_pct*100:.1f}% of account = ₹{_acct_size*_risk_pct:,.0f}")
-                ps4.metric("Risk per Share",  fmt(risk))
-                adj_html = (
-                    f'<div style="background:#0a0a1e;border:1px solid #1c1c36;border-radius:6px;'
-                    f'padding:8px 12px;margin-top:8px;font-size:11px;">'
-                    f'Base qty: <b>{ps["base_qty"]}</b>  ×  '
-                    f'VIX adj <b>{ps["vix_adj"]}×</b>  ×  '
-                    f'ATR adj <b>{ps["atr_adj"]}×</b>  =  '
-                    f'<span style="color:#00c9ff;font-weight:bold;">{ps["final_qty"]} shares</span>'
-                    f'<br><span style="color:#555;">VIX adj = clamp(20/VIX, 0.5, 1.5) — '
-                    f'smaller when VIX high. ATR adj = clamp(ATR_mean/ATR, 0.6, 1.4) — '
-                    f'smaller when today\'s range is expanded.</span></div>'
+                ps1.metric("Suggested Qty",  ps["final_qty"])
+                ps2.metric("Capital Used",   fmt(ps["capital_used"]))
+                ps3.metric("Max Loss",       fmt(ps["max_loss"]))
+                ps4.metric("Risk per Share", fmt(risk))
+                st.markdown(
+                    f'<div style="background:#111120;border:1px solid #1e1e40;border-radius:6px;'
+                    f'padding:8px 12px;margin-top:8px;font-size:11px;'
+                    f'font-family:JetBrains Mono,monospace;color:#6b7090;">'
+                    f'Base: <span style="color:#e8e8f4;">{ps["base_qty"]}</span>  ×  '
+                    f'VIX adj <span style="color:#f59e0b;">{ps["vix_adj"]}×</span>  ×  '
+                    f'ATR adj <span style="color:#f59e0b;">{ps["atr_adj"]}×</span>  =  '
+                    f'<span style="color:#22c55e;font-weight:600;">{ps["final_qty"]} shares</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
                 )
-                st.markdown(adj_html, unsafe_allow_html=True)
 
             # Confidence breakdown
-            with st.expander(f"🎯 Confidence Model — {conf}% ({conf_lbl})", expanded=False):
+            with st.expander(f"Confidence Model — {conf}% ({conf_lbl})", expanded=False):
                 factors = {
                     "Phase alignment":   {PHASE_BRK:20,PHASE_CONT:17,PHASE_ENTRY:13,PHASE_SETUP:7,PHASE_IDLE:2,PHASE_EXIT:0}.get(phase,0),
                     "Score quality":     round(min(20, r["Score"]*0.20),1),
@@ -1982,62 +2129,74 @@ with tab_detail:
                     "HTF alignment":     15 if r.get("HTFUp",True) else 0,
                     "Market regime":     10 if r.get("Regime")=="BULLISH" else 2,
                     "Exhaustion drag":   -min(5, r.get("ExtN",0)*2),
-                    "RS rank bonus":     5 if r.get("RS_Rank",50)>=90 else (3 if r.get("RS_Rank",50)>=80 else 0),  # FIX-3
-                    "Phase progression": r.get("PhaseBonus",0),  # FIX-4
+                    "RS rank bonus":     5 if r.get("RS_Rank",50)>=90 else (3 if r.get("RS_Rank",50)>=80 else 0),
+                    "Phase progression": r.get("PhaseBonus",0),
                 }
                 for fname, fval in factors.items():
-                    col_f = "#2ecc71" if fval >= 10 else ("#f39c12" if fval >= 5 else ("#e74c3c" if fval < 0 else "#aaa"))
+                    col_f = "#22c55e" if fval >= 10 else ("#f59e0b" if fval >= 5 else ("#ef4444" if fval < 0 else "#6b7090"))
                     st.markdown(
-                        f'<div style="display:flex;justify-content:space-between;padding:3px 0;'
-                        f'border-bottom:1px solid #1c1c36;">'
-                        f'<span style="color:#a0a0c0;font-size:12px;">{fname}</span>'
-                        f'<span style="color:{col_f};font-size:12px;font-weight:bold;">{fval:+.0f}</span>'
+                        f'<div style="display:flex;justify-content:space-between;'
+                        f'padding:4px 0;border-bottom:1px solid #1e1e40;">'
+                        f'<span style="color:#6b7090;font-size:12px;'
+                        f'font-family:DM Sans,sans-serif;">{fname}</span>'
+                        f'<span style="color:{col_f};font-size:12px;font-weight:600;'
+                        f'font-family:JetBrains Mono,monospace;">{fval:+.0f}</span>'
                         f'</div>',
                         unsafe_allow_html=True,
                     )
 
-            # Exhaustion detail
-            ext_n = r.get("ExtN",0); ext_labels = r.get("ExtLabels",[]); ext_flags = r.get("ExtFlags",{})
+            # Exhaustion signals
+            ext_n = r.get("ExtN",0)
+            ext_labels = r.get("ExtLabels",[])
+            ext_flags  = r.get("ExtFlags",{})
             if ext_n == 0:
                 st.success("✅ No extension/exhaustion signals — structure is clean.")
             else:
                 flag_desc = {
-                    "rsi_overheat":     "Stock has run up too fast — buyers are exhausted. Wait for it to cool down before entering.",
-                    "atr_extension":    "Today's price swings are unusually large — the move may be a blow-off.",
-                    "parabolic":        "Price jumped far more than normal in just 3 candles. These moves rarely sustain.",
-                    "ema_distance":     "Price is stretched way above its average. Likely to pull back.",
-                    "climactic_volume": "A huge volume spike with a long upper wick — potential distribution.",
-                    "mom_exhaustion":   "Price is still rising but buying pressure is quietly weakening.",
-                    "bearish_div":      "Stock made a new high but momentum did not confirm it.",
+                    "rsi_overheat":     "Stock has run up too fast — buyers are exhausted. Wait for a cooldown.",
+                    "atr_extension":    "Today's range is unusually large — possible blow-off.",
+                    "parabolic":        "Price jumped far more than normal in 3 bars. Hard to sustain.",
+                    "ema_distance":     "Price is stretched way above its average. Pullback likely.",
+                    "climactic_volume": "Huge volume spike with long upper wick — potential distribution.",
+                    "mom_exhaustion":   "Price rising but buying pressure quietly weakening.",
+                    "bearish_div":      "New high, but momentum didn't confirm it.",
                 }
                 with st.expander(
-                    f"⚠️ {ext_n} Caution Signal{'s' if ext_n>1 else ''} — "
+                    f"⚠ {ext_n} Caution Signal{'s' if ext_n>1 else ''} — "
                     f"{'DO NOT enter' if ext_n>=3 else 'Reduce size'}",
                     expanded=True,
                 ):
                     for fk, fa in ext_flags.items():
                         if fa:
-                            st.markdown(f"🔴 **{fk.replace('_',' ').title()}** — {flag_desc.get(fk,'')}")
-                    st.markdown("---")
-                    penalty = sum(EXT_PENALTIES[k] for k,v2 in ext_flags.items() if v2)
+                            ec = "#ef4444" if ext_n >= 3 else "#f59e0b"
+                            st.markdown(
+                                f'<div style="color:{ec};font-size:12px;padding:3px 0;">'
+                                f'▸ <strong>{fk.replace("_"," ").title()}</strong> — '
+                                f'{flag_desc.get(fk,"")}</div>',
+                                unsafe_allow_html=True,
+                            )
+                    penalty = sum(EXT_PENALTIES[k] for k, v2 in ext_flags.items() if v2)
                     st.markdown(
-                        f"**Score reduced by** `{abs(penalty)} points`. **Action:** "
-                        + ("❌ **Skip.** Wait for pullback and RSI<60."
-                           if ext_n>=3 else
-                           "⚠️ **Half size.** Wait for support/EMA dip before entry.")
+                        f'<div style="margin-top:8px;padding:6px 10px;background:#7f1d1d22;'
+                        f'border:1px solid #7f1d1d;border-radius:5px;'
+                        f'font-size:12px;color:#fca5a5;">'
+                        f'Score reduced by {abs(penalty)} pts — '
+                        + ("Skip. Wait for pullback + RSI < 60." if ext_n >= 3
+                           else "Half size. Wait for support/EMA dip.")
+                        + '</div>',
+                        unsafe_allow_html=True,
                     )
 
             info_cols = st.columns(4)
             info_cols[0].metric("RSI",         r.get("RSI","—"))
-            info_cols[1].metric("RS Rank",      f'{r.get("RS_Rank",50)}/100',   # FIX-3
-                                help="52-week return percentile vs scanned universe")
+            info_cols[1].metric("RS Rank",      f'{r.get("RS_Rank",50)}/100')
             info_cols[2].metric("Liq (₹Cr/d)", r.get("AvgTradedCr","—"))
             info_cols[3].metric("Raw RS Diff",  f"{r.get('RS',0):+.1f}%")
 
             if r["Entry"] != r["LTP"]:
                 st.info(
-                    f"⚡ Entry ₹{r['Entry']:,} is the signal trigger price. "
-                    f"LTP = ₹{r['LTP']:,}. Place order near Entry when phase = ENTRY / BREAKOUT."
+                    f"⚡ Entry ₹{r['Entry']:,} is the trigger price. "
+                    f"LTP = ₹{r['LTP']:,}. Place order near Entry when phase = ENTRY/BREAKOUT."
                 )
 
 
@@ -2045,7 +2204,7 @@ with tab_detail:
 # ANALYTICS TAB
 # ═══════════════════════════════════════════════════════════════════
 with tab_analytics:
-    st.subheader("📈 Signal Log & Outcome Tracking")
+    st.subheader("Signal Log & Outcome Tracking")
     log = st.session_state.signal_log
     if not log:
         st.info("No signals logged yet. Run a scan to populate.")
@@ -2053,7 +2212,6 @@ with tab_analytics:
         log_df = pd.DataFrame(log)
         scan_mode_now = st.session_state.scan_mode
 
-        # FIX-6: add staleness column
         log_df["stale"] = log_df.apply(
             lambda row: signal_is_stale(row["timestamp"], row.get("mode", scan_mode_now)),
             axis=1,
@@ -2063,7 +2221,6 @@ with tab_analytics:
             axis=1,
         )
 
-        # Summary — FIX-6: active (non-stale) win rate
         total_sig  = len(log_df)
         pending    = len(log_df[log_df["outcome"]=="Pending"])
         stale_cnt  = int(log_df["stale"].sum())
@@ -2078,18 +2235,14 @@ with tab_analytics:
         am1,am2,am3,am4,am5 = st.columns(5)
         am1.metric("Total Signals", total_sig)
         am2.metric("Pending",       pending)
-        am3.metric("⏱ Expired",     stale_cnt,        # FIX-6
-                   help=f"Signals older than their validity window")
+        am3.metric("Expired",       stale_cnt)
         am4.metric("Overall Win%",  f"{win_rate}%" if win_rate is not None else "—")
-        am5.metric("Active Win%",   f"{active_wr}%" if active_wr is not None else "—",
-                   help="Win rate of non-expired signals only (FIX-6)")
+        am5.metric("Active Win%",   f"{active_wr}%" if active_wr is not None else "—")
 
-        # FIX-6: highlight stale rows
         display_cols = ["timestamp","symbol","action","phase","score","confidence",
                         "rs_rank","entry","sl","t1","age","outcome"]
         display_cols = [c for c in display_cols if c in log_df.columns]
 
-        st.markdown("**Mark outcomes (double-click Outcome cell):** ⏱=expired signal")
         edited = st.data_editor(
             log_df[display_cols].tail(100),
             column_config={
@@ -2107,14 +2260,13 @@ with tab_analytics:
                 if 0 <= idx < len(log):
                     log[idx]["outcome"] = row["outcome"]
 
-        # Phase breakdown (excluding stale)
         if wins+losses > 0:
             st.markdown("---")
             st.subheader("Phase Win-Rate (active signals only)")
             phase_stats = {}
             for entry in log:
                 if signal_is_stale(entry["timestamp"], entry.get("mode", scan_mode_now)):
-                    continue        # FIX-6: skip stale
+                    continue
                 ph = entry.get("phase","UNKNOWN")
                 oc = entry.get("outcome","Pending")
                 if oc in ("Win","Loss"):
@@ -2129,32 +2281,8 @@ with tab_analytics:
                     ps_rows.append({"Phase":ph,"Wins":w,"Losses":l,"Win Rate":f"{wr}%"})
                 st.dataframe(pd.DataFrame(ps_rows), hide_index=True, use_container_width=True)
 
-        if st.button("💾 Export Signal Log"):
+        if st.button("Export Signal Log"):
             export_df = pd.DataFrame(log).drop(columns=["ExtFlags"],errors="ignore")
             csv = export_df.to_csv(index=False)
             ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
             st.download_button("Download", csv, f"NSE_SignalLog_{ts}.csv","text/csv")
-
-    st.markdown("---")
-    st.subheader("⚙ Roadmap")
-    st.markdown("""
-> **FIX-1 (HTF Parallel)** — ✅ Implemented. All HTF fetches are now done in
-> one parallel pass before scoring, eliminating N sequential downloads.
-> Scan time for 50-stock universe should drop from ~4min to <90s.
-
-> **FIX-2 (Index/OI pairing)** — ✅ Fixed. Three cards: Nifty50↔NIFTY OI,
-> BankNifty↔BANKNIFTY OI, Sensex (no OI feed, labeled clearly).
-
-> **FIX-3 (RS Rank)** — ✅ IBD-style 52-week percentile rank (0-100) computed
-> across the scanned universe. RS_Rank>=80 → confidence bonus, scoring bonus.
-
-> **FIX-4 (Phase Transition Memory)** — ✅ session_state phase_history tracks
-> transitions per symbol. SETUP→ENTRY→CONT progressions add +5 confidence.
-> Phase arrows ↗/↘ shown in cards and table.
-
-> **FIX-5 (Position Sizing)** — ✅ Van Tharp 2%-risk + VIX normalisation +
-> ATR normalisation. Visible in Detail tab with full factor breakdown.
-
-> **FIX-6 (Signal Validity)** — ✅ Intraday=4h, Swing=72h, Positional=240h.
-> Expired signals greyed, excluded from active win-rate calculation.
-    """)
