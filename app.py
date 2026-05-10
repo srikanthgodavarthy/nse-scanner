@@ -1403,7 +1403,7 @@ for key, default in [
 st.markdown(
     '<div style="display:flex;align-items:baseline;gap:12px;margin-bottom:4px;">'
     '<h1 style="font-family:Syne,sans-serif;font-size:22px;margin:0;'
-    'color:#f59e0b;letter-spacing:-0.5px;">NSE MASTER SCANNER</h1>'
+    'color:#f59e0b;letter-spacing:-0.5px;">BULL SUTRA</h1>'
     '<span style="font-family:JetBrains Mono,monospace;font-size:11px;'
     'color:#3a3a60;letter-spacing:2px;">PRO · v9</span>'
     '</div>',
