@@ -381,26 +381,33 @@ def _fetch_htf_cached(ticker: str, period: str, interval: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 def _htf_trend_from_df(df: pd.DataFrame, mode: str):
+
     """
-    FIX-1: Drop the last (still-forming) bar before computing HTF EMAs.
-    A live intraday bar on a 15-min or weekly chart has incomplete OHLCV
-    data until the candle closes; using it biases the EMA calculation.
-    We keep at least 20 rows after the drop before making a decision.
+    FIX-1: Use only CLOSED HTF candles.
+    Prevents repainting from partially formed HTF bars.
     """
-    if df.empty:
+
+    if df is None or df.empty:
         return True, "HTF-UNKNOWN"
 
-    # Drop last bar (may be partially formed)
-    df_closed = df.iloc[:-1] if len(df) > 1 else df
+    # Remove live/incomplete HTF candle
+    if mode == "Intraday" and len(df) > 2:
+        df = df.iloc[:-1].copy()
 
-    if len(df_closed) < 20:
+    min_bars = 55 if mode == "Intraday" else 26
+
+    if len(df) < min_bars:
         return True, "HTF-UNKNOWN"
 
-    cl  = df_closed["Close"]
-    ef  = float(ema(cl, 21 if mode == "Intraday" else 13).iloc[-1])
-    es  = float(ema(cl, 55 if mode == "Intraday" else 26).iloc[-1])
-    c   = float(cl.iloc[-1])
-    up  = c > ef > es
+    cl = df["Close"]
+
+    ef = float(ema(cl, 21 if mode == "Intraday" else 13).iloc[-1])
+    es = float(ema(cl, 55 if mode == "Intraday" else 26).iloc[-1])
+
+    c = float(cl.iloc[-1])
+
+    up = c > ef > es
+
     return up, ("HTF↑" if up else "HTF↓")
 
 def prefetch_htf_parallel(symbols: list, mode: str, status_text, progress_bar) -> dict:
@@ -1420,10 +1427,10 @@ def run_scan(symbols, mode, progress_bar, status_text,
     data         = {}
     daily_closes = {}
     args_list    = [(sym, mode, min_bars) for sym in symbols]
-    MAX_WORKERS  = min(32, total)
+    MAX_WORKERS  = min(6, os.cpu_count() or 4, total)
     completed    = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_WORKERS, n_data) as pool:
         futures = {pool.submit(_fetch_one_with_daily, a): a[0] for a in args_list}
         for fut in concurrent.futures.as_completed(futures):
             sym, df, daily_df = fut.result()
@@ -2390,12 +2397,11 @@ with tab_detail:
                                           PHASE_SETUP:7,PHASE_IDLE:2,PHASE_EXIT:0}.get(phase, 0),
                     "Score quality":     round(min(20, r["Score"] * 0.20), 1),
                     "Volume confirmed":  15 if r.get("VolConf") else 5,
-                    "EMA stack":         15 if r.get("EMAStack") else 7,
-                    "HTF alignment":     15 if r.get("HTFUp", True) else 0,
+                    "EMA stack":         8 if r.get("EMAStack") else 3,
+                    "HTF alignment":     7 if r.get("HTFUp", True) else 0,
                     "Market regime":     10 if r.get("Regime") == "BULLISH" else 2,
                     "Exhaustion drag":   -min(5, r.get("ExtN", 0) * 2),
-                    "RS rank bonus":     5 if r.get("RS_Rank", 50) >= 90 else (
-                                         3 if r.get("RS_Rank", 50) >= 80 else 0),
+                    "RS rank bonus": (10 if r.get("RS_Rank", 50) >= 90 else 7 if r.get("RS_Rank", 50) >= 80 else 3 if r.get("RS_Rank", 50) >= 70 else 0
                     "Phase progression": r.get("PhaseBonus", 0),
                 }
                 for fname, fval in factors.items():
