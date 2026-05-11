@@ -1430,7 +1430,7 @@ def run_scan(symbols, mode, progress_bar, status_text,
     MAX_WORKERS  = min(6, os.cpu_count() or 4, total)
     completed    = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_WORKERS, n_data) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_WORKERS, n_data)) as pool:
         futures = {pool.submit(_fetch_one_with_daily, a): a[0] for a in args_list}
         for fut in concurrent.futures.as_completed(futures):
             sym, df, daily_df = fut.result()
