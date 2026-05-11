@@ -2401,7 +2401,7 @@ with tab_detail:
                     "HTF alignment":     7 if r.get("HTFUp", True) else 0,
                     "Market regime":     10 if r.get("Regime") == "BULLISH" else 2,
                     "Exhaustion drag":   -min(5, r.get("ExtN", 0) * 2),
-                    "RS rank bonus": (10 if r.get("RS_Rank", 50) >= 90 else 7 if r.get("RS_Rank", 50) >= 80 else 3 if r.get("RS_Rank", 50) >= 70 else 0
+                    "RS rank bonus": (10 if r.get("RS_Rank", 50) >= 90 else 7 if r.get("RS_Rank", 50) >= 80 else 3 if r.get("RS_Rank", 50) >= 70 else 0),
                     "Phase progression": r.get("PhaseBonus", 0),
                 }
                 for fname, fval in factors.items():
