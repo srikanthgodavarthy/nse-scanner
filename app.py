@@ -60,6 +60,7 @@ PERF-7  Thread-safe phase transitions
 import warnings
 import logging
 import time
+import os
 import threading
 from datetime import datetime, timedelta
 
