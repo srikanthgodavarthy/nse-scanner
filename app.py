@@ -1410,6 +1410,7 @@ def run_scan(symbols, mode, progress_bar, status_text,
     import concurrent.futures
 
     cfg      = MODE_CFG[mode]
+    n_data = len(symbols)
     rejected = 0
     total    = len(symbols)
     min_bars = 60 if mode == "Intraday" else 50
@@ -1428,10 +1429,10 @@ def run_scan(symbols, mode, progress_bar, status_text,
     data         = {}
     daily_closes = {}
     args_list    = [(sym, mode, min_bars) for sym in symbols]
-    MAX_WORKERS  = min(6, os.cpu_count() or 4, total)
+    MAX_WORKERS  = min(6, os.cpu_count() or 4, n_data)
     completed    = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_WORKERS, n_data)) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {pool.submit(_fetch_one_with_daily, a): a[0] for a in args_list}
         for fut in concurrent.futures.as_completed(futures):
             sym, df, daily_df = fut.result()
