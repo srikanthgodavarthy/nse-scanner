@@ -326,7 +326,10 @@ def _fetch_htf_cached(ticker: str, period: str, interval: str) -> pd.DataFrame:
                              auto_adjust=True, progress=False, threads=False)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
-            return df.dropna()
+            df = df.dropna(subset=["Close"])
+            df = _validate_ohlcv(df)
+            if not df.empty:
+                return df
         except Exception:
             time.sleep(min(0.5*(attempt+1), 1.0))
     return pd.DataFrame()
@@ -659,6 +662,39 @@ def score_stock(df, sym, mode, vix_val, htf_up, rs_rank, phase_history_sym=None,
 # DATA FETCH
 # ══════════════════════════════════════════════════════════════════
 
+def _validate_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """Validate and clean OHLCV data — drop bad rows, ensure required columns exist."""
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    for col in required:
+        if col not in df.columns:
+            return pd.DataFrame()          # missing column → reject entirely
+
+    # Drop rows where any OHLC is NaN, zero, or negative
+    df = df.copy()
+    for col in ["Open", "High", "Low", "Close"]:
+        df = df[df[col].notna() & (df[col] > 0)]
+
+    # Drop zero-volume bars (stale/phantom candles)
+    df = df[df["Volume"].notna() & (df["Volume"] > 0)]
+
+    # Drop duplicate timestamps (keep last)
+    df = df[~df.index.duplicated(keep="last")]
+
+    # Sort by time ascending
+    df = df.sort_index()
+
+    # Sanity: High >= Low, High >= Close, Low <= Close
+    df = df[(df["High"] >= df["Low"]) & (df["High"] >= df["Close"]) & (df["Low"] <= df["Close"])]
+
+    # Drop partial intraday candle if last bar volume is suspiciously low (<5% of avg)
+    if len(df) > 20:
+        avg_vol = float(df["Volume"].iloc[-20:].mean())
+        if avg_vol > 0 and float(df["Volume"].iloc[-1]) < avg_vol * 0.05:
+            df = df.iloc[:-1]
+
+    return df
+
+
 def fetch_stock_data(sym: str, mode: str) -> pd.DataFrame:
     cfg    = MODE_CFG[mode]
     ticker = to_nse(sym)
@@ -668,7 +704,8 @@ def fetch_stock_data(sym: str, mode: str) -> pd.DataFrame:
                              auto_adjust=True, progress=False, threads=False)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
-            df = df.dropna()
+            df = df.dropna(subset=["Close"])
+            df = _validate_ohlcv(df)
             if len(df) >= 30:
                 return df
         except Exception:
@@ -696,7 +733,12 @@ def run_scan(symbols: list, mode: str, vix_val, htf_cache: dict,
     # Shared mutable dict updated from threads (protected by lock)
     phase_history_updates = {}
 
-    def _process_one(sym):
+    # Cache fetched DataFrames so we don't re-download in pass 2
+    df_cache = {}
+    df_cache_lock = threading.Lock()
+
+    def _fetch_and_collect(sym):
+        """Pass 1: fetch data, collect 52w return. Score with rs_rank=50 placeholder."""
         df = fetch_stock_data(sym, mode)
         if df is None or df.empty:
             return None
@@ -707,27 +749,36 @@ def run_scan(symbols: list, mode: str, vix_val, htf_cache: dict,
         r52 = _52w_return(df["Close"])
         with lock:
             sym_returns[sym] = r52
+            completed[0] += 1
+        with df_cache_lock:
+            df_cache[sym] = (df, htf_up)
+        return sym
+
+    # Pass 1: fetch all data in parallel
+    status_text.text("Fetching stock data…")
+    valid_syms = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
+        futures = {pool.submit(_fetch_and_collect, sym): sym for sym in symbols}
+        for fut in concurrent.futures.as_completed(futures):
+            sym = fut.result()
+            if sym:
+                valid_syms.append(sym)
+            done = len(valid_syms)
+            progress_bar.progress(min(0.40 + done / max(total, 1) * 0.30, 0.70))
+
+    # Compute real RS ranks from 52w returns BEFORE scoring
+    rs_ranks = compute_rs_ranks(sym_returns)
+
+    # Pass 2: score with true RS ranks (fast, CPU-only, no I/O — run in main thread)
+    status_text.text("Scoring with real RS ranks…")
+    for i, sym in enumerate(valid_syms):
+        df, htf_up = df_cache[sym]
+        rs_rank = rs_ranks.get(sym, 50)
         ph = phase_history_snapshot.get(sym, [])
-        rs_rank = 50
-        # Pass the phase_history snapshot/updates dict; record_phase_transition writes into it
         result = score_stock(df, sym, mode, vix_val, htf_up, rs_rank, ph,
                              phase_history_dict=phase_history_updates)
-        with lock:
-            completed[0] += 1
-        return result
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
-        futures = {pool.submit(_process_one, sym): sym for sym in symbols}
-        for fut in concurrent.futures.as_completed(futures):
-            r = fut.result()
-            if r:
-                results.append(r)
-            # Update progress from the main thread (safe for Streamlit)
-            done = len(results)
-            prog = 0.40 + done / max(total, 1) * 0.55
-            progress_bar.progress(min(prog, 0.95))
-            if done % 20 == 0:
-                status_text.text(f"Scoring {done}/{total}…")
+        results.append(result)
+        progress_bar.progress(min(0.70 + (i+1) / max(len(valid_syms), 1) * 0.25, 0.95))
 
     # Merge phase history updates back into session state (main thread, safe)
     try:
@@ -738,8 +789,7 @@ def run_scan(symbols: list, mode: str, vix_val, htf_cache: dict,
     except Exception:
         pass
 
-    # Apply RS ranks (vectorized)
-    rs_ranks = compute_rs_ranks(sym_returns)
+    # RS ranks already applied in pass 2 — just update display field
     for r in results:
         r["rs_rank"] = rs_ranks.get(r["sym"], 50)
 
@@ -1193,6 +1243,90 @@ def render_scan_card(r: dict, mode: str, account_size: float, risk_pct: float):
     st.markdown(html, unsafe_allow_html=True)
 
 
+def render_scan_card_compact(r: dict, mode: str, account_size: float, risk_pct: float):
+    """Compact 1/3-width card for grid view."""
+    action      = r.get("action", "SKIP")
+    phase       = r.get("phase", PHASE_IDLE)
+    entry       = r.get("entry")
+    stop_p      = r.get("stop")
+    card_border = PHASE_COLORS.get(phase, "#1e2535")
+    htf_color   = "#22aa55" if r["htf_up"] else "#cc4444"
+    htf_arrow   = "&#8593;" if r["htf_up"] else "&#8595;"
+    act_colors  = {
+        "STRONG BUY": ("#00d4aa", "#003d28"),
+        "BUY":        ("#4488ff", "#002d50"),
+        "WATCH":      ("#e8a838", "#3d2800"),
+        "SKIP":       ("#5a6580", "#1e2535"),
+    }
+    act_fg, act_bg = act_colors.get(action, ("#5a6580", "#1e2535"))
+
+    rr = ""
+    if entry and stop_p and stop_p > 0:
+        risk  = abs(entry - stop_p)
+        tgt   = r.get("target")
+        if tgt and risk > 0:
+            rr = f'{((tgt - entry) / risk):.1f}R'
+
+    html = (
+        '<div style="background:#131824;border:1px solid #1e2535;border-left:3px solid '
+        + card_border
+        + ';border-radius:8px;padding:10px 10px 8px;margin-bottom:6px;">'
+
+        # Symbol + action badge
+        + '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;">'
+        + '<div>'
+        + '<div style="font-size:0.95rem;font-weight:700;color:#e8eaf0;line-height:1.2;">' + r["sym"] + '</div>'
+        + '<div style="font-size:0.65rem;color:#5a6580;margin-top:1px;">' + r.get("sector", "") + '</div>'
+        + '</div>'
+        + '<div style="text-align:right;">'
+        + '<div style="display:inline-block;background:' + act_bg + ';color:' + act_fg
+        + ';border:1px solid ' + act_fg + '44;border-radius:4px;padding:2px 6px;'
+        + 'font-size:0.60rem;font-weight:700;letter-spacing:0.06em;">' + action + '</div>'
+        + '<div style="font-size:0.62rem;color:#5a6580;margin-top:2px;">' + phase + '</div>'
+        + '</div>'
+        + '</div>'
+
+        # Price + Score
+        + '<div style="display:flex;justify-content:space-between;margin-bottom:4px;">'
+        + '<span style="font-size:0.82rem;color:#c8d0e0;font-weight:600;">' + fmt(r["price"]) + '</span>'
+        + '<span style="font-size:0.78rem;color:#00d4aa;font-weight:700;">&#9733; ' + str(round(r["score"])) + '</span>'
+        + '</div>'
+
+        # RSI / RS / HTF row
+        + '<div style="font-size:0.68rem;color:#7a8aa0;display:flex;gap:8px;flex-wrap:wrap;margin-bottom:4px;">'
+        + '<span>RSI <b style="color:#c8d0e0;">' + str(r["rsi"]) + '</b></span>'
+        + '<span>RS <b style="color:#c8d0e0;">' + str(r["rs_rank"]) + '</b></span>'
+        + '<span>HTF <b style="color:' + htf_color + ';">' + htf_arrow + '</b></span>'
+        + ('  <b style="color:#e8a838;">' + rr + '</b>' if rr else '')
+        + '</div>'
+
+        # Entry/Stop if available
+        + (
+            '<div style="font-size:0.66rem;color:#7a8aa0;display:flex;gap:6px;flex-wrap:wrap;">'
+            '<span>E <b style="color:#4488ff;">' + fmt(entry) + '</b></span>'
+            '<span>SL <b style="color:#cc4444;">' + fmt(stop_p) + '</b></span>'
+            + ('<span>T <b style="color:#00d4aa;">' + fmt(r.get("target")) + '</b></span>' if r.get("target") else '')
+            + '</div>'
+            if entry else ''
+        )
+        + '</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+    # Action buttons
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("WL+", key=f"cwl_{r['sym']}", use_container_width=True):
+            wl_syms = [w["sym"] for w in st.session_state["watchlist"]]
+            if r["sym"] not in wl_syms:
+                st.session_state["watchlist"].append(r)
+                st.toast(f"Added {r['sym']}")
+    with b2:
+        if entry and st.button("Log", key=f"cen_{r['sym']}", use_container_width=True):
+            add_position(r["sym"], entry, rs_rank=r.get("rs_rank", 50))
+            st.toast(f"Logged {r['sym']}")
+
+
 def render_exit_card(r: ExitResult):
     color      = EXIT_COLORS.get(r.exit_phase, "#555577")
     pnl_color  = "#22cc66" if r.pnl_pct >= 0 else "#cc4444"
@@ -1333,7 +1467,7 @@ def main():
             st.divider()
 
             # Filters
-            fc1, fc2, fc3 = st.columns([2,2,1])
+            fc1, fc2, fc3, fc4 = st.columns([2,2,1,1])
             with fc1:
                 act_filter = st.multiselect("Action", ["STRONG BUY","BUY","WATCH","SKIP"],
                                             default=["STRONG BUY","BUY","WATCH"], key="scan_af")
@@ -1343,6 +1477,8 @@ def main():
                     default=[PHASE_BRK,PHASE_CONT,PHASE_ENTRY,PHASE_SETUP], key="scan_pf")
             with fc3:
                 sec_filter = st.selectbox("Sector", ["All"] + sorted(set(SECTOR_MAP.values())), key="scan_sf")
+            with fc4:
+                view_mode = st.radio("View", ["Table", "Cards"], horizontal=True, key="scan_view")
 
             filtered = [r for r in results
                         if r["action"] in act_filter
@@ -1351,19 +1487,62 @@ def main():
 
             st.caption(f"Showing {len(filtered)} of {len(results)} stocks")
 
-            for r in filtered:
-                render_scan_card(r, cur_mode, account_size, risk_pct)
-                col_a, col_b = st.columns([1,1])
-                with col_a:
-                    if st.button(f"+ Watchlist", key=f"wl_{r['sym']}"):
-                        wl_syms = [w["sym"] for w in st.session_state["watchlist"]]
-                        if r["sym"] not in wl_syms:
-                            st.session_state["watchlist"].append(r)
-                            st.success(f"Added {r['sym']} to Watchlist")
-                with col_b:
-                    if r.get("entry") and st.button(f"+ Log Entry", key=f"en_{r['sym']}"):
-                        add_position(r["sym"], r["entry"], rs_rank=r.get("rs_rank",50))
-                        st.success(f"Position logged: {r['sym']} @ {fmt(r['entry'])}")
+            # ── TABLE VIEW ────────────────────────────────────────
+            if view_mode == "Table":
+                ACTION_EMOJI = {"STRONG BUY": "🟢", "BUY": "🔵", "WATCH": "🟡", "SKIP": "⚫"}
+                rows = []
+                for r in filtered:
+                    rows.append({
+                        "Symbol":  r["sym"],
+                        "Sector":  r.get("sector", ""),
+                        "Action":  ACTION_EMOJI.get(r["action"], "") + " " + r["action"],
+                        "Phase":   r["phase"],
+                        "Score":   r["score"],
+                        "LTP":     r["price"],
+                        "RSI":     r["rsi"],
+                        "RS":      r["rs_rank"],
+                        "HTF":     "↑" if r["htf_up"] else "↓",
+                        "Entry":   r.get("entry") or "",
+                        "Stop":    r.get("stop") or "",
+                        "Target":  r.get("target") or "",
+                    })
+                df_table = pd.DataFrame(rows)
+                st.dataframe(
+                    df_table,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Score":  st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f"),
+                        "LTP":    st.column_config.NumberColumn("LTP", format="₹%.2f"),
+                        "Entry":  st.column_config.NumberColumn("Entry", format="₹%.2f"),
+                        "Stop":   st.column_config.NumberColumn("Stop", format="₹%.2f"),
+                        "Target": st.column_config.NumberColumn("Target", format="₹%.2f"),
+                    }
+                )
+                if filtered:
+                    st.markdown("**Quick action:**")
+                    sel_sym = st.selectbox("Select stock", [r["sym"] for r in filtered], key="tbl_sel", label_visibility="collapsed")
+                    sel_r   = next((r for r in filtered if r["sym"] == sel_sym), None)
+                    if sel_r:
+                        tb1, tb2 = st.columns(2)
+                        with tb1:
+                            if st.button("+ Watchlist", key="tbl_wl", use_container_width=True):
+                                wl_syms = [w["sym"] for w in st.session_state["watchlist"]]
+                                if sel_sym not in wl_syms:
+                                    st.session_state["watchlist"].append(sel_r)
+                                    st.success(f"Added {sel_sym} to Watchlist")
+                        with tb2:
+                            if sel_r.get("entry") and st.button("+ Log Entry", key="tbl_en", use_container_width=True):
+                                add_position(sel_sym, sel_r["entry"], rs_rank=sel_r.get("rs_rank", 50))
+                                st.success(f"Position logged: {sel_sym} @ {fmt(sel_r['entry'])}")
+
+            # ── CARDS VIEW (3-column grid) ────────────────────────
+            elif view_mode == "Cards":
+                for row_start in range(0, len(filtered), 3):
+                    cols = st.columns(3)
+                    for ci, r in enumerate(filtered[row_start:row_start + 3]):
+                        with cols[ci]:
+                            render_scan_card_compact(r, cur_mode, account_size, risk_pct)
 
     # ══════════════════════════════════════════════════════════════
     # TAB 2: WATCHLIST
