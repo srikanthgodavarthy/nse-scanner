@@ -149,15 +149,16 @@ _phase_lock = threading.Lock()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SUPABASE PERSISTENCE
+# SUPABASE PERSISTENCE  — fixed version
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _get_conn():
-    """Open a fresh Supabase Postgres connection using the secret URL."""
-    return psycopg2.connect(st.secrets["SUPABASE_URL"])
+    url = st.secrets.get("SUPABASE_URL", "")
+    if not url:
+        raise ValueError("SUPABASE_URL secret is missing or empty")
+    return psycopg2.connect(url)
 
 def _ensure_table(cur):
-    """Create the positions table if it doesn't exist yet."""
     cur.execute("""
         CREATE TABLE IF NOT EXISTS positions (
             id         SERIAL PRIMARY KEY,
@@ -167,14 +168,12 @@ def _ensure_table(cur):
     """)
 
 def _save_positions():
-    """
-    Persist st.session_state['open_positions'] to Supabase.
-    Uses a single-row pattern: DELETE all → INSERT fresh snapshot.
-    """
+    """Persist open_positions to Supabase. Errors are stored in session state for UI display."""
     try:
         conn = _get_conn()
         cur  = conn.cursor()
         _ensure_table(cur)
+        conn.commit()                          # commit table creation separately
         cur.execute("DELETE FROM positions")
         cur.execute(
             "INSERT INTO positions (data) VALUES (%s)",
@@ -183,14 +182,12 @@ def _save_positions():
         conn.commit()
         cur.close()
         conn.close()
+        st.session_state["_db_error"] = None  # clear any prior error
     except Exception as e:
-        st.warning(f"⚠ Could not save positions to Supabase: {e}")
+        st.session_state["_db_error"] = str(e)   # surface it in the UI instead of swallowing
 
 def _load_positions() -> list:
-    """
-    Load positions from Supabase on app startup.
-    Returns empty list if table is missing or any error occurs.
-    """
+    """Load positions from Supabase. Returns [] on any failure."""
     try:
         conn = _get_conn()
         cur  = conn.cursor()
@@ -202,8 +199,12 @@ def _load_positions() -> list:
         row = cur.fetchone()
         cur.close()
         conn.close()
-        return row[0] if row else []
-    except Exception:
+        if row and row[0]:
+            # row[0] may already be a list (psycopg2 auto-deserializes JSONB)
+            return row[0] if isinstance(row[0], list) else json.loads(row[0])
+        return []
+    except Exception as e:
+        st.session_state["_db_error"] = str(e)
         return []
 
 
@@ -1808,7 +1809,6 @@ html, body, [class*="css"] { background: #07070f; color: #e8e8f4; }
 """, unsafe_allow_html=True)
 
 # ── Session state init ─────────────────────────────────────────────────────────
-# open_positions is loaded from Supabase on every cold start
 for key, default in [
     ("results",         []),
     ("scan_time",       None),
@@ -1823,11 +1823,19 @@ for key, default in [
     ("phase_filter",    "All Phases"),
     ("show_illiquid",   False),
     ("min_liq_cr",      5.0),
-    ("open_positions",  _load_positions()),   # ← loaded from Supabase
     ("htf_cache",       {}),
+    ("_db_error",       None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
+
+# Load positions separately so errors are catchable and visible
+if "open_positions" not in st.session_state:
+    st.session_state["open_positions"] = _load_positions()
+
+# Show DB error banner if present
+if st.session_state.get("_db_error"):
+    st.error(f"⚠️ Supabase error: {st.session_state['_db_error']}")
 
 # ── PERF-5: Pre-warm caches on startup ────────────────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
