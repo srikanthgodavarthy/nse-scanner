@@ -1815,27 +1815,22 @@ html, body, [class*="css"] { background: #07070f; color: #e8e8f4; }
 """, unsafe_allow_html=True)
 
 # ── Session state init ─────────────────────────────────────────────────────────
-# ── Session state init ─────────────────────────────────────────────────────────
-for key, default in [
-    ("results",         []),
-    ("scan_time",       None),
-    ("rejected",        0),
-    ("liq_skipped",     0),
-    ("scan_mode",       "Swing"),
-    ("signal_log",      []),
-    ("phase_history",   {}),
-    ("account_size",    500000),
-    ("risk_pct",        0.02),
-    ("max_capital_pct", 0.20),
-    ("phase_filter",    "All Phases"),
-    ("show_illiquid",   False),
-    ("min_liq_cr",      5.0),
-    ("htf_cache",       {}),
-    ("open_positions",  []),   # always start with [] safely
-    ("_db_error",       None),
-]:
-    if key not in st.session_state:
-        st.session_state[key] = default
+st.session_state.setdefault("results", [])
+st.session_state.setdefault("scan_time", None)
+st.session_state.setdefault("rejected", 0)
+st.session_state.setdefault("liq_skipped", 0)
+st.session_state.setdefault("scan_mode", "Swing")
+st.session_state.setdefault("signal_log", [])
+st.session_state.setdefault("phase_history", {})
+st.session_state.setdefault("account_size", 500000)
+st.session_state.setdefault("risk_pct", 0.02)
+st.session_state.setdefault("max_capital_pct", 0.20)
+st.session_state.setdefault("phase_filter", "All Phases")
+st.session_state.setdefault("show_illiquid", False)
+st.session_state.setdefault("min_liq_cr", 5.0)
+st.session_state.setdefault("htf_cache", {})
+st.session_state.setdefault("open_positions", [])
+st.session_state.setdefault("_db_error", None)
 
 # Load positions from Supabase separately, only on cold start
 if not st.session_state.get("_positions_loaded", False):
@@ -2141,7 +2136,7 @@ with tab_scanner:
                 unsafe_allow_html=True)
 
     # ── Apply filters ──────────────────────────────────────────────────────────
-    results = list(st.session_state.results)
+    results = list(st.session_state.get("results", []))
     if filter_opt == "BUY + STRONG BUY":
         results = [r for r in results if r["Action"] in ("BUY", "STRONG BUY")]
     elif filter_opt == "STRONG BUY only":
@@ -2464,7 +2459,7 @@ with tab_scanner:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 with tab_breadth:
-    all_results = st.session_state.results
+    all_results = st.session_state.get("results", [])
     if not all_results:
         st.info("Run a scan first to see breadth data.")
     else:
@@ -2594,7 +2589,7 @@ with tab_breadth:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 with tab_detail:
-    all_results = st.session_state.results
+    all_results = st.session_state.get("results", [])
     if not all_results:
         st.info("Run a scan first.")
     else:
@@ -2798,7 +2793,7 @@ with tab_detail:
 
 with tab_analytics:
     st.subheader("Signal Log & Outcome Tracking")
-    log = st.session_state.signal_log
+    log = st.session_state.get("signal_log", [])
     if not log:
         st.info("No signals logged yet. Run a scan to populate.")
     else:
