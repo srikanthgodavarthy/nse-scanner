@@ -2665,18 +2665,39 @@ with tab_scanner:
                         rsi_c = "#ef4444" if sr.rsi_val > 70 else ("#f59e0b" if sr.rsi_val > 60 else "#cbd5e1")
                         bar  = min(sr.short_score, 100)
                         hard_pills = "".join(
-                            f'<span style="background:#3d1a1a;border:1px solid #cc224466;color:#f8fafc;'
-                            f'padding:2px 7px;border-radius:4px;font-size:9px;margin:1px;">🔴 {t}</span>'
+                            f'<span style="background:rgba(239,68,68,0.08);'
+                            f'border:1px solid rgba(239,68,68,0.20);'
+                            f'color:#e2e8f0;'
+                            f'padding:3px 8px;'
+                            f'border-radius:6px;'
+                            f'font-size:10px;'
+                            f'font-weight:500;'
+                            f'font-family:Inter,sans-serif;'
+                            f'margin:2px;">{t}</span>'
                             for t in sr.hard_triggers
                         )
                         soft_pills = "".join(
-                            f'<span style="background:#2d2b14;border:1px solid #f59e0b55;color:#fbbf24;'
-                            f'padding:2px 7px;border-radius:4px;font-size:9px;margin:1px;">⚡ {t}</span>'
+                            f'<span style="background:rgba(239,68,68,0.05);'
+                            f'border:1px solid rgba(239,68,68,0.14);'
+                            f'color:#e2e8f0;'
+                            f'padding:3px 8px;'
+                            f'border-radius:6px;'
+                            f'font-size:10px;'
+                            f'font-weight:500;'
+                            f'font-family:Inter,sans-serif;'
+                            f'margin:2px;">{t}</span>'
                             for t in sr.soft_triggers
                         )
                         ext_badge = (
-                            f'<span style="background:#7f1d1d22;border:1px solid #ef444455;color:#e2e8f0;'
-                            f'padding:2px 7px;border-radius:4px;font-size:9px;margin:1px;">'
+                            f'<span style="background:rgba(239,68,68,0.06);'
+                            f'border:1px solid rgba(239,68,68,0.18);'
+                            f'color:#e2e8f0;'
+                            f'padding:3px 8px;'
+                            f'border-radius:6px;'
+                            f'font-size:10px;'
+                            f'font-weight:500;'
+                            f'font-family:Inter,sans-serif;'
+                            f'margin:2px;">'
                             f'EXT {sr.ext_n} — short fuel</span>'
                         ) if sr.ext_n >= 2 else ""
 
