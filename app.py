@@ -190,7 +190,6 @@ def _save_positions():
         st.session_state["_db_error"] = str(e)   # surface it in the UI instead of swallowing
 
 def _load_positions() -> list:
-    """Load positions from Supabase. Returns [] on any failure."""
     try:
         conn = _get_conn()
         cur  = conn.cursor()
@@ -203,12 +202,10 @@ def _load_positions() -> list:
         cur.close()
         conn.close()
         if row and row[0]:
-            # row[0] may already be a list (psycopg2 auto-deserializes JSONB)
             return row[0] if isinstance(row[0], list) else json.loads(row[0])
         return []
-    except Exception as e:
-        st.session_state["_db_error"] = str(e)
-        return []
+    except Exception:
+        return []   # never raise — always return a list
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1805,13 +1802,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
-# TEMP DEBUG — remove after fixing
-with st.expander("🔧 Debug secrets"):
-    try:
-        all_keys = list(st.secrets.keys())
-        st.write("Secret keys found:", all_keys)
-    except Exception as e:
-        st.error(f"st.secrets not available: {e}")
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=DM+Sans:wght@400;500;600&family=Syne:wght@600;700&display=swap');
@@ -1824,6 +1814,7 @@ html, body, [class*="css"] { background: #07070f; color: #e8e8f4; }
 </style>
 """, unsafe_allow_html=True)
 
+# ── Session state init ─────────────────────────────────────────────────────────
 # ── Session state init ─────────────────────────────────────────────────────────
 for key, default in [
     ("results",         []),
@@ -1840,18 +1831,21 @@ for key, default in [
     ("show_illiquid",   False),
     ("min_liq_cr",      5.0),
     ("htf_cache",       {}),
+    ("open_positions",  []),   # always start with [] safely
     ("_db_error",       None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
-# Load positions separately so errors are catchable and visible
-if "open_positions" not in st.session_state:
-    st.session_state["open_positions"] = _load_positions()
-
-# Show DB error banner if present
-if st.session_state.get("_db_error"):
-    st.error(f"⚠️ Supabase error: {st.session_state['_db_error']}")
+# Load positions from Supabase separately, only on cold start
+if not st.session_state.get("_positions_loaded", False):
+    try:
+        loaded = _load_positions()
+        if loaded:
+            st.session_state["open_positions"] = loaded
+        st.session_state["_positions_loaded"] = True
+    except Exception:
+        st.session_state["_positions_loaded"] = True  # don't retry on every rerun
 
 # ── PERF-5: Pre-warm caches on startup ────────────────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
