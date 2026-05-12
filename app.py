@@ -1825,13 +1825,13 @@ with tab6:
               p for p in positions
               if isinstance(p, dict) and p.get("symbol")
             ]
-              positions_sorted = sorted(
-                valid_positions,
-                key=lambda p: _exit_order.get(
-                    exit_results[p["symbol"]].verdict
-                    if p["symbol"] in exit_results else EXIT_HOLD,
-                    3
-                )
+						positions_sorted = sorted(
+							valid_positions,
+							key=lambda p: _exit_order.get(
+									exit_results[p["symbol"]].verdict
+									if p["symbol"] in exit_results else EXIT_HOLD,
+									3
+							)
             )
 
             for pos in positions_sorted:
