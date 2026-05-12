@@ -2665,7 +2665,7 @@ with tab_scanner:
                         rsi_c = "#ef4444" if sr.rsi_val > 70 else ("#f59e0b" if sr.rsi_val > 60 else "#cbd5e1")
                         bar  = min(sr.short_score, 100)
                         hard_pills = "".join(
-                            f'<span style="background:#3d1a1a;border:1px solid #cc224466;color:#ff8888;'
+                            f'<span style="background:#3d1a1a;border:1px solid #cc224466;color:#f8fafc;'
                             f'padding:2px 7px;border-radius:4px;font-size:9px;margin:1px;">🔴 {t}</span>'
                             for t in sr.hard_triggers
                         )
@@ -2675,7 +2675,7 @@ with tab_scanner:
                             for t in sr.soft_triggers
                         )
                         ext_badge = (
-                            f'<span style="background:#7f1d1d22;border:1px solid #ef444455;color:#fca5a5;'
+                            f'<span style="background:#7f1d1d22;border:1px solid #ef444455;color:#e2e8f0;'
                             f'padding:2px 7px;border-radius:4px;font-size:9px;margin:1px;">'
                             f'EXT {sr.ext_n} — short fuel</span>'
                         ) if sr.ext_n >= 2 else ""
@@ -2701,9 +2701,9 @@ with tab_scanner:
                             f'<div style="flex:0 0 45%;padding-right:16px;border-right:1px solid #1e1e40;">'
                             f'<div style="font-family:JetBrains Mono,monospace;color:#f0e8e8;font-size:22px;'
                             f'font-weight:600;line-height:1;">₹{sr.current_price:,.1f}</div>'
-                            f'<div style="color:#ff8888;font-size:11px;margin-top:3px;'
+                            f'<div style="color:#f8fafc;font-size:11px;margin-top:3px;'
                             f'font-family:JetBrains Mono,monospace;">Short zone</div>'
-                            f'<div style="color:#ff8888;font-size:12px;font-weight:600;'
+                            f'<div style="color:#f8fafc;font-size:12px;font-weight:600;'
                             f'font-family:JetBrains Mono,monospace;">'
                             f'₹{sr.entry_zone_lo:,.1f}–₹{sr.entry_zone_hi:,.1f}</div>'
                             f'</div>'
