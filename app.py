@@ -363,7 +363,8 @@ def prefetch_htf_parallel(symbols: list, mode: str, status_text, progress_bar) -
             sym, result = fut.result()
             results[sym] = result
             completed   += 1
-            progress_bar.progress(0.15 + completed/total*0.25)
+            # Update progress from the main thread (safe for Streamlit)
+            progress_bar.progress(0.15 + completed / max(total, 1) * 0.25)
             if completed % 20 == 0:
                 status_text.text(f"HTF pre-fetch {completed}/{total}…")
     return results
@@ -713,10 +714,6 @@ def run_scan(symbols: list, mode: str, vix_val, htf_cache: dict,
                              phase_history_dict=phase_history_updates)
         with lock:
             completed[0] += 1
-            prog = 0.40 + completed[0]/total*0.55
-            progress_bar.progress(min(prog, 0.95))
-            if completed[0] % 20 == 0:
-                status_text.text(f"Scoring {completed[0]}/{total}…")
         return result
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
@@ -725,6 +722,12 @@ def run_scan(symbols: list, mode: str, vix_val, htf_cache: dict,
             r = fut.result()
             if r:
                 results.append(r)
+            # Update progress from the main thread (safe for Streamlit)
+            done = len(results)
+            prog = 0.40 + done / max(total, 1) * 0.55
+            progress_bar.progress(min(prog, 0.95))
+            if done % 20 == 0:
+                status_text.text(f"Scoring {done}/{total}…")
 
     # Merge phase history updates back into session state (main thread, safe)
     try:
