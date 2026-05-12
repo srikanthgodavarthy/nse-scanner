@@ -1141,70 +1141,92 @@ def render_scan_card(r: dict, mode: str, account_size: float, risk_pct: float):
     if entry and stop_p:
         psize = position_size(account_size, risk_pct, entry, stop_p)
 
-    age_str, stale = signal_age_label(r.get("scanned_at",""), mode)
-    stale_flag = ' <span style="color:#cc4444;font-size:0.70rem;">⏱ STALE</span>' if stale else ""
-    gated_flag = ' <span style="color:#e8a838;font-size:0.70rem;">📊 BREADTH GATED</span>' if gated else ""
-    arrow_html = f' <span style="color:#00d4aa;font-size:0.78rem;">{arrow}</span>' if arrow else ""
-
+    age_str, stale = signal_age_label(r.get("scanned_at", ""), mode)
+    stale_flag  = '<span style="color:#cc4444;font-size:0.70rem;"> STALE</span>' if stale else ""
+    gated_flag  = '<span style="color:#e8a838;font-size:0.70rem;"> BREADTH GATED</span>' if gated else ""
+    arrow_html  = '<span style="color:#00d4aa;font-size:0.78rem;">' + arrow + '</span>' if arrow else ""
     card_border = PHASE_COLORS.get(phase, "#1e2535")
+    htf_color   = "#22aa55" if r["htf_up"] else "#cc4444"
+    htf_arrow   = "&#8593;" if r["htf_up"] else "&#8595;"
 
-    st.markdown(f"""
-    <div class="card" style="border-left:4px solid {card_border};">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-        <div>
-          <span style="font-size:1.05rem;font-weight:700;color:#e8eaf0;">{r['sym']}</span>
-          {arrow_html}
-          <span style="color:#5a6580;font-size:0.75rem;margin-left:8px;">{r.get('sector','')}</span>
-        </div>
-        <div style="display:flex;gap:8px;align-items:center;">
-          {action_badge_html(action)}
-          {phase_badge_html(phase)}
-        </div>
-      </div>
-      <div class="mrow">
-        <span>LTP <b>{fmt(r['price'])}</b></span>
-        <span>Score <b style="color:#00d4aa;">{r['score']:.0f}</b></span>
-        <span>RSI <b>{r['rsi']}</b></span>
-        <span>ATR <b>{r['atr_val']}</b></span>
-        <span>RS <b>{r['rs_rank']}</b></span>
-        <span>HTF <b style="color:{'#22aa55' if r['htf_up'] else '#cc4444'};">{'↑' if r['htf_up'] else '↓'}</b></span>
-        <span style="color:#3d4a60;font-size:0.75rem;">{age_str}{stale_flag}{gated_flag}</span>
-      </div>
-      {f'<div class="mrow" style="margin-top:4px;"><span>Entry <b style="color:#4488ff;">{fmt(entry)}</b></span><span>Stop <b style="color:#cc4444;">{fmt(stop_p)}</b></span><span>Target <b style="color:#00d4aa;">{fmt(target)}</b></span>{"<span>Qty <b>" + str(psize.get("qty",0)) + "</b></span><span>Capital <b>" + fmt(psize.get("capital",0)) + "</b></span>" if psize else ""}</div>' if entry else ''}
-    </div>
-    """, unsafe_allow_html=True)
+    # Build optional entry row outside the HTML string
+    if entry:
+        psize_html = ""
+        if psize:
+            psize_html = (
+                '<span>Qty <b>' + str(psize.get("qty", 0)) + '</b></span>'
+                '<span>Capital <b>' + fmt(psize.get("capital", 0)) + '</b></span>'
+            )
+        entry_row = (
+            '<div class="mrow" style="margin-top:4px;">'
+            '<span>Entry <b style="color:#4488ff;">' + fmt(entry) + '</b></span>'
+            '<span>Stop <b style="color:#cc4444;">' + fmt(stop_p) + '</b></span>'
+            '<span>Target <b style="color:#00d4aa;">' + fmt(target) + '</b></span>'
+            + psize_html + '</div>'
+        )
+    else:
+        entry_row = ""
+
+    html = (
+        '<div class="card" style="border-left:4px solid ' + card_border + ';">'
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+        '<div>'
+        '<span style="font-size:1.05rem;font-weight:700;color:#e8eaf0;">' + r["sym"] + '</span> '
+        + arrow_html
+        + ' <span style="color:#5a6580;font-size:0.75rem;margin-left:8px;">' + r.get("sector", "") + '</span>'
+        + '</div>'
+        + '<div style="display:flex;gap:8px;align-items:center;">'
+        + action_badge_html(action) + phase_badge_html(phase)
+        + '</div></div>'
+        + '<div class="mrow">'
+        + '<span>LTP <b>' + fmt(r["price"]) + '</b></span>'
+        + '<span>Score <b style="color:#00d4aa;">' + str(round(r["score"])) + '</b></span>'
+        + '<span>RSI <b>' + str(r["rsi"]) + '</b></span>'
+        + '<span>ATR <b>' + str(r["atr_val"]) + '</b></span>'
+        + '<span>RS <b>' + str(r["rs_rank"]) + '</b></span>'
+        + '<span>HTF <b style="color:' + htf_color + ';">' + htf_arrow + '</b></span>'
+        + '<span style="color:#3d4a60;font-size:0.75rem;">' + age_str + stale_flag + gated_flag + '</span>'
+        + '</div>'
+        + entry_row
+        + '</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
 
 
 def render_exit_card(r: ExitResult):
     color      = EXIT_COLORS.get(r.exit_phase, "#555577")
     pnl_color  = "#22cc66" if r.pnl_pct >= 0 else "#cc4444"
-    hard_pills = "".join(f'<span class="trigger-pill pill-hard">{t}</span>' for t in r.hard_triggers)
-    soft_pills = "".join(f'<span class="trigger-pill pill-soft">{t}</span>' for t in r.soft_triggers)
-    all_pills  = hard_pills + soft_pills or '<span class="trigger-pill" style="background:#1e2535;color:#5a6580;">No triggers</span>'
-    partial    = f'&nbsp;·&nbsp;Partial exit: <b style="color:#e8a838;">{r.partial_exit_pct}%</b>' if r.partial_exit_pct else ""
-    htf_icon   = '<b style="color:#22aa55;">↑ HTF</b>' if r.htf_up else '<b style="color:#cc4444;">↓ HTF</b>'
+    hard_pills = "".join('<span class="trigger-pill pill-hard">' + t + '</span>' for t in r.hard_triggers)
+    soft_pills = "".join('<span class="trigger-pill pill-soft">' + t + '</span>' for t in r.soft_triggers)
+    pills_combined = hard_pills + soft_pills
+    all_pills  = pills_combined if pills_combined else '<span class="trigger-pill" style="background:#1e2535;color:#5a6580;">No triggers</span>'
+    partial    = '&nbsp;·&nbsp;Partial exit: <b style="color:#e8a838;">' + str(r.partial_exit_pct) + '%</b>' if r.partial_exit_pct else ""
+    htf_icon   = '<b style="color:#22aa55;">&#8593; HTF</b>' if r.htf_up else '<b style="color:#cc4444;">&#8595; HTF</b>'
+    pnl_str    = ('+' if r.pnl_pct >= 0 else '') + f'{r.pnl_pct:.1f}%'
+    exit_score_str = f'{r.exit_score:.0f}/100'
 
-    st.markdown(f"""
-    <div class="exit-card" style="border-color:{color};">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-        <span style="font-size:1.05rem;font-weight:700;color:#e8eaf0;">{r.sym}</span>
-        {exit_badge_html(r.exit_phase)}
-      </div>
-      <div class="mrow">
-        <span>LTP <b>{fmt(r.price)}</b></span>
-        <span>Entry <b>{fmt(r.entry_price)}</b></span>
-        <span>P&L <b style="color:{pnl_color};">{r.pnl_pct:+.1f}%</b></span>
-        <span>Trail Stop <b style="color:#e8a838;">{fmt(r.trailing_stop)}</b></span>
-        <span>Exit Score <b style="color:{color};">{r.exit_score:.0f}/100</b></span>
-        <span>RS {r.rs_rank}</span>
-        {htf_icon}
-      </div>
-      <div style="margin:6px 0 5px 0;">{all_pills}</div>
-      <div style="font-size:0.79rem;color:#5a6580;font-style:italic;">
-        {r.urgency_note}{partial}
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+    html = (
+        '<div class="exit-card" style="border-color:' + color + ';">'
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+        '<span style="font-size:1.05rem;font-weight:700;color:#e8eaf0;">' + r.sym + '</span>'
+        + exit_badge_html(r.exit_phase)
+        + '</div>'
+        '<div class="mrow">'
+        '<span>LTP <b>' + fmt(r.price) + '</b></span>'
+        '<span>Entry <b>' + fmt(r.entry_price) + '</b></span>'
+        '<span>P&amp;L <b style="color:' + pnl_color + ';">' + pnl_str + '</b></span>'
+        '<span>Trail Stop <b style="color:#e8a838;">' + fmt(r.trailing_stop) + '</b></span>'
+        '<span>Exit Score <b style="color:' + color + ';">' + exit_score_str + '</b></span>'
+        '<span>RS ' + str(r.rs_rank) + '</span>'
+        + htf_icon
+        + '</div>'
+        '<div style="margin:6px 0 5px 0;">' + all_pills + '</div>'
+        '<div style="font-size:0.79rem;color:#5a6580;font-style:italic;">'
+        + r.urgency_note + partial
+        + '</div>'
+        '</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════
