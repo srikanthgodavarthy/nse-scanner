@@ -1820,29 +1820,39 @@ with tab6:
             st.divider()
 
             # sort by urgency
-            _exit_order = {EXIT_CONFIRMED: 0, EXIT_SIGNAL: 1, EXIT_WATCH: 2, EXIT_HOLD: 3}
+            _exit_order = {
+                EXIT_CONFIRMED: 0,
+                EXIT_SIGNAL: 1,
+                EXIT_WATCH: 2,
+                EXIT_HOLD: 3
+            }
+            
             valid_positions = [
-              p for p in positions
-              if isinstance(p, dict) and p.get("symbol")
+                p for p in positions
+                if isinstance(p, dict) and p.get("symbol")
             ]
-						positions_sorted = sorted(
-							valid_positions,
-							key=lambda p: _exit_order.get(
-									exit_results[p["symbol"]].verdict
-									if p["symbol"] in exit_results else EXIT_HOLD,
-									3
-							)
+            
+            positions_sorted = sorted(
+                valid_positions,
+                key=lambda p: _exit_order.get(
+                    exit_results[p["symbol"]].verdict
+                    if p["symbol"] in exit_results else EXIT_HOLD,
+                    3
+                )
             )
-
+            
             for pos in positions_sorted:
-                sym = pos["symbol"]
+                sym = pos.get("symbol")
                 if not sym:
                     continue
-                er  = exit_results.get(sym)
+            
+                er = exit_results.get(sym)
                 _render_exit_card(pos, er)
-
+            
                 verdict = er.verdict if er else EXIT_HOLD
+            
                 c1, c2, c3 = st.columns([2, 2, 1])
+            
                 with c1:
                     if verdict == EXIT_CONFIRMED:
                         st.error("⚠️ Consider full exit or tight stop")
@@ -1850,12 +1860,15 @@ with tab6:
                         st.warning("🔶 Consider 50% exit to lock gains")
                     elif verdict == EXIT_WATCH:
                         st.info("👁 Monitor closely — tighten stop")
+            
                 with c3:
                     if st.button("🗑 Remove", key=f"rm_{sym}_{pos.get('entry_date','')}"):
                         st.session_state["open_positions"] = [
                             p for p in st.session_state["open_positions"]
-                            if not (p["symbol"] == sym
-                                    and p.get("entry_date") == pos.get("entry_date"))
+                            if not (
+                                p.get("symbol") == sym
+                                and p.get("entry_date") == pos.get("entry_date")
+                            )
                         ]
                         _save_positions()
                         st.rerun()
