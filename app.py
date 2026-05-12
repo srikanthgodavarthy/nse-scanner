@@ -2665,7 +2665,7 @@ with tab_scanner:
                         rsi_c = "#ef4444" if sr.rsi_val > 70 else ("#f59e0b" if sr.rsi_val > 60 else "#cbd5e1")
                         bar  = min(sr.short_score, 100)
                         hard_pills = "".join(
-                            f'<span style="background:rgba(239,68,68,0.08);'
+                            f'<span style="background:#0b0b0f;'
                             f'border:1px solid rgba(239,68,68,0.20);'
                             f'color:#e2e8f0;'
                             f'padding:3px 8px;'
@@ -2677,7 +2677,7 @@ with tab_scanner:
                             for t in sr.hard_triggers
                         )
                         soft_pills = "".join(
-                            f'<span style="background:rgba(239,68,68,0.05);'
+                            f'<span style="background:#0b0b0f;'
                             f'border:1px solid rgba(239,68,68,0.14);'
                             f'color:#e2e8f0;'
                             f'padding:3px 8px;'
@@ -2689,7 +2689,7 @@ with tab_scanner:
                             for t in sr.soft_triggers
                         )
                         ext_badge = (
-                            f'<span style="background:rgba(239,68,68,0.06);'
+                            f'<span style="background:#0b0b0f;'
                             f'border:1px solid rgba(239,68,68,0.18);'
                             f'color:#e2e8f0;'
                             f'padding:3px 8px;'
