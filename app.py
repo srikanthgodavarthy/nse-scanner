@@ -1918,11 +1918,25 @@ def score_exit(sym: str, entry_price: float, mode: str = "Swing",
 
 def run_exit_scan(positions: list, vix_val: float = None) -> dict:
     out = {}
+    valid = [p for p in positions if isinstance(p, dict) and p.get("symbol")]
+    if not valid:
+        return out
+
     def _one(pos):
-        return pos["symbol"], score_exit(pos["symbol"], pos.get("entry_price", 0),
-                                          pos.get("mode", "Swing"), vix_val)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(positions) or 1)) as pool:
-        for sym, er in pool.map(_one, positions): out[sym] = er
+        sym = pos["symbol"]
+        return sym, score_exit(sym, pos.get("entry_price", 0),
+                               pos.get("mode", "Swing"), vix_val)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(valid))) as pool:
+        futures = {pool.submit(_one, pos): pos for pos in valid}
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                sym, er = fut.result()
+                out[sym] = er
+            except Exception as e:
+                pos = futures[fut]
+                sym = pos.get("symbol", "?")
+                out[sym] = ExitResult(symbol=sym, error=str(e))
     return out
 
 
