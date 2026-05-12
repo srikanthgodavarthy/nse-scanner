@@ -2162,7 +2162,7 @@ st.markdown(
     '''<div style="font-family:Syne,sans-serif;font-size:28px;font-weight:700;
     letter-spacing:-1px;color:#e8e8f4;padding:8px 0 4px;">
     BULL SUTRA <span style="color:#f59e0b;">''</span>
-    <span style="font-size:13px;color:#6b7090;font-family:JetBrains Mono,monospace;
+    <span style="font-size:13px;color:#cbd5e1;font-family:JetBrains Mono,monospace;
     font-weight:400;">PRO · v14</span></div>''',
     unsafe_allow_html=True,
 )
@@ -2187,8 +2187,8 @@ with gc5:
 vix_val, vix_label = fetch_vix()
 vix_color = {
     "CALM":    "#22c55e", "CAUTION": "#f59e0b",
-    "STRESS":  "#ef4444", "UNKNOWN": "#6b7090",
-}.get(vix_label, "#6b7090")
+    "STRESS":  "#ef4444", "UNKNOWN": "#cbd5e1",
+}.get(vix_label, "#cbd5e1")
 vix_text_color = {
     "CALM":    "#14532d", "CAUTION": "#78350f",
     "STRESS":  "#7f1d1d", "UNKNOWN": "#374151",
@@ -2353,7 +2353,7 @@ with tab_scanner:
         with col:
             if not d:
                 st.markdown(
-                    f"<div style='color:#6b7090;font-size:12px;'>{name}: unavailable</div>",
+                    f"<div style='color:#cbd5e1;font-size:12px;'>{name}: unavailable</div>",
                     unsafe_allow_html=True)
                 continue
 
@@ -2365,7 +2365,7 @@ with tab_scanner:
             score_bar_color = (
                 "#f59e0b" if act == "STRONG BUY" else
                 "#22c55e" if act == "BUY" else
-                "#f59e0b" if act == "WATCH" else "#6b7090"
+                "#f59e0b" if act == "WATCH" else "#cbd5e1"
             )
             sp = int(min(d["score"], 100))
 
@@ -2377,11 +2377,11 @@ with tab_scanner:
                 oi_badge = (
                     f'<div style="margin-top:6px;padding:5px 8px;background:#09090f;'
                     f'border-radius:5px;border:1px solid #1e1e40;font-family:JetBrains Mono,monospace;">'
-                    f'<span style="color:#6b7090;font-size:9px;">PCR </span>'
+                    f'<span style="color:#cbd5e1;font-size:9px;">PCR </span>'
                     f'<span style="background:{s_col}22;border:1px solid {s_col}44;'
                     f'color:{s_col};padding:1px 5px;border-radius:3px;font-size:9px;font-weight:600;">'
                     f'{oi_data["pcr"]} {s_label}</span>'
-                    f'<span style="color:#6b7090;font-size:9px;margin-left:6px;">Pain </span>'
+                    f'<span style="color:#cbd5e1;font-size:9px;margin-left:6px;">Pain </span>'
                     f'<span style="color:#f59e0b;font-size:9px;font-weight:600;">'
                     f'₹{oi_data["max_pain"]:,} {pa}{abs(pd_):,}</span>'
                     f'<br><span style="color:#ef4444;font-size:9px;">C▶₹{oi_data["call_wall"]:,}  </span>'
@@ -2392,7 +2392,7 @@ with tab_scanner:
             st.markdown(
                 f'<div style="background:#111120;border:1px solid #1e1e40;'
                 f'border-radius:10px;padding:14px 16px;">'
-                f'<div style="font-family:DM Sans,sans-serif;color:#6b7090;'
+                f'<div style="font-family:DM Sans,sans-serif;color:#cbd5e1;'
                 f'font-size:10px;text-transform:uppercase;letter-spacing:1px;">{name}</div>'
                 f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;'
                 f'font-size:22px;font-weight:600;margin:4px 0 2px;">{ltp_val:,.1f}</div>'
@@ -2455,7 +2455,7 @@ with tab_scanner:
             if act == "STRONG BUY": return "#f59e0b22", "#f59e0b55", "#f59e0b"
             if act == "BUY":        return "#22c55e1a", "#22c55e44", "#22c55e"
             if act == "WATCH":      return "#f59e0b11", "#f59e0b33", "#d97706"
-            return "#6b709011", "#6b709033", "#6b7090"
+            return "#cbd5e111", "#cbd5e133", "#cbd5e1"
 
         def make_card(i, r, border_color, show_entry=True):
             chg = r["%Change"]
@@ -2478,7 +2478,7 @@ with tab_scanner:
             conf_lbl, conf_col = confidence_label(conf)
 
             rsr    = r.get("RS_Rank", 50)
-            rs_col = "#22c55e" if rsr >= 80 else ("#d97706" if rsr >= 60 else "#6b7090")
+            rs_col = "#22c55e" if rsr >= 80 else ("#d97706" if rsr >= 60 else "#cbd5e1")
 
             entry_str  = (f'₹{r["Entry"]:,.2f}' if show_entry and r["Entry"] != r["LTP"] else "")
             ext_n      = r.get("ExtN", 0)
@@ -2527,7 +2527,7 @@ with tab_scanner:
                 if r.get("InGolden") else ""
             )
             stale_html = (
-                '<span style="color:#6b7090;font-size:10px;margin-left:6px;">⏱ stale</span>'
+                '<span style="color:#cbd5e1;font-size:10px;margin-left:6px;">⏱ stale</span>'
                 if is_stale else ""
             )
 
@@ -2542,7 +2542,7 @@ with tab_scanner:
                 f'<span style="background:#1e1e40;border:1px solid {conf_col}55;'
                 f'padding:6px 10px;border-radius:6px;font-size:10px;font-weight:600;'
                 f'font-family:DM Sans,sans-serif;">'
-                f'<span style="color:#6b7090;font-size:9px;display:block;">{conf_lbl}</span>'
+                f'<span style="color:#cbd5e1;font-size:9px;display:block;">{conf_lbl}</span>'
                 f'<span style="color:{conf_col};font-weight:700;">{conf}%</span></span>'
             )
             parts = [
@@ -2560,7 +2560,7 @@ with tab_scanner:
                 f'<span style="background:{act_bg};border:1px solid {act_brd};color:{act_txt};'
                 f'padding:4px 10px;border-radius:5px;font-size:11px;font-weight:700;'
                 f'font-family:DM Sans,sans-serif;">{act}</span>',
-                f'<span style="background:#1e1e40;color:#6b7090;font-family:JetBrains Mono,'
+                f'<span style="background:#1e1e40;color:#cbd5e1;font-family:JetBrains Mono,'
                 f'monospace;font-size:11px;padding:4px 8px;border-radius:5px;">{r["Score"]}</span>',
                 stale_html, '</div>',
                 '<div style="display:flex;padding:14px 16px;gap:0;">',
@@ -2581,21 +2581,21 @@ with tab_scanner:
                 '</div>', ext_html, '</div>', '</div>',
                 '<div style="display:flex;align-items:center;padding:9px 16px;'
                 'border-top:1px solid #1e1e40;background:#0d0d1a;">',
-                f'<div style="flex:1;"><span style="color:#6b7090;font-size:9px;display:block;'
+                f'<div style="flex:1;"><span style="color:#cbd5e1;font-size:9px;display:block;'
                 f'text-transform:uppercase;letter-spacing:0.5px;">RSI</span>'
                 f'<span style="color:#e8e8f4;font-size:12px;font-family:JetBrains Mono,'
                 f'monospace;">{rsi_val}</span></div>',
                 '<div style="width:1px;background:#1e1e40;height:28px;margin:0 6px;"></div>',
-                f'<div style="flex:1;"><span style="color:#6b7090;font-size:9px;display:block;'
+                f'<div style="flex:1;"><span style="color:#cbd5e1;font-size:9px;display:block;'
                 f'text-transform:uppercase;letter-spacing:0.5px;">Trend</span>'
                 f'<span style="color:{trend_col};font-size:12px;font-weight:600;">'
                 f'{trend_label}</span></div>',
                 '<div style="width:1px;background:#1e1e40;height:28px;margin:0 6px;"></div>',
-                f'<div style="flex:1;"><span style="color:#6b7090;font-size:9px;display:block;'
+                f'<div style="flex:1;"><span style="color:#cbd5e1;font-size:9px;display:block;'
                 f'text-transform:uppercase;letter-spacing:0.5px;">Volume</span>'
                 f'<span style="color:#e8e8f4;font-size:12px;">{vol_label}</span></div>',
                 '<div style="width:1px;background:#1e1e40;height:28px;margin:0 6px;"></div>',
-                f'<div style="flex:1;"><span style="color:#6b7090;font-size:9px;display:block;'
+                f'<div style="flex:1;"><span style="color:#cbd5e1;font-size:9px;display:block;'
                 f'text-transform:uppercase;letter-spacing:0.5px;">Sector</span>'
                 f'<span style="color:#e8e8f4;font-size:12px;">{sector}</span></div>',
                 '</div>', '</div>',
@@ -2662,7 +2662,7 @@ with tab_scanner:
                     for i, sr in enumerate(top_shorts):
                         vc   = SHORT_COLORS.get(sr.verdict, "#555577")
                         rr_c = "#22c55e" if sr.risk_reward >= 2 else ("#f59e0b" if sr.risk_reward >= 1.5 else "#ef4444")
-                        rsi_c = "#ef4444" if sr.rsi_val > 70 else ("#f59e0b" if sr.rsi_val > 60 else "#6b7090")
+                        rsi_c = "#ef4444" if sr.rsi_val > 70 else ("#f59e0b" if sr.rsi_val > 60 else "#cbd5e1")
                         bar  = min(sr.short_score, 100)
                         hard_pills = "".join(
                             f'<span style="background:#3d1a1a;border:1px solid #cc224466;color:#ff8888;'
@@ -2681,11 +2681,11 @@ with tab_scanner:
                         ) if sr.ext_n >= 2 else ""
 
                         sh_cards += (
-                            f'<div style="background:#110d0d;border:1px solid {vc};border-radius:12px;'
+                            f'<div style="background:#1b1113;border:1px solid {vc}55;border-radius:12px;'
                             f'overflow:hidden;width:360px;min-width:320px;max-width:380px;flex:1 1 360px;">'
                             # header
                             f'<div style="display:flex;align-items:center;padding:12px 16px 10px;'
-                            f'border-bottom:1px solid #1e1e40;gap:10px;">'
+                            f'border-bottom:1px solid rgba(255,255,255,0.08);gap:10px;">'
                             f'<div style="background:{vc}22;color:{vc};font-family:JetBrains Mono,monospace;'
                             f'font-size:12px;font-weight:700;padding:4px 8px;border-radius:6px;'
                             f'min-width:32px;text-align:center;">{i+1:02d}</div>'
@@ -2693,7 +2693,7 @@ with tab_scanner:
                             f'font-weight:700;flex:1;">{sr.symbol}</div>'
                             f'<span style="background:{vc}22;border:1px solid {vc};color:{vc};'
                             f'padding:4px 10px;border-radius:5px;font-size:11px;font-weight:700;">▼ {sr.verdict}</span>'
-                            f'<span style="background:#1e1e40;color:#6b7090;font-family:JetBrains Mono,'
+                            f'<span style="background:#1e1e40;color:#cbd5e1;font-family:JetBrains Mono,'
                             f'monospace;font-size:11px;padding:4px 8px;border-radius:5px;">{sr.short_score}</span>'
                             f'</div>'
                             # price + short zone
@@ -2711,33 +2711,33 @@ with tab_scanner:
                             f'<div style="flex:1;padding-left:16px;">'
                             f'<div style="display:flex;gap:6px;flex-wrap:wrap;">'
                             f'<span style="background:#1e1e40;padding:5px 8px;border-radius:5px;">'
-                            f'<span style="color:#6b7090;font-size:9px;display:block;">SL ▲</span>'
+                            f'<span style="color:#cbd5e1;font-size:9px;display:block;">SL ▲</span>'
                             f'<span style="color:#ef4444;font-family:JetBrains Mono,monospace;font-size:11px;'
                             f'font-weight:600;">₹{sr.stop_loss:,.1f}</span></span>'
                             f'<span style="background:#1e1e40;padding:5px 8px;border-radius:5px;">'
-                            f'<span style="color:#6b7090;font-size:9px;display:block;">R:R</span>'
+                            f'<span style="color:#cbd5e1;font-size:9px;display:block;">R:R</span>'
                             f'<span style="color:{rr_c};font-weight:700;font-size:12px;">1:{sr.risk_reward:.1f}</span></span>'
                             f'<span style="background:#1e1e40;padding:5px 8px;border-radius:5px;">'
-                            f'<span style="color:#6b7090;font-size:9px;display:block;">RSI</span>'
+                            f'<span style="color:#cbd5e1;font-size:9px;display:block;">RSI</span>'
                             f'<span style="color:{rsi_c};font-family:JetBrains Mono,monospace;font-size:11px;">'
                             f'{sr.rsi_val:.0f}</span></span>'
                             f'<span style="background:#1e1e40;padding:5px 8px;border-radius:5px;">'
-                            f'<span style="color:#6b7090;font-size:9px;display:block;">HTF</span>'
+                            f'<span style="color:#cbd5e1;font-size:9px;display:block;">HTF</span>'
                             f'<span style="color:#aaa;font-size:11px;">{sr.htf_trend}</span></span>'
                             f'</div></div></div>'
                             # targets
                             f'<div style="padding:6px 16px 8px;background:#0a0808;display:flex;gap:16px;">'
-                            f'<div><span style="color:#6b7090;font-size:9px;">T1 ▼</span>'
+                            f'<div><span style="color:#cbd5e1;font-size:9px;">T1 ▼</span>'
                             f'<div style="font-family:JetBrains Mono,monospace;color:#22aa88;font-size:11px;">'
                             f'₹{sr.target1:,.1f}</div></div>'
-                            f'<div><span style="color:#6b7090;font-size:9px;">T2 ▼</span>'
+                            f'<div><span style="color:#cbd5e1;font-size:9px;">T2 ▼</span>'
                             f'<div style="font-family:JetBrains Mono,monospace;color:#22aa88;font-size:12px;'
                             f'font-weight:600;">₹{sr.target2:,.1f}</div></div>'
-                            f'<div><span style="color:#6b7090;font-size:9px;">T3 ▼</span>'
+                            f'<div><span style="color:#cbd5e1;font-size:9px;">T3 ▼</span>'
                             f'<div style="font-family:JetBrains Mono,monospace;color:#22aa88;font-size:11px;">'
                             f'₹{sr.target3:,.1f}</div></div>'
                             f'<div style="margin-left:auto;text-align:right;">'
-                            f'<span style="color:#6b7090;font-size:9px;">RS · {sr.sector}</span>'
+                            f'<span style="color:#cbd5e1;font-size:9px;">RS · {sr.sector}</span>'
                             f'<div style="color:#aaa;font-family:JetBrains Mono,monospace;font-size:11px;">'
                             f'RS{sr.rs_rank}</div></div>'
                             f'</div>'
@@ -2765,7 +2765,7 @@ with tab_scanner:
                 sh_watch_list = [s for s in short_candidates if s.verdict == SHORT_WATCH]
                 if sh_watch_list:
                     st.markdown(
-                        f'<div style="color:#6b7090;font-size:11px;font-family:DM Sans,sans-serif;'
+                        f'<div style="color:#cbd5e1;font-size:11px;font-family:DM Sans,sans-serif;'
                         f'margin-top:10px;">Also on watch ({len(sh_watch_list)}):</div>',
                         unsafe_allow_html=True,
                     )
@@ -2815,7 +2815,7 @@ with tab_scanner:
         df_display = pd.DataFrame(rows)
 
         def color_extn(val):
-            if val == 0: return "background-color: transparent; color: #6b7090"
+            if val == 0: return "background-color: transparent; color: #cbd5e1"
             if val == 1: return "background-color: #78350f44; color: #f59e0b"
             if val == 2: return "background-color: #9a3412aa; color: #fb923c"
             return "background-color: #7f1d1d; color: #fca5a5; font-weight: 600"
@@ -2824,7 +2824,7 @@ with tab_scanner:
             if val == "STRONG BUY": return "color: #f59e0b; font-weight: 600"
             if val == "BUY":        return "color: #22c55e"
             if val == "WATCH":      return "color: #d97706"
-            return "color: #6b7090"
+            return "color: #cbd5e1"
 
         def color_pct(val):
             if isinstance(val, str) and val.startswith("+"):
@@ -2946,7 +2946,7 @@ with tab_breadth:
                     f'border-radius:7px;padding:10px 12px;">'
                     f'<div style="color:#e8e8f4;font-size:11px;font-weight:600;'
                     f'font-family:DM Sans,sans-serif;">{row["Sector"]}</div>'
-                    f'<div style="color:#6b7090;font-size:10px;'
+                    f'<div style="color:#cbd5e1;font-size:10px;'
                     f'font-family:JetBrains Mono,monospace;">{int(row["Count"])} stocks</div>'
                     f'<div style="background:#1e1e40;border-radius:2px;height:4px;margin:6px 0;">'
                     f'<div style="background:{bar_col};width:{pct}%;height:4px;border-radius:2px;"></div></div>'
@@ -2971,7 +2971,7 @@ with tab_breadth:
                 f'border-radius:7px;padding:12px;text-align:center;">'
                 f'<div style="color:{col};font-size:22px;font-weight:600;'
                 f'font-family:JetBrains Mono,monospace;">{count}</div>'
-                f'<div style="color:#6b7090;font-size:11px;font-family:DM Sans,sans-serif;">{label}</div>'
+                f'<div style="color:#cbd5e1;font-size:11px;font-family:DM Sans,sans-serif;">{label}</div>'
                 f'<div style="color:{col};font-size:11px;font-family:JetBrains Mono,monospace;">{pct2}%</div>'
                 f'</div>'
             )
@@ -3025,7 +3025,7 @@ with tab_detail:
                 }.get(PHASE_COLORS[ph], "#e8e8f4")
                 ph_html += (
                     f'<div style="background:{bg};border:{brd};'
-                    f'color:{ph_txt_active if active else "#6b7090"};'
+                    f'color:{ph_txt_active if active else "#cbd5e1"};'
                     f'padding:4px 12px;border-radius:5px;font-size:11px;'
                     f'font-weight:{"600" if active else "400"};font-family:DM Sans,sans-serif;">'
                     f'{ph}{"  ◀" if active else ""}</div>'
@@ -3047,9 +3047,9 @@ with tab_detail:
                         f'  <span style="color:#3a3a60;font-size:10px;">({curr_ts[:16]})</span>'
                     )
                 st.markdown(
-                    '<details><summary style="color:#6b7090;font-size:11px;cursor:pointer;">'
+                    '<details><summary style="color:#cbd5e1;font-size:11px;cursor:pointer;">'
                     f'Phase History ({len(history)} states)</summary>'
-                    '<div style="font-size:11px;color:#6b7090;padding:6px 0;'
+                    '<div style="font-size:11px;color:#cbd5e1;padding:6px 0;'
                     'font-family:JetBrains Mono,monospace;">'
                     + "<br>".join(transitions) + '</div></details>',
                     unsafe_allow_html=True,
@@ -3098,7 +3098,7 @@ with tab_detail:
                 st.markdown(
                     f'<div style="background:#111120;border:1px solid #1e1e40;border-radius:6px;'
                     f'padding:8px 12px;margin-top:8px;font-size:11px;'
-                    f'font-family:JetBrains Mono,monospace;color:#6b7090;">'
+                    f'font-family:JetBrains Mono,monospace;color:#cbd5e1;">'
                     f'Base: <span style="color:#e8e8f4;">{ps["base_qty"]}</span>  ×  '
                     f'VIX adj <span style="color:#f59e0b;">{ps["vix_adj"]}×</span>  ×  '
                     f'ATR adj <span style="color:#f59e0b;">{ps["atr_adj"]}×</span>  =  '
@@ -3124,11 +3124,11 @@ with tab_detail:
                 for fname, fval in factors.items():
                     col_f = ("#22c55e" if fval >= 10 else
                              "#f59e0b" if fval >= 5 else
-                             "#ef4444" if fval < 0 else "#6b7090")
+                             "#ef4444" if fval < 0 else "#cbd5e1")
                     st.markdown(
                         f'<div style="display:flex;justify-content:space-between;'
                         f'padding:4px 0;border-bottom:1px solid #1e1e40;">'
-                        f'<span style="color:#6b7090;font-size:12px;'
+                        f'<span style="color:#cbd5e1;font-size:12px;'
                         f'font-family:DM Sans,sans-serif;">{fname}</span>'
                         f'<span style="color:{col_f};font-size:12px;font-weight:600;'
                         f'font-family:JetBrains Mono,monospace;">{fval:+.0f}</span>'
@@ -3361,7 +3361,7 @@ with tab_portfolio:
 
             trail_bit = (
                 f'<div style="flex:0 0 auto;">'
-                f'<div style="color:#6b7090;font-size:9px;">TRAIL SL</div>'
+                f'<div style="color:#cbd5e1;font-size:9px;">TRAIL SL</div>'
                 f'<div style="font-family:JetBrains Mono,monospace;color:#f59e0b;font-size:13px;font-weight:600;">₹{trail_sl:,.2f}</div>'
                 f'</div>'
             ) if trail_sl else ""
@@ -3373,20 +3373,20 @@ with tab_portfolio:
                 f'<div style="display:flex;justify-content:space-between;align-items:center;'
                 f'padding:12px 16px 10px;border-bottom:1px solid #1e1e40;">'
                 f'<div><span style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:16px;font-weight:700;">{sym}</span>'
-                f'<span style="color:#6b7090;font-size:11px;font-family:DM Sans,sans-serif;margin-left:8px;">'
+                f'<span style="color:#cbd5e1;font-size:11px;font-family:DM Sans,sans-serif;margin-left:8px;">'
                 f'{SECTOR_MAP.get(sym,"—")} · {mode_p}</span></div>'
                 f'<span style="background:{vc}22;border:1px solid {vc};color:{vc};'
                 f'padding:4px 12px;border-radius:6px;font-size:11px;font-weight:700;">{verdict}</span>'
                 f'</div>'
                 # metrics
                 f'<div style="display:flex;gap:20px;flex-wrap:wrap;padding:12px 16px;">'
-                f'<div><div style="color:#6b7090;font-size:9px;">ENTRY</div>'
+                f'<div><div style="color:#cbd5e1;font-size:9px;">ENTRY</div>'
                 f'<div style="font-family:JetBrains Mono,monospace;color:#aaa;font-size:14px;">₹{entry_px:,.2f}</div></div>'
-                f'<div><div style="color:#6b7090;font-size:9px;">CURRENT</div>'
+                f'<div><div style="color:#cbd5e1;font-size:9px;">CURRENT</div>'
                 f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:14px;">₹{curr_px:,.2f}</div></div>'
-                f'<div><div style="color:#6b7090;font-size:9px;">QTY</div>'
+                f'<div><div style="color:#cbd5e1;font-size:9px;">QTY</div>'
                 f'<div style="font-family:JetBrains Mono,monospace;color:#aaa;font-size:14px;">{qty}</div></div>'
-                f'<div><div style="color:#6b7090;font-size:9px;">P&L</div>'
+                f'<div><div style="color:#cbd5e1;font-size:9px;">P&L</div>'
                 f'<div style="font-family:JetBrains Mono,monospace;color:{pnl_col};font-size:14px;font-weight:700;">'
                 f'{"+"}' + f'{pnl_pct:.1f}% (₹{pnl_abs:+,.0f})</div></div>'
                 + trail_bit +
@@ -3394,7 +3394,7 @@ with tab_portfolio:
                 # exit pressure bar
                 f'<div style="padding:4px 16px 8px;">'
                 f'<div style="display:flex;justify-content:space-between;margin-bottom:3px;">'
-                f'<span style="color:#6b7090;font-size:9px;">EXIT PRESSURE</span>'
+                f'<span style="color:#cbd5e1;font-size:9px;">EXIT PRESSURE</span>'
                 f'<span style="color:{vc};font-size:9px;font-weight:700;">{bar}/100</span></div>'
                 f'<div style="background:#1e1e40;border-radius:2px;height:4px;">'
                 f'<div style="background:{vc};width:{bar}%;height:4px;border-radius:2px;"></div></div></div>'
