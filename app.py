@@ -1,60 +1,14 @@
-"""BULL SUTRA Pro — v11
+"""BULL SUTRA Pro — v11 + EXIT LAYER
 ═══════════════════════════════════════════════════════════════════
-FIXES FROM v10
-──────────────────────────
-FIX-1  CLOSED-CANDLE HTF ALIGNMENT
-        _htf_trend_from_df now drops the last (still-forming) bar
-        before computing EMAs, so a live intraday bar never
-        contaminates the higher-timeframe signal.
-
-FIX-2  BREADTH-BASED GATING
-        run_scan computes a quick breadth pulse after scoring.
-        When breadth is WEAK (pct_above_ema50 < 40 AND ad_ratio < 0.8)
-        stocks in PHASE_BRK / PHASE_CONT have their action capped to
-        WATCH and a "breadth_gated" flag is set on the result dict.
-        No scoring math changes; the gate is applied in the main thread.
-
-FIX-3  STRUCTURAL BREAKOUT FILTERING
-        detect_phase_and_entry now requires a breakout candle to clear
-        the rolling high by at least 0.15 × ATR (was 0.20 × ATR buf),
-        AND volume must exceed vol_avg × 1.5 (hard gate, not weighted).
-        Breakout is also rejected when the prior 3-bar range is already
-        expanded (atr_val > atr_mean × 1.4) — avoids chasing blowoffs.
-
-FIX-4  INTRADAY TIME-NORMALISED VOLUME
-        liquidity_ok and score_stock now compute vol_avg using only
-        bars from the current session so far when mode == "Intraday".
-        A helper _intraday_bars_elapsed() returns the fraction of the
-        trading session completed; volume is scaled to a full-session
-        equivalent before comparison, preventing false "volume spike"
-        signals early in the day.
-
-FIX-5  CAPITAL CAP IN POSITION SIZING
-        position_size now accepts a max_capital_pct parameter
-        (default 0.20 = 20 % of account).  final_qty is clamped so
-        that capital_used ≤ account_size × max_capital_pct, regardless
-        of how wide the stop is relative to account size.
-
-FIX-6  EMA DOUBLE-COUNTING REMOVED
-        In score_stock bull scoring the block
-            bull += 15 if e_fast > e_slow else (7 if e_fast > e_slow * 0.995 else 0)
-        was also fully captured by the trend_up / trend_strong flags
-        (which already require e_fast > e_slow).  The EMA cross line
-        is replaced with a tighter, non-overlapping bonus:
-            +8 if golden-cross within last 5 bars (fresh cross)
-            +4 if e_fast > e_slow but not a fresh cross
-            0  otherwise
-        trend_up (+25) and ema_stack (+15) remain unchanged.
-
-SPEED IMPROVEMENTS PRESERVED FROM v10
-──────────────────────────
-PERF-1  Parallel scoring (ThreadPoolExecutor, 32 workers)
-PERF-2  Merged OHLCV + daily context fetch
-PERF-3  No throttle sleep; 32 workers
-PERF-4  Vectorized RS ranks (numpy argsort)
-PERF-5  VIX + Nifty pre-warmed on startup
-PERF-6  Retry sleep capped at 1.0 s
-PERF-7  Thread-safe phase transitions
+BASE: v11 solid — all FIX-1 … FIX-6 preserved, same UI/scoring.
+NEW:  Exit Layer fully integrated.
+  • ExitResult dataclass + score_exit() — 4 hard + 7 soft triggers
+  • compute_trailing_stop() — VIX-adjusted, profit-tightening
+  • run_exit_scan()          — parallel, thread-safe
+  • Position manager         — add/remove from session state
+  • Tab 6: 🔴 Exit/Sell      — v11 dark-theme cards, exit score bar,
+                               trigger pills, partial-exit guidance
+═══════════════════════════════════════════════════════════════════
 """
 
 import warnings
@@ -62,7 +16,10 @@ import logging
 import time
 import os
 import threading
+import concurrent.futures
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -158,10 +115,29 @@ VIX_CAUTION = 20
 VIX_STRESS  = 25
 LIQUIDITY_MIN_CR = 5.0
 
-# NSE cash-market session: 09:15–15:30 IST
 NSE_OPEN_HOUR,  NSE_OPEN_MIN  = 9, 15
 NSE_CLOSE_HOUR, NSE_CLOSE_MIN = 15, 30
-NSE_SESSION_MINUTES = (NSE_CLOSE_HOUR * 60 + NSE_CLOSE_MIN) - (NSE_OPEN_HOUR * 60 + NSE_OPEN_MIN)  # 375
+NSE_SESSION_MINUTES = (NSE_CLOSE_HOUR * 60 + NSE_CLOSE_MIN) - (NSE_OPEN_HOUR * 60 + NSE_OPEN_MIN)
+
+# ── Exit Layer Constants ───────────────────────────────────────────────────────
+
+EXIT_HOLD      = "HOLD"
+EXIT_WATCH     = "EXIT WATCH"
+EXIT_SIGNAL    = "EXIT SIGNAL"
+EXIT_CONFIRMED = "EXIT NOW"
+
+EXIT_COLORS = {
+    EXIT_HOLD:      "#22aa55",
+    EXIT_WATCH:     "#f59e0b",
+    EXIT_SIGNAL:    "#ff8800",
+    EXIT_CONFIRMED: "#cc4444",
+}
+
+EXIT_SCORE_WATCH     = 20
+EXIT_SCORE_SIGNAL    = 40
+EXIT_SCORE_CONFIRMED = 65
+EXIT_HARD_WEIGHT     = 25
+EXIT_SOFT_WEIGHT     = 10
 
 # ── Thread safety ──────────────────────────────────────────────────────────────
 _phase_lock = threading.Lock()
@@ -224,11 +200,6 @@ def fmt(val):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _session_elapsed_fraction() -> float:
-    """
-    Returns the fraction of the NSE trading session (09:15–15:30) that has
-    elapsed as of *now* (IST = UTC+5:30).  Clamped to [0.05, 1.0] so we
-    never divide by near-zero early in the session.
-    """
     now_utc  = datetime.utcnow()
     now_ist  = now_utc + timedelta(hours=5, minutes=30)
     minutes_since_open = (now_ist.hour * 60 + now_ist.minute) - (NSE_OPEN_HOUR * 60 + NSE_OPEN_MIN)
@@ -237,30 +208,15 @@ def _session_elapsed_fraction() -> float:
 
 
 def _intraday_vol_avg(volume: pd.Series, bars_per_day: int) -> float:
-    """
-    FIX-4: For intraday data, compute today's cumulative volume scaled to a
-    full-session equivalent, then average with recent prior-day totals.
-
-    - Collects full prior-day volumes (rolling sum of bars_per_day bars,
-      shifted by 1 day's worth of bars so today's partial data is excluded).
-    - Estimates today's projected full-day volume by dividing elapsed bars'
-      cumulative volume by the session fraction elapsed.
-    - Returns the mean of the last 5 prior-day full volumes + today's projection.
-    """
     elapsed_frac = _session_elapsed_fraction()
-
-    # today's bars: last N bars (may be partial)
     today_bars = int(min(bars_per_day * elapsed_frac + 1, len(volume)))
     today_vol  = float(volume.iloc[-today_bars:].sum())
-    today_proj = today_vol / elapsed_frac          # scaled to full session
-
-    # prior full days: rolling sum, skip today's partial bars
+    today_proj = today_vol / elapsed_frac
     if len(volume) > bars_per_day + today_bars:
         prior = volume.iloc[:-(today_bars)].rolling(bars_per_day).sum().dropna()
         prior_daily = prior.iloc[-5:].values.tolist()
     else:
         prior_daily = []
-
     all_days = prior_daily + [today_proj]
     return float(np.mean(all_days)) if all_days else float(volume.mean() * bars_per_day)
 
@@ -340,18 +296,12 @@ def liquidity_ok(df, min_cr=LIQUIDITY_MIN_CR, mode="Swing"):
         else:
             delta_min = 1440
 
-        if delta_min <= 5:
-            bars_per_day = 75
-        elif delta_min <= 15:
-            bars_per_day = 25
-        elif delta_min <= 30:
-            bars_per_day = 13
-        elif delta_min < 240:
-            bars_per_day = 7
-        else:
-            bars_per_day = 1
+        if delta_min <= 5:       bars_per_day = 75
+        elif delta_min <= 15:    bars_per_day = 25
+        elif delta_min <= 30:    bars_per_day = 13
+        elif delta_min < 240:    bars_per_day = 7
+        else:                    bars_per_day = 1
 
-        # FIX-4: use time-normalised volume for intraday liquidity check
         if mode == "Intraday" and bars_per_day > 1:
             avg_daily_vol = _intraday_vol_avg(df["Volume"], bars_per_day)
             avg_cr        = float(avg_daily_vol * float(df["Close"].iloc[-1])) / 1e7
@@ -382,37 +332,21 @@ def _fetch_htf_cached(ticker: str, period: str, interval: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 def _htf_trend_from_df(df: pd.DataFrame, mode: str):
-
-    """
-    FIX-1: Use only CLOSED HTF candles.
-    Prevents repainting from partially formed HTF bars.
-    """
-
     if df is None or df.empty:
         return True, "HTF-UNKNOWN"
-
-    # Remove live/incomplete HTF candle
     if mode == "Intraday" and len(df) > 2:
         df = df.iloc[:-1].copy()
-
     min_bars = 55 if mode == "Intraday" else 26
-
     if len(df) < min_bars:
         return True, "HTF-UNKNOWN"
-
     cl = df["Close"]
-
     ef = float(ema(cl, 21 if mode == "Intraday" else 13).iloc[-1])
     es = float(ema(cl, 55 if mode == "Intraday" else 26).iloc[-1])
-
     c = float(cl.iloc[-1])
-
     up = c > ef > es
-
     return up, ("HTF↑" if up else "HTF↓")
 
 def prefetch_htf_parallel(symbols: list, mode: str, status_text, progress_bar) -> dict:
-    import concurrent.futures
     cfg     = MODE_CFG[mode]
     results = {}
     total   = len(symbols)
@@ -525,13 +459,6 @@ def get_phase_arrow(sym: str) -> str:
 
 def position_size(account_size, entry, sl, atr_val, atr_mean, vix_val,
                   risk_pct=0.02, max_capital_pct=0.20):
-    """
-    FIX-5: Added max_capital_pct (default 20 %).
-    final_qty is now clamped so that:
-        final_qty × entry  ≤  account_size × max_capital_pct
-    This prevents the sizer from allocating a runaway position when the
-    stop is very tight relative to account size.
-    """
     risk_per_share = max(entry - sl, 0.01)
     base_qty       = int((account_size * risk_pct) / risk_per_share)
 
@@ -546,8 +473,6 @@ def position_size(account_size, entry, sl, atr_val, atr_mean, vix_val,
         atr_adj = 1.0
 
     vol_adj_qty = max(1, int(base_qty * vix_adj * atr_adj))
-
-    # FIX-5: capital cap — never allocate more than max_capital_pct of account
     max_qty_by_capital = max(1, int((account_size * max_capital_pct) / entry))
     final_qty          = min(vol_adj_qty, max_qty_by_capital)
 
@@ -558,7 +483,7 @@ def position_size(account_size, entry, sl, atr_val, atr_mean, vix_val,
         "base_qty":          base_qty,
         "vix_adj":           round(vix_adj, 2),
         "atr_adj":           round(atr_adj, 2),
-        "vol_adj_qty":       vol_adj_qty,           # pre-cap qty (diagnostic)
+        "vol_adj_qty":       vol_adj_qty,
         "final_qty":         final_qty,
         "capital_used":      capital_used,
         "max_loss":          max_loss,
@@ -742,14 +667,11 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
     brk_lb         = 5
     rolling_hi_brk = float(high.iloc[-brk_lb-1:-1].max()) if n > brk_lb + 1 else float(high.iloc[-1])
 
-    # FIX-3: tighter buffer (0.15 × ATR) + hard volume gate + anti-blowoff guard
-    buf = atr_val * 0.15    # tighter than v10's 0.20
+    buf = atr_val * 0.15
 
     is_compressed = atr_val < atr_mean * 0.8
     is_expanding  = atr_val > float(atr_s.iloc[-2])
 
-    # FIX-3: reject breakouts when the prior 3-bar range is already expanded
-    #         (avoids entering a blow-off move disguised as a breakout)
     prior_3bar_atr_expanded = atr_val > atr_mean * 1.4
 
     body = (abs(float(close.iloc[-1]) - float(df["Open"].iloc[-1]))
@@ -758,7 +680,6 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
                   if "Open" in df.columns else 0)
     is_exhaustion = upper_wick > body * 1.5
 
-    # FIX-3: hard volume gate — breakout candle MUST have vol > 1.5× avg
     brk_vol_ok    = (v > vol_avg * 1.5) if vol_avg > 0 else False
 
     vol_spike     = v > vol_avg * 1.3
@@ -777,13 +698,11 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
     }
     brk_confidence = sum(w for w, cond in brk_weights.values() if cond)
 
-    # FIX-3: add hard gates — exhaustion, volume, and prior-range expansion all
-    #         veto the breakout regardless of the weighted score
     is_breakout = (
         brk_confidence >= BRK_CONF_MIN
         and not is_exhaustion
-        and brk_vol_ok                      # FIX-3 hard vol gate
-        and not prior_3bar_atr_expanded     # FIX-3 anti-blowoff
+        and brk_vol_ok
+        and not prior_3bar_atr_expanded
         and htf_up
     )
 
@@ -875,6 +794,26 @@ def _compute_targets(entry, sl, atr_val, fib, setup_type, sw_hi, sw_lo,
 # FETCH HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _validate_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """Validate and clean OHLCV data — drop bad rows, ensure required columns exist."""
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    for col in required:
+        if col not in df.columns:
+            return pd.DataFrame()
+    df = df.copy()
+    for col in ["Open", "High", "Low", "Close"]:
+        df = df[df[col].notna() & (df[col] > 0)]
+    df = df[df["Volume"].notna() & (df["Volume"] > 0)]
+    df = df[~df.index.duplicated(keep="last")]
+    df = df.sort_index()
+    df = df[(df["High"] >= df["Low"]) & (df["High"] >= df["Close"]) & (df["Low"] <= df["Close"])]
+    if len(df) > 20:
+        avg_vol = float(df["Volume"].iloc[-20:].mean())
+        if avg_vol > 0 and float(df["Volume"].iloc[-1]) < avg_vol * 0.05:
+            df = df.iloc[:-1]
+    return df
+
+
 def _fetch_one(args):
     sym, mode, min_bars = args
     cfg    = MODE_CFG[mode]
@@ -907,6 +846,24 @@ def _fetch_one_with_daily(args):
         _, daily_df = _fetch_one((sym, "Swing", 50))
     return primary_sym, primary_df, daily_df
 
+def fetch_stock_data(sym: str, mode: str) -> pd.DataFrame:
+    """Fetch + validate a single stock's OHLCV. Used by the exit scanner."""
+    cfg    = MODE_CFG[mode]
+    ticker = to_nse(sym)
+    for attempt in range(3):
+        try:
+            df = yf.download(ticker, period=cfg["period"], interval=cfg["interval"],
+                             auto_adjust=True, progress=False, threads=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.dropna(subset=["Close"])
+            df = _validate_ohlcv(df)
+            if len(df) >= 30:
+                return df
+        except Exception:
+            time.sleep(min(0.5 * (attempt + 1), 1.0))
+    return pd.DataFrame()
+
 @st.cache_data(ttl=300)
 def fetch_nifty(mode="Swing"):
     cfg = MODE_CFG[mode]
@@ -932,20 +889,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
                 market_bullish=True, vix_val=None, min_liquidity_cr=LIQUIDITY_MIN_CR,
                 sym=None, htf_up=True, rs_rank=50,
                 phase_history_snapshot=None):
-    """
-    FIX-4: vol_avg for Intraday mode now uses _intraday_vol_avg() so that
-           a partial session's volume is scaled to a full-day equivalent
-           before comparison.  This prevents spurious "volume spike" signals
-           at market open.
-
-    FIX-6: EMA cross scoring block is replaced with a fresh-cross bonus that
-           is orthogonal to trend_up (+25) and ema_stack (+15):
-               +8  golden-cross within last 5 bars  (fresh, bullish momentum)
-               +4  e_fast > e_slow but not a fresh cross
-               0   otherwise
-           The old "+15 if e_fast > e_slow" added redundant signal weight
-           that was already embedded in trend_up and ema_stack.
-    """
     try:
         cfg    = MODE_CFG[mode]
         close  = df["Close"]
@@ -970,7 +913,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         chg      = round(((c - prev) / prev) * 100, 2)
         hh       = float(close.iloc[-11:-1].max())
 
-        # ── FIX-4: time-normalised vol_avg for intraday ──────────────────────
         n_rows  = len(df)
         if n_rows >= 2:
             try:
@@ -1006,21 +948,18 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         trend_strong = c > e_fast and e_fast > e_slow
         ema_stack    = (e200 is not None) and (c > e200) and (e_fast > e_slow) and (e_fast > e200)
 
-        # ── FIX-6: fresh EMA cross detection (non-redundant) ─────────────────
-        # A "golden cross" is the first bar where e_fast crosses above e_slow.
-        # We look back up to 5 bars to see if such a cross occurred recently.
+        # FIX-6: fresh EMA cross detection
         fresh_cross = False
         if n >= 6 and e_fast > e_slow:
             lookback_cross = min(5, n - 1)
             for k in range(1, lookback_cross + 1):
                 ef_prev = float(e_fast_s.iloc[-(k+1)])
                 es_prev = float(e_slow_s.iloc[-(k+1)])
-                if ef_prev <= es_prev:   # was below or equal → this is the cross bar
+                if ef_prev <= es_prev:
                     fresh_cross = True
                     break
 
         ema_cross_bonus = 8 if fresh_cross else (4 if e_fast > e_slow else 0)
-        # (replaces the old "+15 if e_fast > e_slow" which double-counted trend_up)
 
         mom_src = (daily_close if (mode == "Intraday" and daily_close is not None
                                    and len(daily_close) >= 21) else close)
@@ -1058,11 +997,8 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         )
         r = float(rsi_series.iloc[-1])
 
-        # ── Bull score  (FIX-6: ema_cross_bonus replaces old +15 EMA block) ──
         bull  = 0
         bull += 25 if trend_up else 0
-        # FIX-6: was "+15 if e_fast > e_slow else (7 if near else 0)"
-        # Now replaced with non-redundant fresh-cross bonus:
         bull += ema_cross_bonus
         bull += (15 if r >= 65 else 10) if r >= 60 else (5 if r > 50 else 0)
         bull += 10 if v > vol_avg * 1.2 else (5 if v > vol_avg else 0)
@@ -1085,8 +1021,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
             bull = int(bull * BEARISH_HAIRCUT)
 
         raw_score = max(0, bull)
-        # FIX-6: BULL_MAX adjusted down by 7 to reflect removed double-count
-        # (old max was 120; ema cross block max contribution was +15, now max +8)
         BULL_MAX_V11 = 113
         norm_bull  = min(100.0, max(0.0, bull * 100.0 / BULL_MAX_V11))
         score_th   = float(cfg["score_th"])
@@ -1107,7 +1041,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         phase, _ = ext_phase_override(phase, ext_flags, ext_n, mode)
         act       = ext_action_cap(act, ext_n, vix_val)
 
-        # PERF-7: compute phase bonus from snapshot (no session_state in thread)
         phase_bonus = 0
         if sym and phase_history_snapshot:
             history = phase_history_snapshot.get(sym, [])
@@ -1183,12 +1116,11 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
             "HTFUp":         htf_up,
             "EMAStack":      ema_stack,
             "VolConf":       vol_confirmed,
-            "FreshCross":    fresh_cross,       # diagnostic
+            "FreshCross":    fresh_cross,
             "ATR":           round(atr_val, 2),
             "ATR_Mean":      round(atr_mean, 2),
             "PhaseBonus":    phase_bonus,
-            "BreadthGated":  False,             # set by run_scan (FIX-2)
-            # Return detected phase so main thread can call record_phase_transition
+            "BreadthGated":  False,
             "_detected_phase": phase,
         }
     except Exception:
@@ -1407,8 +1339,6 @@ def fetch_indices(mode="Swing"):
 
 def run_scan(symbols, mode, progress_bar, status_text,
              vix_val=None, min_liq_cr=LIQUIDITY_MIN_CR):
-    import concurrent.futures
-
     cfg      = MODE_CFG[mode]
     n_data = len(symbols)
     rejected = 0
@@ -1424,7 +1354,6 @@ def run_scan(symbols, mode, progress_bar, status_text,
             "Scores haircut 15%. Targets compressed."
         )
 
-    # ── Pass 1: Merged OHLCV + daily context (PERF-2, PERF-3) ──────────────
     status_text.text("Pass 1/3: Fetching OHLCV + daily context (parallel)…")
     data         = {}
     daily_closes = {}
@@ -1445,20 +1374,16 @@ def run_scan(symbols, mode, progress_bar, status_text,
             else:
                 rejected += 1
 
-    # ── Pass 2: HTF ──────────────────────────────────────────────────────────
     status_text.text("Pass 2/3: Pre-fetching HTF data (parallel)…")
     progress_bar.progress(0.40)
     htf_map = prefetch_htf_parallel(list(data.keys()), mode, status_text, progress_bar)
 
-    # ── Pass 2b: Vectorized RS ranks (PERF-4) ────────────────────────────────
     status_text.text("Pass 2b/3: Computing RS ranks (vectorized)…")
     sym_52w_returns = {sym: _52w_return(df["Close"]) for sym, df in data.items()}
     rs_rank_map     = compute_rs_ranks(sym_52w_returns)
 
-    # ── PERF-7: Snapshot phase history ───────────────────────────────────────
     phase_history_snapshot = dict(st.session_state.get("phase_history", {}))
 
-    # ── Pass 3: Parallel scoring (PERF-1) ────────────────────────────────────
     status_text.text("Pass 3/3: Scoring stocks (parallel)…")
     results     = []
     liq_skipped = 0
@@ -1497,18 +1422,12 @@ def run_scan(symbols, mode, progress_bar, status_text,
                     liq_skipped += 1
                 results.append(res)
 
-    # ── PERF-7: Apply phase transitions in main thread ────────────────────────
     for res in results:
         sym   = res["Symbol"]
         phase = res["_detected_phase"]
         record_phase_transition(sym, phase)
         res["PhaseBonus"] = phase_transition_conf_bonus(sym)
 
-    # ── FIX-2: Breadth-based gating ──────────────────────────────────────────
-    # Compute a fast breadth pulse from the freshly scored results.
-    # When the market is internally weak (pct_above_ema50 < 40 AND ad_ratio < 0.8),
-    # cap BRK/CONT actions to WATCH and flag the result so the UI can show
-    # a breadth-gate badge.  No scoring math is changed; this is a post-hoc cap.
     breadth_pulse = compute_breadth(results)
     pct_ema50_now = breadth_pulse.get("pct_above_ema50", 100)
     ad_ratio_now  = breadth_pulse.get("ad_ratio", 2.0)
@@ -1532,6 +1451,278 @@ def run_scan(symbols, mode, progress_bar, status_text,
     progress_bar.progress(1.0)
     results.sort(key=lambda x: x["Score"], reverse=True)
     return results, rejected, liq_skipped
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXIT LAYER — TRAILING STOP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_trailing_stop(df, entry_price: float, mode: str, vix_val) -> float:
+    """
+    VIX-adjusted, profit-tightening ATR trailing stop.
+    As the position gains, the multiplier tightens by 10% per 5% gain.
+    """
+    cfg       = MODE_CFG[mode]
+    base_mult = cfg.get("atr_mult", 2.5)
+    atr_val   = float(atr_series(df).iloc[-1])
+    vix_adj   = 1.0
+    if vix_val is not None:
+        if vix_val >= VIX_STRESS:    vix_adj = 1.35
+        elif vix_val >= VIX_CAUTION: vix_adj = 1.20
+    price          = float(df["Close"].iloc[-1])
+    pnl_pct        = (price - entry_price) / entry_price * 100 if entry_price else 0
+    profit_tighten = max(0.0, pnl_pct / 5.0) * 0.10
+    adj_mult       = max(base_mult * 0.50, (base_mult * vix_adj) - profit_tighten)
+    swing_low      = float(df["Low"].rolling(20).min().iloc[-1])
+    return round(max(swing_low, price - adj_mult * atr_val), 2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXIT LAYER — RESULT DATACLASS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ExitResult:
+    sym:             str
+    exit_phase:      str   = EXIT_HOLD
+    exit_score:      float = 0.0
+    hard_triggers:   list  = field(default_factory=list)
+    soft_triggers:   list  = field(default_factory=list)
+    price:           float = 0.0
+    entry_price:     float = 0.0
+    pnl_pct:         float = 0.0
+    trailing_stop:   float = 0.0
+    partial_exit_pct: int  = 0
+    urgency_note:    str   = ""
+    rs_rank:         int   = 50
+    htf_up:          bool  = True
+    scanned_at:      str   = ""
+    error:           Optional[str] = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXIT LAYER — SIGNAL SCORER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def score_exit(df, sym: str, entry_price: float, mode: str,
+               vix_val, htf_up: bool, rs_rank: int,
+               phase_history=None) -> ExitResult:
+    result = ExitResult(sym=sym, entry_price=entry_price, rs_rank=rs_rank,
+                        htf_up=htf_up, scanned_at=datetime.now().isoformat())
+
+    if df is None or len(df) < 30:
+        result.error = "Insufficient data"
+        return result
+
+    cfg        = MODE_CFG[mode]
+    cl         = df["Close"]
+    hi         = df["High"]
+    lo         = df["Low"]
+    vol        = df["Volume"]
+    price      = float(cl.iloc[-1])
+    atr_val    = float(atr_series(df).iloc[-1])
+    atr_mean   = float(atr_series(df).rolling(20).mean().iloc[-1])
+    e_fast     = ema(cl, cfg["ema_fast"])
+    e_slow     = ema(cl, cfg["ema_slow"])
+    rsi_s      = rsi(cl, cfg["rsi_len"])
+
+    result.price         = round(price, 2)
+    result.pnl_pct       = round((price - entry_price) / entry_price * 100, 2) if entry_price else 0
+    result.trailing_stop = compute_trailing_stop(df, entry_price, mode, vix_val)
+
+    hard_triggers = []
+    soft_triggers = []
+    exit_score    = 0.0
+
+    # ── Hard triggers (25 pts each) ───────────────────────────────
+
+    # H1: Trailing stop breach
+    if price < result.trailing_stop:
+        hard_triggers.append("H1:TrailStop"); exit_score += EXIT_HARD_WEIGHT
+
+    # H2: EMA crossdown in last 3 bars
+    cross_bars = min(3, len(e_fast) - 1)
+    ema_cross_down = any(
+        float(e_fast.iloc[-(i+1)]) < float(e_slow.iloc[-(i+1)]) and
+        float(e_fast.iloc[-(i+2)]) >= float(e_slow.iloc[-(i+2)])
+        for i in range(cross_bars) if len(e_fast) > i + 2
+    )
+    if ema_cross_down:
+        hard_triggers.append("H2:EMAxDown"); exit_score += EXIT_HARD_WEIGHT
+
+    # H3: HTF trend flip
+    if not htf_up:
+        hard_triggers.append("H3:HTFBearish"); exit_score += EXIT_HARD_WEIGHT
+
+    # H4: Volume climax on a red candle
+    if len(vol) >= 20:
+        vol_avg  = float(vol.rolling(20).mean().iloc[-1])
+        last_red = float(cl.iloc[-1]) < float(cl.iloc[-2])
+        if last_red and float(vol.iloc[-1]) > vol_avg * 3.0:
+            hard_triggers.append("H4:VolClimax"); exit_score += EXIT_HARD_WEIGHT
+
+    # ── Soft triggers (10 pts each) ───────────────────────────────
+
+    # S1: RSI overbought reversal
+    if len(rsi_s) >= 4:
+        rsi_now  = float(rsi_s.iloc[-1])
+        rsi_peak = float(rsi_s.iloc[-4:-1].max())
+        if rsi_peak > 70 and rsi_now < rsi_peak - 5:
+            soft_triggers.append("S1:RSIrev"); exit_score += EXIT_SOFT_WEIGHT
+
+    # S2: Bearish engulfing candle
+    if len(df) >= 3 and "Open" in df.columns:
+        o         = df["Open"]
+        prev_bull = float(cl.iloc[-2]) > float(o.iloc[-2])
+        prev_body = abs(float(cl.iloc[-2]) - float(o.iloc[-2]))
+        curr_bear = float(cl.iloc[-1]) < float(o.iloc[-1])
+        curr_body = abs(float(cl.iloc[-1]) - float(o.iloc[-1]))
+        if prev_bull and curr_bear and curr_body > prev_body * 1.2:
+            soft_triggers.append("S2:BearEngulf"); exit_score += EXIT_SOFT_WEIGHT
+
+    # S3: At Fibonacci extension target (1.27 or 1.61)
+    _, _, fibs, _ = fib_levels(df, lookback=min(60, len(df)))
+    for key in ("ext127", "ext161"):
+        fib_val = fibs.get(key)
+        if fib_val and abs(price - fib_val) / fib_val < 0.003:
+            soft_triggers.append(f"S3:Fib{key}"); exit_score += EXIT_SOFT_WEIGHT; break
+
+    # S4: Phase regression
+    if phase_history and len(phase_history) >= 2:
+        last_two = [h[1] for h in phase_history[-2:]]
+        ord_a    = PHASE_ORDER.get(last_two[0], 0)
+        ord_b    = PHASE_ORDER.get(last_two[1], 0)
+        if ord_b < ord_a and last_two[1] not in (PHASE_EXIT, PHASE_IDLE):
+            soft_triggers.append("S4:PhaseRegr"); exit_score += EXIT_SOFT_WEIGHT
+
+    # S5: 1-bar momentum decay
+    if len(cl) >= 4:
+        mom1 = float(cl.iloc[-1]) - float(cl.iloc[-2])
+        mom3 = float(cl.iloc[-1]) - float(cl.iloc[-4])
+        if mom1 < 0 < mom3:
+            soft_triggers.append("S5:MomDecay"); exit_score += EXIT_SOFT_WEIGHT
+
+    # S6: RS rank declining
+    if rs_rank < 40:
+        soft_triggers.append(f"S6:RS{rs_rank}"); exit_score += EXIT_SOFT_WEIGHT
+
+    # S7: Gap-up exhaustion (gapped up, closed below open)
+    if len(df) >= 2 and "Open" in df.columns:
+        prior_close = float(cl.iloc[-2])
+        open_today  = float(df["Open"].iloc[-1])
+        close_today = float(cl.iloc[-1])
+        if open_today > prior_close * 1.015 and close_today < open_today:
+            soft_triggers.append("S7:GapExhaust"); exit_score += EXIT_SOFT_WEIGHT
+
+    # VIX stress amplifier
+    if vix_val is not None and vix_val >= VIX_STRESS and exit_score > 0:
+        exit_score = min(100, exit_score * 1.2)
+
+    score  = round(min(exit_score, 100), 1)
+    n_hard = len(hard_triggers)
+
+    if n_hard >= 2 or score >= EXIT_SCORE_CONFIRMED:
+        phase = EXIT_CONFIRMED
+    elif n_hard >= 1 or score >= EXIT_SCORE_SIGNAL:
+        phase = EXIT_SIGNAL
+    elif len(soft_triggers) >= 1 or score >= EXIT_SCORE_WATCH:
+        phase = EXIT_WATCH
+    else:
+        phase = EXIT_HOLD
+
+    partial_pct = 0
+    if result.pnl_pct > 0:
+        if phase == EXIT_SIGNAL:                              partial_pct = 50
+        elif phase == EXIT_WATCH and result.pnl_pct > 5:     partial_pct = 25
+
+    notes = []
+    if phase == EXIT_CONFIRMED: notes.append("EXIT IMMEDIATELY — multiple hard triggers fired.")
+    elif phase == EXIT_SIGNAL:  notes.append("Prepare to exit. Consider partial sell.")
+    elif phase == EXIT_WATCH:   notes.append("Monitor closely. Tighten mental stop.")
+    else:                       notes.append("Position healthy — hold.")
+    if result.pnl_pct > 0:     notes.append(f"Open P&L: +{result.pnl_pct:.1f}%.")
+    elif result.pnl_pct < 0:   notes.append(f"Open P&L: {result.pnl_pct:.1f}% — review stop.")
+    if not htf_up:              notes.append("HTF bearish — reduce exposure.")
+
+    result.exit_phase       = phase
+    result.exit_score       = score
+    result.hard_triggers    = hard_triggers
+    result.soft_triggers    = soft_triggers
+    result.partial_exit_pct = partial_pct
+    result.urgency_note     = " ".join(notes)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXIT LAYER — PARALLEL SCAN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_exit_scan(positions: list, mode: str, vix_val, htf_cache: dict) -> list:
+    results = []
+    lock    = threading.Lock()
+    try:
+        phase_history_all = dict(st.session_state.get("phase_history", {}))
+    except Exception:
+        phase_history_all = {}
+
+    # Prefetch HTF for any positions not in cache
+    missing_htf = [p["sym"] for p in positions if p["sym"] not in htf_cache]
+    if missing_htf:
+        cfg = MODE_CFG[mode]
+        for sym in missing_htf:
+            ticker = to_nse(sym)
+            df_htf = _fetch_htf_cached(ticker, cfg["htf_period"], cfg["htf_interval"])
+            htf_cache[sym] = _htf_trend_from_df(df_htf, mode)
+
+    def _one(pos):
+        sym         = pos.get("sym", "")
+        entry_price = float(pos.get("entry_price", 0))
+        rs_rank     = int(pos.get("rs_rank", 50))
+        ph          = phase_history_all.get(sym, [])
+        df          = fetch_stock_data(sym, mode)
+        if df is None or df.empty:
+            return ExitResult(sym=sym, error="Fetch failed", entry_price=entry_price,
+                              scanned_at=datetime.now().isoformat())
+        htf_up, _ = htf_cache.get(sym, (True, "HTF-UNKNOWN"))
+        return score_exit(df, sym, entry_price, mode, vix_val, htf_up, rs_rank, ph)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, max(1, len(positions)))) as pool:
+        futures = {pool.submit(_one, pos): pos for pos in positions}
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                with lock:
+                    results.append(fut.result())
+            except Exception as e:
+                pos = futures[fut]
+                results.append(ExitResult(sym=pos.get("sym", "?"), error=str(e),
+                                          scanned_at=datetime.now().isoformat()))
+
+    results.sort(key=lambda r: r.exit_score, reverse=True)
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# POSITION MANAGER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def add_position(sym: str, entry_price: float, qty: int = 1, rs_rank: int = 50):
+    if "open_positions" not in st.session_state:
+        st.session_state["open_positions"] = []
+    existing = [p["sym"] for p in st.session_state["open_positions"]]
+    if sym not in existing:
+        st.session_state["open_positions"].append({
+            "sym":         sym,
+            "entry_price": entry_price,
+            "qty":         qty,
+            "rs_rank":     rs_rank,
+            "entry_date":  datetime.now().isoformat(),
+        })
+
+def remove_position(sym: str):
+    if "open_positions" in st.session_state:
+        st.session_state["open_positions"] = [
+            p for p in st.session_state["open_positions"] if p["sym"] != sym
+        ]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1568,10 +1759,12 @@ for key, default in [
     ("phase_history",   {}),
     ("account_size",    500000),
     ("risk_pct",        0.02),
-    ("max_capital_pct", 0.20),      # FIX-5: new setting
+    ("max_capital_pct", 0.20),
     ("phase_filter",    "All Phases"),
     ("show_illiquid",   False),
     ("min_liq_cr",      5.0),
+    ("open_positions",  []),
+    ("htf_cache",       {}),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -1589,7 +1782,7 @@ st.markdown(
     letter-spacing:-1px;color:#e8e8f4;padding:8px 0 4px;">
     BULL SUTRA <span style="color:#f59e0b;">''</span>
     <span style="font-size:13px;color:#6b7090;font-family:JetBrains Mono,monospace;
-    font-weight:400;">PRO · v11</span></div>''',
+    font-weight:400;">PRO · v11 + EXIT</span></div>''',
     unsafe_allow_html=True,
 )
 
@@ -1636,8 +1829,8 @@ st.markdown(
 )
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
-tab_scanner, tab_breadth, tab_detail, tab_analytics, tab_settings = st.tabs(
-    ["Scanner", "Breadth Engine", "Detail", "Analytics", "Settings"]
+tab_scanner, tab_breadth, tab_detail, tab_analytics, tab_exit, tab_settings = st.tabs(
+    ["Scanner", "Breadth Engine", "Detail", "Analytics", "🔴 Exit/Sell", "Settings"]
 )
 
 
@@ -1668,7 +1861,6 @@ with tab_settings:
         st.session_state.risk_pct = st.slider(
             "Risk per trade (%)", 0.5, 5.0,
             float(st.session_state.risk_pct * 100), 0.5) / 100.0
-        # FIX-5: capital cap slider
         st.session_state.max_capital_pct = st.slider(
             "Max capital per trade (% of account)  ← FIX-5", 5, 50,
             int(st.session_state.max_capital_pct * 100), 5) / 100.0
@@ -1695,6 +1887,26 @@ with tab_settings:
 | Swing | 72 h |
 | Positional | 240 h |
 """)
+        st.markdown("**Exit Trigger Legend**")
+        for label, desc in [
+            ("H1:TrailStop",   "Price below VIX-adj trailing stop"),
+            ("H2:EMAxDown",    "EMA fast crossed below slow"),
+            ("H3:HTFBearish",  "Higher-TF trend flipped bearish"),
+            ("H4:VolClimax",   "3× avg volume on a red candle"),
+            ("S1:RSIrev",      "RSI overbought reversal (peak→now gap)"),
+            ("S2:BearEngulf",  "Bearish engulfing candle"),
+            ("S3:FibExt",      "Price at fib extension 1.27 / 1.61"),
+            ("S4:PhaseRegr",   "Phase stepped backwards"),
+            ("S5:MomDecay",    "1-bar momentum turned negative"),
+            ("S6:RS<40",       "RS rank below 40th percentile"),
+            ("S7:GapExhaust",  "Gap-up but closed weak below open"),
+        ]:
+            prefix = "🔴" if label.startswith("H") else "🟡"
+            st.markdown(
+                f"{prefix} `{label}` — <span style='color:#6b7090;font-size:0.85em;'>{desc}</span>",
+                unsafe_allow_html=True
+            )
+
         st.markdown("**v11 Fixes**")
         st.markdown("""
 | Fix | What changed |
@@ -1730,6 +1942,16 @@ if scan_btn:
     st.session_state.scan_time   = (
         datetime.now().strftime("%H:%M:%S") + f" ({universe_opt} · {mode_opt})"
     )
+    # Update HTF cache for exit scanner use
+    try:
+        cfg_tmp = MODE_CFG[mode_opt]
+        for r in results:
+            sym = r["Symbol"]
+            if sym not in st.session_state.htf_cache:
+                st.session_state.htf_cache[sym] = (r.get("HTFUp", True), "HTF-CACHED")
+    except Exception:
+        pass
+
     ts         = datetime.now().isoformat()
     validity_h = MODE_CFG[mode_opt]["validity_hours"]
     for r in results:
@@ -1749,7 +1971,7 @@ if scan_btn:
                 "mode":           mode_opt,
                 "validity_hours": validity_h,
                 "outcome":        "Pending",
-                "breadth_gated":  r.get("BreadthGated", False),  # FIX-2 diagnostic
+                "breadth_gated":  r.get("BreadthGated", False),
             })
     prog.empty(); stat.empty()
     st.success(
@@ -1912,7 +2134,7 @@ with tab_scanner:
             ph_arrow   = get_phase_arrow(r["Symbol"])
             is_stale   = r["Symbol"] in stale_syms
             sector     = r.get("Sector", SECTOR_MAP.get(r["Symbol"], "—"))
-            breadth_gated = r.get("BreadthGated", False)   # FIX-2
+            breadth_gated = r.get("BreadthGated", False)
 
             vol_conf    = r.get("VolConf", False)
             vol_label   = "High" if vol_conf else "Above Avg" if r.get("ATR", 0) > 0 else "Normal"
@@ -1940,7 +2162,6 @@ with tab_scanner:
                         f'⚠ {lbl}</div>'
                     )
 
-            # FIX-2: breadth gate badge
             breadth_badge = (
                 '<span style="background:#1e2a40;border:1px solid #3b5998;color:#93b4ff;'
                 'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:4px;">B-GATE</span>'
@@ -1971,6 +2192,10 @@ with tab_scanner:
                 f'<span style="color:#6b7090;font-size:9px;display:block;">{conf_lbl}</span>'
                 f'<span style="color:{conf_col};font-weight:700;">{conf}%</span></span>'
             )
+
+            # "Log Entry" quick button — auto-adds to open positions
+            log_key = f"log_{r['Symbol']}_{i}"
+
             parts = [
                 f'<div style="background:#111120;border:1px solid {border_color};'
                 f'border-radius:12px;overflow:hidden;width:360px;min-width:320px;'
@@ -2026,22 +2251,32 @@ with tab_scanner:
                 f'<span style="color:#e8e8f4;font-size:12px;">{sector}</span></div>',
                 '</div>', '</div>',
             ]
-            return "".join(parts)
+            return "".join(parts), log_key
 
         if top_act:
             with st.expander(
                 f"READY TO TRADE — {len(top_act)} stocks in ENTRY / CONT / BREAKOUT",
                 expanded=True
             ):
-                cards_html = '<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
-                for i, r in enumerate(top_act):
-                    cards_html += make_card(i, r, "#22c55e55", show_entry=True)
-                cards_html += "</div>"
-                st.markdown(cards_html, unsafe_allow_html=True)
+                cols_per_row = 3
+                for row_start in range(0, len(top_act), cols_per_row):
+                    row_items = top_act[row_start:row_start + cols_per_row]
+                    cols = st.columns(len(row_items))
+                    for ci, (col, r) in enumerate(zip(cols, row_items)):
+                        with col:
+                            card_html, log_key = make_card(row_start + ci, r, "#22c55e55", show_entry=True)
+                            st.markdown(card_html, unsafe_allow_html=True)
+                            if r.get("Entry") and st.button(
+                                f"+ Log Entry", key=log_key, use_container_width=True
+                            ):
+                                add_position(r["Symbol"], r["Entry"],
+                                             rs_rank=r.get("RS_Rank", 50))
+                                st.toast(f"✅ {r['Symbol']} added to positions")
                 st.markdown(
                     '<div style="text-align:center;color:#3a3a60;font-size:10px;'
                     'font-family:JetBrains Mono,monospace;padding:4px 0 2px;">'
-                    'ⓘ Data is indicator based. Confirm with price action.</div>',
+                    'ⓘ Data is indicator based. Confirm with price action. '
+                    'Click "+ Log Entry" to track in Exit/Sell tab.</div>',
                     unsafe_allow_html=True,
                 )
         else:
@@ -2059,7 +2294,8 @@ with tab_scanner:
             ):
                 cards_html = '<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
                 for i, r in enumerate(watchlist):
-                    cards_html += make_card(i, r, "#f59e0b55", show_entry=False)
+                    card_html, _ = make_card(i, r, "#f59e0b55", show_entry=False)
+                    cards_html += card_html
                 cards_html += "</div>"
                 st.markdown(cards_html, unsafe_allow_html=True)
 
@@ -2081,7 +2317,7 @@ with tab_scanner:
                 "Phase":    f'{phase}{" "+ph_arrow if ph_arrow else ""}',
                 "Setup":    setup_icon,
                 "Action":   r["Action"],
-                "B-Gate":   "⚠" if r.get("BreadthGated") else "",   # FIX-2
+                "B-Gate":   "⚠" if r.get("BreadthGated") else "",
                 "%Chg":     f"+{chg}%" if chg >= 0 else f"{chg}%",
                 "RSI":      r.get("RSI", "—"),
                 "RS_Rank":  r.get("RS_Rank", 50),
@@ -2175,7 +2411,6 @@ with tab_breadth:
         bm5.metric("A/D Ratio",     breadth["ad_ratio"])
         bm6.metric("Liquid Stocks", breadth["liquid_count"])
 
-        # FIX-2: show how many signals are breadth-gated
         gated_n = sum(1 for r in all_results if r.get("BreadthGated"))
         if gated_n:
             st.warning(
@@ -2367,7 +2602,7 @@ with tab_detail:
                     atr_mean        = r.get("ATR_Mean", risk),
                     vix_val         = vix_val,
                     risk_pct        = _risk_pct,
-                    max_capital_pct = _max_cap_pct,      # FIX-5
+                    max_capital_pct = _max_cap_pct,
                 )
                 ps1, ps2, ps3, ps4 = st.columns(4)
                 ps1.metric("Suggested Qty",  ps["final_qty"])
@@ -2392,6 +2627,13 @@ with tab_detail:
                     f'</div>',
                     unsafe_allow_html=True,
                 )
+                # Quick log entry button in detail view
+                if r.get("Entry") and st.button(
+                    f"+ Log {sel} to Open Positions", key=f"detail_log_{sel}"
+                ):
+                    add_position(sel, r["Entry"], qty=ps["final_qty"],
+                                 rs_rank=r.get("RS_Rank", 50))
+                    st.success(f"✅ {sel} added — check Exit/Sell tab to monitor.")
 
             with st.expander(f"Confidence Model — {conf}% ({conf_lbl})", expanded=False):
                 factors = {
@@ -2560,3 +2802,225 @@ with tab_analytics:
             ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
             st.download_button("Download", csv,
                                f"NSE_SignalLog_{ts}.csv", "text/csv")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXIT / SELL TAB  — v11 dark-theme styling
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tab_exit:
+    st.markdown(
+        '<div style="font-family:Syne,sans-serif;font-size:20px;font-weight:700;'
+        'color:#cc4444;padding:4px 0 12px;">🔴 Exit / Sell Monitor</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Position Manager ───────────────────────────────────────────────────────
+    with st.expander(
+        f"➕ Manage Open Positions  ({len(st.session_state.open_positions)} tracked)",
+        expanded=len(st.session_state.open_positions) == 0
+    ):
+        pm1, pm2, pm3, pm4 = st.columns([2, 2, 1, 1])
+        sym_in   = pm1.text_input("Symbol",       key="pm_sym",   placeholder="RELIANCE")
+        price_in = pm2.number_input("Entry Price (₹)", min_value=0.01, value=100.0, key="pm_price")
+        qty_in   = pm3.number_input("Qty", min_value=1, value=1, key="pm_qty")
+        add_btn  = pm4.button("Add", key="pm_add", use_container_width=True, type="primary")
+
+        if add_btn and sym_in.strip():
+            add_position(sym_in.strip().upper(), float(price_in), int(qty_in))
+            st.success(f"✅ Added {sym_in.strip().upper()} @ ₹{price_in:,.2f}")
+            st.rerun()
+
+        positions = st.session_state.open_positions
+        if positions:
+            st.markdown(
+                '<div style="font-size:11px;color:#6b7090;margin-bottom:6px;'
+                'font-family:JetBrains Mono,monospace;">OPEN POSITIONS</div>',
+                unsafe_allow_html=True
+            )
+            for pos in positions:
+                pc1, pc2, pc3 = st.columns([4, 1, 1])
+                pc1.markdown(
+                    f'<span style="font-family:JetBrains Mono,monospace;color:#e8e8f4;">'
+                    f'`{pos["sym"]}`</span>  '
+                    f'<span style="color:#f59e0b;">₹{pos["entry_price"]:,.2f}</span>  '
+                    f'<span style="color:#6b7090;">×{pos.get("qty",1)}  '
+                    f'{pos.get("entry_date","")[:10]}</span>',
+                    unsafe_allow_html=True
+                )
+                if pc3.button("Remove", key=f"xrm_{pos['sym']}"):
+                    remove_position(pos["sym"])
+                    st.rerun()
+        else:
+            st.caption("No positions yet. Add above, or use **+ Log Entry** buttons on Scanner/Detail tabs.")
+
+    st.markdown('<div style="border-top:1px solid #1e1e40;margin:14px 0;"></div>', unsafe_allow_html=True)
+
+    positions = st.session_state.open_positions
+    if not positions:
+        st.info("No open positions tracked. Add via the panel above or use '+ Log Entry' from the Scanner tab.")
+    else:
+        # ── Run exit scan ──────────────────────────────────────────────────────
+        cur_mode  = st.session_state.get("scan_mode", mode_opt)
+        htf_cache = st.session_state.get("htf_cache", {})
+
+        with st.spinner(f"Scanning {len(positions)} position(s) for exit signals…"):
+            exit_results = run_exit_scan(positions, cur_mode, vix_val, htf_cache)
+
+        # ── Summary metrics ────────────────────────────────────────────────────
+        n_exit_now = sum(1 for r in exit_results if r.exit_phase == EXIT_CONFIRMED)
+        n_signal   = sum(1 for r in exit_results if r.exit_phase == EXIT_SIGNAL)
+        n_watch    = sum(1 for r in exit_results if r.exit_phase == EXIT_WATCH)
+        n_hold     = sum(1 for r in exit_results if r.exit_phase == EXIT_HOLD)
+        valid_pnl  = [r.pnl_pct for r in exit_results if r.error is None]
+        avg_pnl    = np.mean(valid_pnl) if valid_pnl else 0.0
+        pnl_col    = "#22c55e" if avg_pnl >= 0 else "#ef4444"
+
+        e1, e2, e3, e4, e5 = st.columns(5)
+        e1.metric("🔴 EXIT NOW",    n_exit_now)
+        e2.metric("🟠 EXIT SIGNAL", n_signal)
+        e3.metric("🟡 EXIT WATCH",  n_watch)
+        e4.metric("🟢 HOLD",        n_hold)
+        e5.metric("Avg P&L",        f"{avg_pnl:+.1f}%")
+
+        st.markdown('<div style="border-top:1px solid #1e1e40;margin:12px 0;"></div>', unsafe_allow_html=True)
+
+        # ── Filters ────────────────────────────────────────────────────────────
+        xf1, xf2 = st.columns([3, 1])
+        with xf1:
+            phase_filter_x = st.multiselect(
+                "Show exit phases",
+                [EXIT_CONFIRMED, EXIT_SIGNAL, EXIT_WATCH, EXIT_HOLD],
+                default=[EXIT_CONFIRMED, EXIT_SIGNAL, EXIT_WATCH, EXIT_HOLD],
+                key="exit_pf",
+            )
+        with xf2:
+            sort_x = st.selectbox("Sort by", ["Exit Score", "P&L % ↓", "P&L % ↑", "Symbol"], key="exit_sort")
+
+        filtered_x = [r for r in exit_results if r.exit_phase in phase_filter_x]
+        if sort_x == "P&L % ↓":   filtered_x.sort(key=lambda r: r.pnl_pct, reverse=True)
+        elif sort_x == "P&L % ↑": filtered_x.sort(key=lambda r: r.pnl_pct)
+        elif sort_x == "Symbol":   filtered_x.sort(key=lambda r: r.sym)
+
+        # ── Exit cards (v11 dark theme) ────────────────────────────────────────
+        def render_exit_card_v11(r: ExitResult) -> str:
+            color      = EXIT_COLORS.get(r.exit_phase, "#555577")
+            pnl_color  = "#22c55e" if r.pnl_pct >= 0 else "#ef4444"
+            pnl_str    = ('+' if r.pnl_pct >= 0 else '') + f'{r.pnl_pct:.1f}%'
+            score_pct  = int(min(r.exit_score, 100))
+            htf_str    = '<span style="color:#22c55e;">↑ HTF</span>' if r.htf_up else '<span style="color:#ef4444;">↓ HTF</span>'
+
+            hard_pills = ""
+            for t in r.hard_triggers:
+                hard_pills += (
+                    f'<span style="display:inline-block;background:#3b0a0a;'
+                    f'border:1px solid #ef444466;color:#fca5a5;padding:2px 8px;'
+                    f'border-radius:10px;font-size:10px;margin:2px;'
+                    f'font-family:JetBrains Mono,monospace;">{t}</span>'
+                )
+            soft_pills = ""
+            for t in r.soft_triggers:
+                soft_pills += (
+                    f'<span style="display:inline-block;background:#2a1e00;'
+                    f'border:1px solid #f59e0b66;color:#fbbf24;padding:2px 8px;'
+                    f'border-radius:10px;font-size:10px;margin:2px;'
+                    f'font-family:JetBrains Mono,monospace;">{t}</span>'
+                )
+            all_pills = hard_pills + soft_pills
+            if not all_pills:
+                all_pills = (
+                    '<span style="display:inline-block;background:#1e1e40;color:#6b7090;'
+                    'padding:2px 8px;border-radius:10px;font-size:10px;">'
+                    'No triggers — position healthy</span>'
+                )
+
+            partial_html = ""
+            if r.partial_exit_pct:
+                partial_html = (
+                    f'<div style="margin-top:6px;background:#2a1e00;border:1px solid #f59e0b66;'
+                    f'border-radius:5px;padding:5px 10px;font-size:11px;color:#fbbf24;'
+                    f'font-family:DM Sans,sans-serif;">⚡ Partial exit recommended: {r.partial_exit_pct}%</div>'
+                )
+
+            rs_col = "#22c55e" if r.rs_rank >= 80 else ("#d97706" if r.rs_rank >= 60 else "#6b7090")
+
+            return (
+                f'<div style="background:#111120;border:1px solid #1e1e40;'
+                f'border-left:4px solid {color};border-radius:12px;'
+                f'overflow:hidden;margin-bottom:14px;">'
+
+                # Header row
+                f'<div style="display:flex;align-items:center;padding:12px 16px 10px;'
+                f'border-bottom:1px solid #1e1e40;gap:10px;">'
+                f'<div style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:16px;'
+                f'font-weight:700;flex:1;">{r.sym}</div>'
+                f'<span style="background:{color}22;border:1px solid {color}44;color:{color};'
+                f'padding:4px 10px;border-radius:5px;font-size:11px;font-weight:700;'
+                f'font-family:DM Sans,sans-serif;">{r.exit_phase}</span>'
+                f'<span style="background:#1e1e40;color:#6b7090;font-family:JetBrains Mono,'
+                f'monospace;font-size:11px;padding:4px 8px;border-radius:5px;">'
+                f'{r.exit_score:.0f}/100</span>'
+                f'</div>'
+
+                # Metrics row
+                f'<div style="display:flex;gap:0;padding:12px 16px;'
+                f'border-bottom:1px solid #1e1e40;flex-wrap:wrap;">'
+                + "".join([
+                    f'<div style="flex:1;min-width:80px;padding-right:12px;">'
+                    f'<span style="color:#6b7090;font-size:9px;display:block;'
+                    f'text-transform:uppercase;letter-spacing:0.5px;">{label}</span>'
+                    f'<span style="color:{val_col};font-family:JetBrains Mono,monospace;'
+                    f'font-size:14px;font-weight:600;">{val}</span></div>'
+                    for label, val, val_col in [
+                        ("LTP",        fmt(r.price),         "#e8e8f4"),
+                        ("Entry",      fmt(r.entry_price),   "#e8e8f4"),
+                        ("P&L",        pnl_str,              pnl_color),
+                        ("Trail Stop", fmt(r.trailing_stop), "#f59e0b"),
+                        ("RS Rank",    str(r.rs_rank),       rs_col),
+                    ]
+                ])
+                + f'<div style="flex:1;min-width:60px;padding-right:12px;">'
+                f'<span style="color:#6b7090;font-size:9px;display:block;'
+                f'text-transform:uppercase;letter-spacing:0.5px;">HTF</span>'
+                f'{htf_str}</div>'
+                f'</div>'
+
+                # Score bar
+                f'<div style="padding:10px 16px 0;">'
+                f'<div style="background:#1e1e40;border-radius:3px;height:3px;margin-bottom:10px;">'
+                f'<div style="background:{color};width:{score_pct}%;height:3px;border-radius:3px;">'
+                f'</div></div>'
+
+                # Trigger pills
+                f'<div style="margin-bottom:8px;">{all_pills}</div>'
+
+                # Urgency note + partial exit
+                f'<div style="color:#6b7090;font-size:11px;font-style:italic;'
+                f'font-family:DM Sans,sans-serif;margin-bottom:6px;">{r.urgency_note}</div>'
+                + partial_html
+                + f'</div>'
+                f'</div>'
+            )
+
+        if filtered_x:
+            for r in filtered_x:
+                if r.error:
+                    st.warning(f"⚠ {r.sym}: {r.error}")
+                    continue
+                st.markdown(render_exit_card_v11(r), unsafe_allow_html=True)
+                col_a, col_b = st.columns([3, 1])
+                with col_b:
+                    if st.button(f"Mark Exited — {r.sym}", key=f"exit_rm_{r.sym}",
+                                 use_container_width=True):
+                        remove_position(r.sym)
+                        st.success(f"{r.sym} removed from open positions.")
+                        st.rerun()
+        else:
+            st.info("No positions match the selected exit phase filters.")
+
+        st.markdown(
+            f'<div style="font-size:10px;color:#3a3a60;font-family:JetBrains Mono,monospace;'
+            f'margin-top:8px;">Last updated: {datetime.now().strftime("%H:%M:%S")}  ·  '
+            f'{len(exit_results)} position(s)  ·  Mode: {cur_mode}</div>',
+            unsafe_allow_html=True,
+        )
