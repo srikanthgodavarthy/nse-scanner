@@ -1768,11 +1768,13 @@ def run_exit_scan(positions: list, mode: str, vix_val, htf_cache: dict) -> list:
 
 def add_position(sym: str, entry_price: float, qty: int = 1, rs_rank: int = 50):
     if "open_positions" not in st.session_state:
-      try:
-          st.session_state["open_positions"] = _load_positions()
-      except Exception as e:
-          st.session_state["open_positions"] = []
-          st.session_state["_db_error"] = f"Could not load positions: {e}"
+        try:
+            st.session_state["open_positions"] = _load_positions()
+        except Exception as e:
+            st.session_state["open_positions"] = []
+            st.session_state["_db_error"] = f"Could not load positions: {e}"
+    
+    existing = [p["sym"] for p in st.session_state["open_positions"]]
     if sym not in existing:
         st.session_state["open_positions"].append({
             "sym":         sym,
@@ -1781,7 +1783,9 @@ def add_position(sym: str, entry_price: float, qty: int = 1, rs_rank: int = 50):
             "rs_rank":     rs_rank,
             "entry_date":  datetime.now().isoformat(),
         })
-    _save_positions()   # persist immediately to Supabase
+        _save_positions()
+    else:
+        st.toast(f"⚠️ {sym} is already in open positions")
 
 def remove_position(sym: str):
     if "open_positions" in st.session_state:
