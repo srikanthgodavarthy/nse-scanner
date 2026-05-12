@@ -1273,12 +1273,16 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
             "HTFUp":         htf_up,
             "EMAStack":      ema_stack,
             "VolConf":       vol_confirmed,
-            "FreshCross":    fresh_cross,       # diagnostic
+            "FreshCross":    fresh_cross,
             "ATR":           round(atr_val, 2),
             "ATR_Mean":      round(atr_mean, 2),
             "PhaseBonus":    phase_bonus,
-            "BreadthGated":  False,             # set by run_scan (FIX-2)
-            # Return detected phase so main thread can call record_phase_transition
+            "BreadthGated":  False,
+            # v14: short scoring uses these — already computed, free to store
+            "Mom1":          round(mom1, 2),
+            "Mom3":          round(mom3, 2),
+            "TrendUp":       trend_up,
+            "TrendDown":     trend_down,
             "_detected_phase": phase,
         }
     except Exception:
@@ -1846,7 +1850,151 @@ def run_short_scan(symbols: list, mode: str,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# EXIT LAYER  (for portfolio positions)
+# SHORT SCORING FROM EXISTING SCAN RESULTS  (v14 — no re-download)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def score_short_from_result(r: dict, mode: str, vix_val: float = None) -> ShortResult:
+    """
+    Derive a ShortResult from an already-scored score_stock() dict.
+    Zero network calls — all inputs come from fields stored in v14's result dict.
+
+    Fields used:
+      Phase, TrendDown, TrendUp, EMAStack, HTFUp, RSI, RS_Rank,
+      ExtN, ExtFlags, Mom1, Mom3, ATR, LTP, Sector, Symbol, %Change, VolConf
+    """
+    sym    = r.get("Symbol", "")
+    result = ShortResult(symbol=sym, mode=mode, sector=r.get("Sector", SECTOR_MAP.get(sym, "—")))
+    cfg    = MODE_CFG[mode]
+
+    try:
+        close      = float(r.get("LTP", 0))
+        if close <= 0:
+            result.error = "no price"; return result
+
+        atr_v      = float(r.get("ATR", 0))
+        rsi_v      = float(r.get("RSI", 50))
+        rs_rank    = int(r.get("RS_Rank", 50))
+        ext_n      = int(r.get("ExtN", 0))
+        ext_flags  = r.get("ExtFlags", {})
+        htf_up     = bool(r.get("HTFUp", True))
+        htf_label  = "HTF↑" if htf_up else "HTF↓"
+        ema_stack  = bool(r.get("EMAStack", False))   # price>EF>ES>E200
+        trend_down = bool(r.get("TrendDown", False))  # price<EF<ES
+        trend_up   = bool(r.get("TrendUp",  False))
+        fresh_cross = bool(r.get("FreshCross", False))  # golden cross just happened
+        mom1       = float(r.get("Mom1", 0))
+        mom3       = float(r.get("Mom3", 0))
+        vol_conf   = bool(r.get("VolConf", False))
+        phase      = r.get("Phase", PHASE_IDLE)
+        chg        = float(r.get("%Change", 0))
+
+        result.current_price = close
+        result.atr           = atr_v
+        result.rsi_val       = round(rsi_v, 1)
+        result.rs_rank       = rs_rank
+        result.htf_trend     = htf_label
+        result.phase         = phase
+        result.ext_n         = ext_n
+
+        # volume_ratio: VolConf means vol > 1.2× avg
+        result.volume_ratio  = 1.3 if vol_conf else 0.9
+
+        score = 0; hard_t = []; soft_t = []
+
+        # ── HARD TRIGGERS ────────────────────────────────────────────────────
+
+        # H1 — Bearish EMA stack (price < EF < ES; stored as TrendDown)
+        if trend_down:
+            score += SHORT_HARD_WEIGHT; hard_t.append("Bearish EMA Stack")
+
+        # H2 — Death cross proxy: EMAStack just turned False AND FreshCross False
+        #       (i.e. no golden cross recently, and bearish alignment)
+        if not ema_stack and not htf_up and not fresh_cross and not trend_up:
+            score += SHORT_HARD_WEIGHT; hard_t.append("Bearish EMA Alignment (no golden cross)")
+
+        # H3 — HTF downtrend
+        if not htf_up:
+            score += SHORT_HARD_WEIGHT; hard_t.append(f"HTF Downtrend ({htf_label})")
+
+        # H4 — Phase EXIT = v11 confirmed the stock is in a downtrend structure
+        if phase == PHASE_EXIT:
+            score += SHORT_HARD_WEIGHT; hard_t.append("Phase EXIT (structural downtrend)")
+
+        # ── SOFT TRIGGERS ────────────────────────────────────────────────────
+
+        # S1 — RSI overbought rollover: ExtFlags rsi_overheat = RSI was very high
+        if ext_flags.get("rsi_overheat") or ext_flags.get("mom_exhaustion"):
+            score += SHORT_SOFT_WEIGHT; soft_t.append("RSI/Mom Exhaustion (ExtFlag)")
+
+        # S2 — RSI bearish zone
+        if rsi_v < 42 and not htf_up:
+            score += SHORT_SOFT_WEIGHT; soft_t.append(f"RSI Bearish Zone ({rsi_v:.0f})")
+
+        # S3 — Negative 1-month momentum
+        if mom1 < -cfg["mom1_th"]:
+            score += SHORT_SOFT_WEIGHT; soft_t.append(f"Neg 1M Mom ({mom1:.1f}%)")
+
+        # S4 — Negative 3-month momentum
+        if mom3 < -cfg["mom3_th"]:
+            score += SHORT_SOFT_WEIGHT; soft_t.append(f"Neg 3M Mom ({mom3:.1f}%)")
+
+        # S5 — High-vol red day: today down + vol confirmed
+        if chg < -0.5 and vol_conf:
+            score += SHORT_SOFT_WEIGHT; soft_t.append(f"High-Vol Red Day ({chg:+.1f}%)")
+
+        # S6 — Bearish divergence from ExtFlags
+        if ext_flags.get("bearish_div"):
+            score += SHORT_SOFT_WEIGHT; soft_t.append("Bearish Divergence (ExtFlag)")
+
+        # S7 — Relative weakness
+        if rs_rank < 30:
+            score += SHORT_SOFT_WEIGHT; soft_t.append(f"RS Rank Weak ({rs_rank})")
+
+        # Bonus: VIX stress + exhaustion count
+        if vix_val and vix_val >= VIX_STRESS: score += 5
+        if ext_n >= 2: score += min(ext_n * 4, 12)
+
+        result.short_score   = min(score, 100)
+        result.hard_triggers = hard_t
+        result.soft_triggers = soft_t
+
+        if score >= SHORT_SCORE_CONFIRMED:   result.verdict = SHORT_CONFIRMED
+        elif score >= SHORT_SCORE_SIGNAL:    result.verdict = SHORT_SIGNAL
+        elif score >= SHORT_SCORE_WATCH:     result.verdict = SHORT_WATCH
+        else:                                result.verdict = SHORT_SKIP
+
+        # Trade levels
+        if atr_v > 0:
+            atr_sl_mult      = cfg["atr_mult"] * (0.85 if vix_val and vix_val >= VIX_STRESS else 1.0)
+            result.entry_zone_lo = round(close, 2)
+            result.entry_zone_hi = round(close + atr_v * 0.4, 2)
+            result.stop_loss     = round(close + atr_v * atr_sl_mult, 2)
+            result.target1       = round(close - atr_v * cfg["atr_mult"] * 1.0, 2)
+            result.target2       = round(close - atr_v * cfg["atr_mult"] * 2.0, 2)
+            result.target3       = round(close - atr_v * cfg["atr_mult"] * 3.0, 2)
+            risk = result.stop_loss - close
+            result.risk_reward = round((close - result.target2) / risk, 2) if risk > 0 else 0.0
+
+    except Exception as e:
+        result.error = str(e)
+    return result
+
+
+def derive_short_candidates(scan_results: list, mode: str,
+                             vix_val: float = None) -> list:
+    """
+    Convert existing bull-scan results into ShortResults — no downloads.
+    Returns sorted list excluding SKIP and errors.
+    """
+    out = []
+    for r in scan_results:
+        if not r:
+            continue
+        sr = score_short_from_result(r, mode, vix_val)
+        if sr.verdict != SHORT_SKIP and not sr.error:
+            out.append(sr)
+    out.sort(key=lambda s: s.short_score, reverse=True)
+    return out
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -2062,8 +2210,8 @@ st.markdown(
 )
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
-tab_scanner, tab_breadth, tab_detail, tab_short, tab_portfolio, tab_analytics, tab_settings = st.tabs(
-    ["Scanner", "Breadth Engine", "Detail", "🔻 Short Scan", "💼 Portfolio", "Analytics", "Settings"]
+tab_scanner, tab_breadth, tab_detail, tab_portfolio, tab_analytics, tab_settings = st.tabs(
+    ["Scanner", "Breadth Engine", "Detail", "💼 Portfolio", "Analytics", "Settings"]
 )
 
 
@@ -2488,6 +2636,147 @@ with tab_scanner:
                     cards_html += make_card(i, r, "#f59e0b55", show_entry=False)
                 cards_html += "</div>"
                 st.markdown(cards_html, unsafe_allow_html=True)
+
+        # ── 🔻 SHORT LIST — derived from same scan, zero re-download ──────────
+        short_candidates = derive_short_candidates(
+            st.session_state.results, scan_mode_now, vix_val
+        )
+        if short_candidates:
+            sh_now   = sum(1 for s in short_candidates if s.verdict == SHORT_CONFIRMED)
+            sh_sig   = sum(1 for s in short_candidates if s.verdict == SHORT_SIGNAL)
+            sh_watch = sum(1 for s in short_candidates if s.verdict == SHORT_WATCH)
+            top_shorts = [s for s in short_candidates
+                          if s.verdict in (SHORT_CONFIRMED, SHORT_SIGNAL)][:12]
+
+            with st.expander(
+                f"🔻 SHORT LIST — {sh_now} SHORT NOW · {sh_sig} SIGNAL · {sh_watch} WATCH",
+                expanded=(sh_now > 0)
+            ):
+                if vix_val and vix_val >= VIX_STRESS:
+                    st.error(f"⚡ VIX {vix_val} STRESS — short probability elevated; use strict SL")
+                elif vix_val and vix_val >= VIX_CAUTION:
+                    st.warning(f"⚠️ VIX {vix_val} CAUTION — prefer SHORT NOW only")
+
+                if top_shorts:
+                    sh_cards = '<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
+                    for i, sr in enumerate(top_shorts):
+                        vc   = SHORT_COLORS.get(sr.verdict, "#555577")
+                        rr_c = "#22c55e" if sr.risk_reward >= 2 else ("#f59e0b" if sr.risk_reward >= 1.5 else "#ef4444")
+                        rsi_c = "#ef4444" if sr.rsi_val > 70 else ("#f59e0b" if sr.rsi_val > 60 else "#6b7090")
+                        bar  = min(sr.short_score, 100)
+                        hard_pills = "".join(
+                            f'<span style="background:#3d1a1a;border:1px solid #cc224466;color:#ff8888;'
+                            f'padding:2px 7px;border-radius:4px;font-size:9px;margin:1px;">🔴 {t}</span>'
+                            for t in sr.hard_triggers
+                        )
+                        soft_pills = "".join(
+                            f'<span style="background:#2d2b14;border:1px solid #f59e0b55;color:#fbbf24;'
+                            f'padding:2px 7px;border-radius:4px;font-size:9px;margin:1px;">⚡ {t}</span>'
+                            for t in sr.soft_triggers
+                        )
+                        ext_badge = (
+                            f'<span style="background:#7f1d1d22;border:1px solid #ef444455;color:#fca5a5;'
+                            f'padding:2px 7px;border-radius:4px;font-size:9px;margin:1px;">'
+                            f'EXT {sr.ext_n} — short fuel</span>'
+                        ) if sr.ext_n >= 2 else ""
+
+                        sh_cards += (
+                            f'<div style="background:#110d0d;border:1px solid {vc};border-radius:12px;'
+                            f'overflow:hidden;width:360px;min-width:320px;max-width:380px;flex:1 1 360px;">'
+                            # header
+                            f'<div style="display:flex;align-items:center;padding:12px 16px 10px;'
+                            f'border-bottom:1px solid #1e1e40;gap:10px;">'
+                            f'<div style="background:{vc}22;color:{vc};font-family:JetBrains Mono,monospace;'
+                            f'font-size:12px;font-weight:700;padding:4px 8px;border-radius:6px;'
+                            f'min-width:32px;text-align:center;">{i+1:02d}</div>'
+                            f'<div style="font-family:Syne,sans-serif;color:#f0e8e8;font-size:16px;'
+                            f'font-weight:700;flex:1;">{sr.symbol}</div>'
+                            f'<span style="background:{vc}22;border:1px solid {vc};color:{vc};'
+                            f'padding:4px 10px;border-radius:5px;font-size:11px;font-weight:700;">▼ {sr.verdict}</span>'
+                            f'<span style="background:#1e1e40;color:#6b7090;font-family:JetBrains Mono,'
+                            f'monospace;font-size:11px;padding:4px 8px;border-radius:5px;">{sr.short_score}</span>'
+                            f'</div>'
+                            # price + short zone
+                            f'<div style="display:flex;padding:12px 16px;gap:0;">'
+                            f'<div style="flex:0 0 45%;padding-right:16px;border-right:1px solid #1e1e40;">'
+                            f'<div style="font-family:JetBrains Mono,monospace;color:#f0e8e8;font-size:22px;'
+                            f'font-weight:600;line-height:1;">₹{sr.current_price:,.1f}</div>'
+                            f'<div style="color:#ff8888;font-size:11px;margin-top:3px;'
+                            f'font-family:JetBrains Mono,monospace;">Short zone</div>'
+                            f'<div style="color:#ff8888;font-size:12px;font-weight:600;'
+                            f'font-family:JetBrains Mono,monospace;">'
+                            f'₹{sr.entry_zone_lo:,.1f}–₹{sr.entry_zone_hi:,.1f}</div>'
+                            f'</div>'
+                            # right side metrics
+                            f'<div style="flex:1;padding-left:16px;">'
+                            f'<div style="display:flex;gap:6px;flex-wrap:wrap;">'
+                            f'<span style="background:#1e1e40;padding:5px 8px;border-radius:5px;">'
+                            f'<span style="color:#6b7090;font-size:9px;display:block;">SL ▲</span>'
+                            f'<span style="color:#ef4444;font-family:JetBrains Mono,monospace;font-size:11px;'
+                            f'font-weight:600;">₹{sr.stop_loss:,.1f}</span></span>'
+                            f'<span style="background:#1e1e40;padding:5px 8px;border-radius:5px;">'
+                            f'<span style="color:#6b7090;font-size:9px;display:block;">R:R</span>'
+                            f'<span style="color:{rr_c};font-weight:700;font-size:12px;">1:{sr.risk_reward:.1f}</span></span>'
+                            f'<span style="background:#1e1e40;padding:5px 8px;border-radius:5px;">'
+                            f'<span style="color:#6b7090;font-size:9px;display:block;">RSI</span>'
+                            f'<span style="color:{rsi_c};font-family:JetBrains Mono,monospace;font-size:11px;">'
+                            f'{sr.rsi_val:.0f}</span></span>'
+                            f'<span style="background:#1e1e40;padding:5px 8px;border-radius:5px;">'
+                            f'<span style="color:#6b7090;font-size:9px;display:block;">HTF</span>'
+                            f'<span style="color:#aaa;font-size:11px;">{sr.htf_trend}</span></span>'
+                            f'</div></div></div>'
+                            # targets
+                            f'<div style="padding:6px 16px 8px;background:#0a0808;display:flex;gap:16px;">'
+                            f'<div><span style="color:#6b7090;font-size:9px;">T1 ▼</span>'
+                            f'<div style="font-family:JetBrains Mono,monospace;color:#22aa88;font-size:11px;">'
+                            f'₹{sr.target1:,.1f}</div></div>'
+                            f'<div><span style="color:#6b7090;font-size:9px;">T2 ▼</span>'
+                            f'<div style="font-family:JetBrains Mono,monospace;color:#22aa88;font-size:12px;'
+                            f'font-weight:600;">₹{sr.target2:,.1f}</div></div>'
+                            f'<div><span style="color:#6b7090;font-size:9px;">T3 ▼</span>'
+                            f'<div style="font-family:JetBrains Mono,monospace;color:#22aa88;font-size:11px;">'
+                            f'₹{sr.target3:,.1f}</div></div>'
+                            f'<div style="margin-left:auto;text-align:right;">'
+                            f'<span style="color:#6b7090;font-size:9px;">RS · {sr.sector}</span>'
+                            f'<div style="color:#aaa;font-family:JetBrains Mono,monospace;font-size:11px;">'
+                            f'RS{sr.rs_rank}</div></div>'
+                            f'</div>'
+                            # score bar
+                            f'<div style="padding:0 16px 6px;">'
+                            f'<div style="background:#1e1e40;border-radius:2px;height:3px;">'
+                            f'<div style="background:{vc};width:{bar}%;height:3px;border-radius:2px;"></div>'
+                            f'</div></div>'
+                            # trigger pills
+                            f'<div style="padding:4px 16px 10px;">'
+                            f'{hard_pills}{soft_pills}{ext_badge}</div>'
+                            f'</div>'
+                        )
+                    sh_cards += "</div>"
+                    st.markdown(sh_cards, unsafe_allow_html=True)
+                    st.markdown(
+                        '<div style="text-align:center;color:#3a3a60;font-size:10px;'
+                        'font-family:JetBrains Mono,monospace;padding:4px 0;">'
+                        'ⓘ Short candidates derived from same scan data. Confirm with price action. '
+                        'Short selling involves unlimited risk — always use stop-loss.</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Watch-only table (collapsed)
+                sh_watch_list = [s for s in short_candidates if s.verdict == SHORT_WATCH]
+                if sh_watch_list:
+                    st.markdown(
+                        f'<div style="color:#6b7090;font-size:11px;font-family:DM Sans,sans-serif;'
+                        f'margin-top:10px;">Also on watch ({len(sh_watch_list)}):</div>',
+                        unsafe_allow_html=True,
+                    )
+                    tbl = [{"Symbol": s.symbol, "Score": s.short_score,
+                            "Current": fmt(s.current_price), "SL ▲": fmt(s.stop_loss),
+                            "T2 ▼": fmt(s.target2), "R:R": s.risk_reward,
+                            "RSI": s.rsi_val, "RS": s.rs_rank, "Phase": s.phase,
+                            "Hard#": len(s.hard_triggers), "Soft#": len(s.soft_triggers)}
+                           for s in sh_watch_list]
+                    st.dataframe(pd.DataFrame(tbl), use_container_width=True,
+                                 hide_index=True, height=200)
 
     # ── Main table ─────────────────────────────────────────────────────────────
     if results:
@@ -2986,241 +3275,6 @@ with tab_analytics:
             ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
             st.download_button("Download", csv,
                                f"NSE_SignalLog_{ts}.csv", "text/csv")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 🔻 SHORT SCAN TAB  (v14 new — top-level, v11 card style)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-with tab_short:
-    # ── Controls ──────────────────────────────────────────────────────────────
-    sc1, sc2, sc3, sc4 = st.columns([2, 2, 2, 1])
-    with sc1:
-        short_uni  = st.radio("Universe", ["NSE 500", "Nifty 50", "Custom"], horizontal=True, key="sh_uni")
-    with sc2:
-        short_mode = st.radio("Mode", ["Swing", "Intraday", "Positional"], horizontal=True, key="sh_mode")
-    with sc3:
-        sh_filter  = st.selectbox("Show", ["SHORT NOW + SIGNAL", "SHORT NOW only", "All (incl. WATCH)"],
-                                   label_visibility="collapsed", key="sh_filter")
-    with sc4:
-        sh_btn = st.button("🔻 SCAN", type="primary", use_container_width=True, key="sh_scan_btn")
-
-    if short_uni == "Custom":
-        custom_sh = st.text_input("Symbols (comma-separated)", key="sh_custom_inp")
-        short_symbols = [s.strip().upper() for s in custom_sh.split(",") if s.strip()]
-    elif short_uni == "Nifty 50":
-        short_symbols = NIFTY50
-    else:
-        short_symbols = NSE500
-
-    # ── VIX banner ────────────────────────────────────────────────────────────
-    vix_val_sh, vix_label_sh = fetch_vix()
-    vix_col_sh = {"CALM":"#22c55e","CAUTION":"#f59e0b","STRESS":"#ef4444","UNKNOWN":"#6b7090"}.get(vix_label_sh,"#6b7090")
-    st.markdown(
-        f'<div style="background:{vix_col_sh}11;border:1px solid {vix_col_sh}33;'
-        f'border-radius:7px;padding:6px 14px;margin:4px 0 10px;display:flex;align-items:center;gap:10px;'
-        f'font-family:JetBrains Mono,monospace;">'
-        f'<span style="background:{vix_col_sh};color:#07070f;padding:2px 8px;border-radius:4px;'
-        f'font-size:11px;font-weight:700;">VIX {vix_val_sh if vix_val_sh else "—"} · {vix_label_sh}</span>'
-        + (f'<span style="color:#ef4444;font-size:11px;">⚡ STRESS market — shorts favour but widen gaps, use tight SL</span>' if vix_val_sh and vix_val_sh >= VIX_STRESS else "")
-        + (f'<span style="color:#f59e0b;font-size:11px;">⚡ Elevated VIX — prefer SHORT NOW signals only</span>' if vix_val_sh and VIX_CAUTION <= vix_val_sh < VIX_STRESS else "")
-        + '</div>', unsafe_allow_html=True,
-    )
-
-    if sh_btn and short_symbols:
-        sh_prog = st.progress(0)
-        sh_stat = st.empty()
-        sh_stat.text("Pre-fetching HTF data…")
-        sh_htf  = prefetch_htf_parallel(short_symbols, short_mode, sh_stat, sh_prog)
-
-        sh_stat.text("Computing RS ranks…")
-        sh_raw = {}
-        def _sh_ret(sym):
-            try:
-                cfg = MODE_CFG[short_mode]
-                df  = yf.download(to_nse(sym), period=cfg["period"], interval=cfg["interval"],
-                                  auto_adjust=True, progress=False, threads=False)
-                if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-                return sym, _52w_return(df["Close"].dropna())
-            except Exception: return sym, 0.0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
-            for sym, ret in pool.map(_sh_ret, short_symbols): sh_raw[sym] = ret
-        sh_ranks = compute_rs_ranks(sh_raw)
-
-        sh_stat.text("Scoring short candidates…")
-        sh_res = run_short_scan(short_symbols, short_mode, sh_htf, sh_ranks,
-                                vix_val_sh, sh_stat, sh_prog)
-        st.session_state["short_results"] = sh_res
-        sh_prog.progress(1.0)
-        sh_stat.text(f"✅ {len(sh_res)} short candidates found.")
-
-    sh_results = st.session_state.get("short_results", [])
-
-    if not sh_results:
-        st.info("Select universe + mode, then press **🔻 SCAN** to find short candidates.")
-    else:
-        # Apply filter
-        if sh_filter == "SHORT NOW only":
-            sh_show = [r for r in sh_results if r.verdict == SHORT_CONFIRMED]
-        elif sh_filter == "SHORT NOW + SIGNAL":
-            sh_show = [r for r in sh_results if r.verdict in (SHORT_CONFIRMED, SHORT_SIGNAL)]
-        else:
-            sh_show = sh_results
-
-        # Summary strip
-        s_now  = sum(1 for r in sh_results if r.verdict == SHORT_CONFIRMED)
-        s_sig  = sum(1 for r in sh_results if r.verdict == SHORT_SIGNAL)
-        s_wtch = sum(1 for r in sh_results if r.verdict == SHORT_WATCH)
-        sm1, sm2, sm3, sm4 = st.columns(4)
-        sm1.metric("Scanned",      len(sh_results))
-        sm2.metric("🔴 Short Now", s_now)
-        sm3.metric("🟠 Signal",    s_sig)
-        sm4.metric("🟡 Watch",     s_wtch)
-        st.markdown('<div style="border-top:1px solid #1e1e40;margin:10px 0;"></div>', unsafe_allow_html=True)
-
-        # Ready-to-Short cards (v11 card style)
-        top_sh = [r for r in sh_show if r.verdict in (SHORT_CONFIRMED, SHORT_SIGNAL)][:15]
-        if top_sh:
-            with st.expander(f"READY TO SHORT — {len(top_sh)} confirmed/signal candidates", expanded=True):
-                cards_html = '<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
-                for i, sr in enumerate(top_sh):
-                    vc   = SHORT_COLORS.get(sr.verdict, "#555577")
-                    rr_c = "#22c55e" if sr.risk_reward >= 2 else ("#f59e0b" if sr.risk_reward >= 1.5 else "#ef4444")
-                    rsi_c = "#ef4444" if sr.rsi_val > 70 else ("#f59e0b" if sr.rsi_val > 60 else "#6b7090")
-                    bar  = min(sr.short_score, 100)
-                    hard_pills = "".join(
-                        f'<span style="background:#3d1a1a;border:1px solid #cc2244;color:#ff8888;'
-                        f'padding:2px 7px;border-radius:4px;font-size:9px;margin:1px;">🔴 {t}</span>'
-                        for t in sr.hard_triggers
-                    )
-                    soft_pills = "".join(
-                        f'<span style="background:#2d2b14;border:1px solid #f59e0b55;color:#fbbf24;'
-                        f'padding:2px 7px;border-radius:4px;font-size:9px;margin:1px;">⚡ {t}</span>'
-                        for t in sr.soft_triggers
-                    )
-                    ext_html = (
-                        f'<div style="margin-top:5px;"><span style="background:#7f1d1d22;border:1px solid #ef444455;'
-                        f'color:#fca5a5;padding:2px 7px;border-radius:4px;font-size:9px;">'
-                        f'EXT {sr.ext_n} — overextended (short fuel)</span></div>'
-                    ) if sr.ext_n >= 2 else ""
-                    cards_html += (
-                        f'<div style="background:#110d0d;border:1px solid {vc};border-radius:12px;'
-                        f'overflow:hidden;width:360px;min-width:320px;max-width:380px;flex:1 1 360px;">'
-                        # header
-                        f'<div style="display:flex;align-items:center;padding:12px 16px 10px;'
-                        f'border-bottom:1px solid #1e1e40;gap:10px;">'
-                        f'<div style="background:{vc}22;color:{vc};font-family:JetBrains Mono,monospace;'
-                        f'font-size:12px;font-weight:700;padding:4px 8px;border-radius:6px;min-width:32px;text-align:center;">{i+1:02d}</div>'
-                        f'<div style="font-family:Syne,sans-serif;color:#f0e8e8;font-size:16px;font-weight:700;flex:1;">'
-                        f'{sr.symbol}</div>'
-                        f'<span style="background:{vc}22;border:1px solid {vc};color:{vc};'
-                        f'padding:4px 10px;border-radius:5px;font-size:11px;font-weight:700;">▼ {sr.verdict}</span>'
-                        f'<span style="background:#1e1e40;color:#6b7090;font-family:JetBrains Mono,monospace;'
-                        f'font-size:11px;padding:4px 8px;border-radius:5px;">{sr.short_score}</span>'
-                        f'</div>'
-                        # prices
-                        f'<div style="display:flex;padding:12px 16px;gap:0;">'
-                        f'<div style="flex:0 0 45%;padding-right:16px;border-right:1px solid #1e1e40;">'
-                        f'<div style="font-family:JetBrains Mono,monospace;color:#f0e8e8;font-size:22px;font-weight:600;line-height:1;">₹{sr.current_price:,.1f}</div>'
-                        f'<div style="font-family:JetBrains Mono,monospace;color:#ff8888;font-size:12px;margin-top:3px;">Short zone</div>'
-                        f'<div style="font-family:JetBrains Mono,monospace;color:#ff8888;font-size:13px;font-weight:600;">₹{sr.entry_zone_lo:,.1f}–₹{sr.entry_zone_hi:,.1f}</div>'
-                        f'</div>'
-                        f'<div style="flex:1;padding-left:16px;">'
-                        f'<div style="display:flex;gap:6px;flex-wrap:wrap;">'
-                        f'<span style="background:#1e1e40;padding:5px 8px;border-radius:5px;font-size:10px;font-weight:600;font-family:DM Sans,sans-serif;">'
-                        f'<span style="color:#6b7090;font-size:9px;display:block;">SL ▲</span>'
-                        f'<span style="color:#ef4444;">₹{sr.stop_loss:,.1f}</span></span>'
-                        f'<span style="background:#1e1e40;padding:5px 8px;border-radius:5px;font-size:10px;font-family:DM Sans,sans-serif;">'
-                        f'<span style="color:#6b7090;font-size:9px;display:block;">R:R</span>'
-                        f'<span style="color:{rr_c};font-weight:700;">1:{sr.risk_reward:.1f}</span></span>'
-                        f'<span style="background:#1e1e40;padding:5px 8px;border-radius:5px;font-size:10px;font-family:DM Sans,sans-serif;">'
-                        f'<span style="color:#6b7090;font-size:9px;display:block;">HTF</span>'
-                        f'<span style="color:#aaa;">{sr.htf_trend}</span></span>'
-                        f'<span style="background:#1e1e40;padding:5px 8px;border-radius:5px;font-size:10px;font-family:DM Sans,sans-serif;">'
-                        f'<span style="color:#6b7090;font-size:9px;display:block;">RSI</span>'
-                        f'<span style="color:{rsi_c};">{sr.rsi_val:.0f}</span></span>'
-                        f'</div></div></div>'
-                        # targets row
-                        f'<div style="padding:6px 16px 8px;background:#0a0808;display:flex;gap:12px;">'
-                        f'<div><span style="color:#6b7090;font-size:9px;">T1 ▼</span>'
-                        f'<div style="font-family:JetBrains Mono,monospace;color:#22aa88;font-size:11px;">₹{sr.target1:,.1f}</div></div>'
-                        f'<div><span style="color:#6b7090;font-size:9px;">T2 ▼</span>'
-                        f'<div style="font-family:JetBrains Mono,monospace;color:#22aa88;font-size:12px;font-weight:600;">₹{sr.target2:,.1f}</div></div>'
-                        f'<div><span style="color:#6b7090;font-size:9px;">T3 ▼</span>'
-                        f'<div style="font-family:JetBrains Mono,monospace;color:#22aa88;font-size:11px;">₹{sr.target3:,.1f}</div></div>'
-                        f'<div style="margin-left:auto;text-align:right;">'
-                        f'<span style="color:#6b7090;font-size:9px;">RS Rank · Sector</span>'
-                        f'<div style="font-family:JetBrains Mono,monospace;color:#aaa;font-size:11px;">{sr.rs_rank} · {sr.sector}</div></div>'
-                        f'</div>'
-                        # score bar
-                        f'<div style="padding:0 16px 8px;">'
-                        f'<div style="background:#1e1e40;border-radius:2px;height:3px;">'
-                        f'<div style="background:{vc};width:{bar}%;height:3px;border-radius:2px;"></div></div></div>'
-                        # trigger pills
-                        f'<div style="padding:4px 16px 10px;">{hard_pills}{soft_pills}{ext_html}</div>'
-                        f'</div>'
-                    )
-                cards_html += "</div>"
-                st.markdown(cards_html, unsafe_allow_html=True)
-                st.markdown(
-                    '<div style="text-align:center;color:#3a3a60;font-size:10px;'
-                    'font-family:JetBrains Mono,monospace;padding:4px 0;">ⓘ Short sell involves unlimited risk. Always use stop-loss.</div>',
-                    unsafe_allow_html=True,
-                )
-
-        # Watch cards (collapsed)
-        sh_watch = [r for r in sh_show if r.verdict == SHORT_WATCH]
-        if sh_watch:
-            with st.expander(f"SHORT WATCH — {len(sh_watch)} building bearish setups", expanded=False):
-                wh_html = '<div style="display:flex;flex-wrap:wrap;gap:10px;">'
-                for sr in sh_watch[:10]:
-                    wh_html += (
-                        f'<div style="background:#110d0d;border:1px solid #f59e0b44;border-radius:8px;'
-                        f'padding:10px 14px;min-width:240px;flex:1 1 240px;">'
-                        f'<div style="display:flex;justify-content:space-between;align-items:center;">'
-                        f'<span style="font-family:Syne,sans-serif;color:#f0e8e8;font-size:14px;font-weight:700;">{sr.symbol}</span>'
-                        f'<span style="background:#f59e0b22;border:1px solid #f59e0b44;color:#f59e0b;'
-                        f'padding:2px 8px;border-radius:4px;font-size:10px;">WATCH · {sr.short_score}</span></div>'
-                        f'<div style="font-family:JetBrains Mono,monospace;color:#aaa;font-size:11px;margin-top:4px;">'
-                        f'₹{sr.current_price:,.1f} · SL ₹{sr.stop_loss:,.1f} · T2 ₹{sr.target2:,.1f}</div>'
-                        f'<div style="color:#6b7090;font-size:9px;margin-top:3px;">{sr.sector} · RS{sr.rs_rank} · {sr.htf_trend}</div>'
-                        f'</div>'
-                    )
-                wh_html += "</div>"
-                st.markdown(wh_html, unsafe_allow_html=True)
-
-        # Full table
-        if sh_show:
-            st.markdown('<div style="border-top:1px solid #1e1e40;margin:12px 0;"></div>', unsafe_allow_html=True)
-            tbl_rows = [{"#": i+1, "Symbol": r.symbol, "Score": r.short_score,
-                         "Verdict": r.verdict, "Phase": r.phase,
-                         "Current": fmt(r.current_price), "Short Zone": f"₹{r.entry_zone_lo:,.2f}–₹{r.entry_zone_hi:,.2f}",
-                         "SL ▲": fmt(r.stop_loss), "T1": fmt(r.target1), "T2": fmt(r.target2),
-                         "R:R": r.risk_reward, "RSI": r.rsi_val, "RS": r.rs_rank,
-                         "HTF": r.htf_trend, "Ext": r.ext_n,
-                         "Hard#": len(r.hard_triggers), "Soft#": len(r.soft_triggers)}
-                        for i, r in enumerate(sh_show)]
-            st.dataframe(pd.DataFrame(tbl_rows), use_container_width=True, hide_index=True)
-
-        # Saved watchlist
-        saved_wl = st.session_state.get("short_watchlist", []) or []
-        if saved_wl:
-            st.markdown("---")
-            st.markdown("#### 📌 Saved Short Watchlist")
-            for sw in saved_wl:
-                vc = SHORT_COLORS.get(sw.get("verdict", SHORT_WATCH), "#888")
-                c1, c2, c3 = st.columns([3, 4, 1])
-                c1.markdown(
-                    f'<span style="color:{vc};font-weight:700;font-family:JetBrains Mono,monospace;">{sw["symbol"]}</span>'
-                    f' <span style="color:#6b7090;font-size:0.75rem;">· {sw.get("verdict","")} · score {sw.get("short_score","")}</span>',
-                    unsafe_allow_html=True)
-                c2.caption(f'Short ≤₹{sw.get("entry_hi",0):,.2f} · SL ₹{sw.get("stop_loss",0):,.2f} · T2 ₹{sw.get("target2",0):,.2f} · {sw.get("mode","Swing")}')
-                with c3:
-                    if st.button("🗑", key=f"del_sw_{sw['symbol']}"):
-                        st.session_state["short_watchlist"] = [
-                            w for w in st.session_state["short_watchlist"] if w["symbol"] != sw["symbol"]]
-                        _db_save("bs_short_wl", st.session_state["short_watchlist"])
-                        st.rerun()
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 💼 PORTFOLIO TAB  (open positions with exit signals)
