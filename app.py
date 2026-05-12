@@ -1,4 +1,4 @@
-"""BULL SUTRA Pro — v11 + EXIT LAYER
+"""BULL SUTRA Pro — v12 + EXIT LAYER + SUPABASE PERSISTENCE
 ═══════════════════════════════════════════════════════════════════
 BASE: v11 solid — all FIX-1 … FIX-6 preserved, same UI/scoring.
 NEW:  Exit Layer fully integrated.
@@ -8,6 +8,9 @@ NEW:  Exit Layer fully integrated.
   • Position manager         — add/remove from session state
   • Tab 6: 🔴 Exit/Sell      — v11 dark-theme cards, exit score bar,
                                trigger pills, partial-exit guidance
+PERSISTENCE:
+  • Positions saved to Supabase Postgres (survives Streamlit Cloud restarts)
+  • Set SUPABASE_URL in Streamlit Cloud Secrets
 ═══════════════════════════════════════════════════════════════════
 """
 
@@ -17,12 +20,14 @@ import time
 import os
 import threading
 import concurrent.futures
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional
 
 import numpy as np
 import pandas as pd
+import psycopg2
 import yfinance as yf
 import streamlit as st
 
@@ -141,6 +146,65 @@ EXIT_SOFT_WEIGHT     = 10
 
 # ── Thread safety ──────────────────────────────────────────────────────────────
 _phase_lock = threading.Lock()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SUPABASE PERSISTENCE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _get_conn():
+    """Open a fresh Supabase Postgres connection using the secret URL."""
+    return psycopg2.connect(st.secrets["SUPABASE_URL"])
+
+def _ensure_table(cur):
+    """Create the positions table if it doesn't exist yet."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS positions (
+            id         SERIAL PRIMARY KEY,
+            data       JSONB NOT NULL,
+            updated_at TIMESTAMP DEFAULT now()
+        )
+    """)
+
+def _save_positions():
+    """
+    Persist st.session_state['open_positions'] to Supabase.
+    Uses a single-row pattern: DELETE all → INSERT fresh snapshot.
+    """
+    try:
+        conn = _get_conn()
+        cur  = conn.cursor()
+        _ensure_table(cur)
+        cur.execute("DELETE FROM positions")
+        cur.execute(
+            "INSERT INTO positions (data) VALUES (%s)",
+            [json.dumps(st.session_state.get("open_positions", []))]
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        st.warning(f"⚠ Could not save positions to Supabase: {e}")
+
+def _load_positions() -> list:
+    """
+    Load positions from Supabase on app startup.
+    Returns empty list if table is missing or any error occurs.
+    """
+    try:
+        conn = _get_conn()
+        cur  = conn.cursor()
+        _ensure_table(cur)
+        conn.commit()
+        cur.execute(
+            "SELECT data FROM positions ORDER BY updated_at DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return row[0] if row else []
+    except Exception:
+        return []
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -795,7 +859,6 @@ def _compute_targets(entry, sl, atr_val, fib, setup_type, sw_hi, sw_lo,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _validate_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    """Validate and clean OHLCV data — drop bad rows, ensure required columns exist."""
     required = ["Open", "High", "Low", "Close", "Volume"]
     for col in required:
         if col not in df.columns:
@@ -847,7 +910,6 @@ def _fetch_one_with_daily(args):
     return primary_sym, primary_df, daily_df
 
 def fetch_stock_data(sym: str, mode: str) -> pd.DataFrame:
-    """Fetch + validate a single stock's OHLCV. Used by the exit scanner."""
     cfg    = MODE_CFG[mode]
     ticker = to_nse(sym)
     for attempt in range(3):
@@ -1458,10 +1520,6 @@ def run_scan(symbols, mode, progress_bar, status_text,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def compute_trailing_stop(df, entry_price: float, mode: str, vix_val) -> float:
-    """
-    VIX-adjusted, profit-tightening ATR trailing stop.
-    As the position gains, the multiplier tightens by 10% per 5% gain.
-    """
     cfg       = MODE_CFG[mode]
     base_mult = cfg.get("atr_mult", 2.5)
     atr_val   = float(atr_series(df).iloc[-1])
@@ -1665,7 +1723,6 @@ def run_exit_scan(positions: list, mode: str, vix_val, htf_cache: dict) -> list:
     except Exception:
         phase_history_all = {}
 
-    # Prefetch HTF for any positions not in cache
     missing_htf = [p["sym"] for p in positions if p["sym"] not in htf_cache]
     if missing_htf:
         cfg = MODE_CFG[mode]
@@ -1702,7 +1759,7 @@ def run_exit_scan(positions: list, mode: str, vix_val, htf_cache: dict) -> list:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# POSITION MANAGER
+# POSITION MANAGER  (with Supabase persistence)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def add_position(sym: str, entry_price: float, qty: int = 1, rs_rank: int = 50):
@@ -1717,12 +1774,14 @@ def add_position(sym: str, entry_price: float, qty: int = 1, rs_rank: int = 50):
             "rs_rank":     rs_rank,
             "entry_date":  datetime.now().isoformat(),
         })
+    _save_positions()   # persist immediately to Supabase
 
 def remove_position(sym: str):
     if "open_positions" in st.session_state:
         st.session_state["open_positions"] = [
             p for p in st.session_state["open_positions"] if p["sym"] != sym
         ]
+    _save_positions()   # persist immediately to Supabase
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1749,6 +1808,7 @@ html, body, [class*="css"] { background: #07070f; color: #e8e8f4; }
 """, unsafe_allow_html=True)
 
 # ── Session state init ─────────────────────────────────────────────────────────
+# open_positions is loaded from Supabase on every cold start
 for key, default in [
     ("results",         []),
     ("scan_time",       None),
@@ -1763,7 +1823,7 @@ for key, default in [
     ("phase_filter",    "All Phases"),
     ("show_illiquid",   False),
     ("min_liq_cr",      5.0),
-    ("open_positions",  []),
+    ("open_positions",  _load_positions()),   # ← loaded from Supabase
     ("htf_cache",       {}),
 ]:
     if key not in st.session_state:
@@ -1942,7 +2002,6 @@ if scan_btn:
     st.session_state.scan_time   = (
         datetime.now().strftime("%H:%M:%S") + f" ({universe_opt} · {mode_opt})"
     )
-    # Update HTF cache for exit scanner use
     try:
         cfg_tmp = MODE_CFG[mode_opt]
         for r in results:
@@ -2193,7 +2252,6 @@ with tab_scanner:
                 f'<span style="color:{conf_col};font-weight:700;">{conf}%</span></span>'
             )
 
-            # "Log Entry" quick button — auto-adds to open positions
             log_key = f"log_{r['Symbol']}_{i}"
 
             parts = [
@@ -2627,7 +2685,6 @@ with tab_detail:
                     f'</div>',
                     unsafe_allow_html=True,
                 )
-                # Quick log entry button in detail view
                 if r.get("Entry") and st.button(
                     f"+ Log {sel} to Open Positions", key=f"detail_log_{sel}"
                 ):
@@ -2860,14 +2917,12 @@ with tab_exit:
     if not positions:
         st.info("No open positions tracked. Add via the panel above or use '+ Log Entry' from the Scanner tab.")
     else:
-        # ── Run exit scan ──────────────────────────────────────────────────────
         cur_mode  = st.session_state.get("scan_mode", mode_opt)
         htf_cache = st.session_state.get("htf_cache", {})
 
         with st.spinner(f"Scanning {len(positions)} position(s) for exit signals…"):
             exit_results = run_exit_scan(positions, cur_mode, vix_val, htf_cache)
 
-        # ── Summary metrics ────────────────────────────────────────────────────
         n_exit_now = sum(1 for r in exit_results if r.exit_phase == EXIT_CONFIRMED)
         n_signal   = sum(1 for r in exit_results if r.exit_phase == EXIT_SIGNAL)
         n_watch    = sum(1 for r in exit_results if r.exit_phase == EXIT_WATCH)
@@ -2885,7 +2940,6 @@ with tab_exit:
 
         st.markdown('<div style="border-top:1px solid #1e1e40;margin:12px 0;"></div>', unsafe_allow_html=True)
 
-        # ── Filters ────────────────────────────────────────────────────────────
         xf1, xf2 = st.columns([3, 1])
         with xf1:
             phase_filter_x = st.multiselect(
@@ -2902,7 +2956,6 @@ with tab_exit:
         elif sort_x == "P&L % ↑": filtered_x.sort(key=lambda r: r.pnl_pct)
         elif sort_x == "Symbol":   filtered_x.sort(key=lambda r: r.sym)
 
-        # ── Exit cards (v11 dark theme) ────────────────────────────────────────
         def render_exit_card_v11(r: ExitResult) -> str:
             color      = EXIT_COLORS.get(r.exit_phase, "#555577")
             pnl_color  = "#22c55e" if r.pnl_pct >= 0 else "#ef4444"
@@ -2949,7 +3002,6 @@ with tab_exit:
                 f'border-left:4px solid {color};border-radius:12px;'
                 f'overflow:hidden;margin-bottom:14px;">'
 
-                # Header row
                 f'<div style="display:flex;align-items:center;padding:12px 16px 10px;'
                 f'border-bottom:1px solid #1e1e40;gap:10px;">'
                 f'<div style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:16px;'
@@ -2962,7 +3014,6 @@ with tab_exit:
                 f'{r.exit_score:.0f}/100</span>'
                 f'</div>'
 
-                # Metrics row
                 f'<div style="display:flex;gap:0;padding:12px 16px;'
                 f'border-bottom:1px solid #1e1e40;flex-wrap:wrap;">'
                 + "".join([
@@ -2985,16 +3036,13 @@ with tab_exit:
                 f'{htf_str}</div>'
                 f'</div>'
 
-                # Score bar
                 f'<div style="padding:10px 16px 0;">'
                 f'<div style="background:#1e1e40;border-radius:3px;height:3px;margin-bottom:10px;">'
                 f'<div style="background:{color};width:{score_pct}%;height:3px;border-radius:3px;">'
                 f'</div></div>'
 
-                # Trigger pills
                 f'<div style="margin-bottom:8px;">{all_pills}</div>'
 
-                # Urgency note + partial exit
                 f'<div style="color:#6b7090;font-size:11px;font-style:italic;'
                 f'font-family:DM Sans,sans-serif;margin-bottom:6px;">{r.urgency_note}</div>'
                 + partial_html
