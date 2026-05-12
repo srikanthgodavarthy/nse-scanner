@@ -2754,12 +2754,30 @@ with tab_scanner:
                     sh_cards += "</div>"
                     st.markdown(sh_cards, unsafe_allow_html=True)
                     st.markdown(
-                        '<div style="text-align:center;color:#3a3a60;font-size:10px;'
-                        'font-family:JetBrains Mono,monospace;padding:4px 0;">'
-                        'ⓘ Short candidates derived from same scan data. Confirm with price action. '
-                        'Short selling involves unlimited risk — always use stop-loss.</div>',
-                        unsafe_allow_html=True,
-                    )
+                      '''
+                      <div style="
+                          text-align:center;
+                          color:#94a3b8;
+                          font-size:11px;
+                          font-family:JetBrains Mono,monospace;
+                          padding:10px 0 4px;
+                          line-height:1.6;
+                          opacity:0.92;
+                          max-width:900px;
+                          margin:0 auto;
+                      ">
+                          ⓘ Short candidates are derived from the same scan engine and require
+                          confirmation with price action, volume, and market context.<br>
+                          <span style="
+                              color:#fca5a5;
+                              font-weight:600;
+                          ">
+                              Short selling carries elevated risk — always use disciplined stop-loss management.
+                          </span>
+                      </div>
+                      ''',
+                      unsafe_allow_html=True,
+                  )
 
                 # Watch-only table (collapsed)
                 sh_watch_list = [s for s in short_candidates if s.verdict == SHORT_WATCH]
