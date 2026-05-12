@@ -153,9 +153,12 @@ _phase_lock = threading.Lock()
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _get_conn():
-    url = st.secrets.get("SUPABASE_URL", "")
-    if not url:
-        raise ValueError("SUPABASE_URL secret is missing or empty")
+    try:
+        url = st.secrets["SUPABASE_URL"]
+    except Exception:
+        raise ValueError("SUPABASE_URL secret is missing — check Streamlit Cloud Secrets")
+    if not url or not url.startswith(("postgres://", "postgresql://")):
+        raise ValueError(f"SUPABASE_URL looks wrong: {url[:30]}...")
     return psycopg2.connect(url)
 
 def _ensure_table(cur):
@@ -1765,8 +1768,11 @@ def run_exit_scan(positions: list, mode: str, vix_val, htf_cache: dict) -> list:
 
 def add_position(sym: str, entry_price: float, qty: int = 1, rs_rank: int = 50):
     if "open_positions" not in st.session_state:
-        st.session_state["open_positions"] = []
-    existing = [p["sym"] for p in st.session_state["open_positions"]]
+      try:
+          st.session_state["open_positions"] = _load_positions()
+      except Exception as e:
+          st.session_state["open_positions"] = []
+          st.session_state["_db_error"] = f"Could not load positions: {e}"
     if sym not in existing:
         st.session_state["open_positions"].append({
             "sym":         sym,
