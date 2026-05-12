@@ -1842,7 +1842,7 @@ st.markdown(
     letter-spacing:-1px;color:#e8e8f4;padding:8px 0 4px;">
     BULL SUTRA <span style="color:#f59e0b;">''</span>
     <span style="font-size:13px;color:#6b7090;font-family:JetBrains Mono,monospace;
-    font-weight:400;">PRO · v11 + EXIT</span></div>''',
+    font-weight:400;">PRO · v12 + DB</span></div>''',
     unsafe_allow_html=True,
 )
 
