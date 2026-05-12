@@ -1801,9 +1801,16 @@ with tab6:
             # ── Summary strip ────────────────────────────────────────────
             counts = {EXIT_HOLD: 0, EXIT_WATCH: 0, EXIT_SIGNAL: 0, EXIT_CONFIRMED: 0}
             for p in positions:
-                er  = exit_results.get(p["symbol"])
-                lbl = er.verdict if er else EXIT_HOLD
-                counts[lbl] = counts.get(lbl, 0) + 1
+              if not isinstance(p, dict):
+                  continue
+          
+              sym = p.get("symbol")
+              if not sym:
+                  continue
+          
+              er  = exit_results.get(sym)
+              lbl = er.verdict if er else EXIT_HOLD
+              counts[lbl] = counts.get(lbl, 0) + 1
 
             col_h, col_w, col_s, col_e = st.columns(4)
             col_h.metric("🟢 Hold",        counts[EXIT_HOLD])
@@ -1814,16 +1821,23 @@ with tab6:
 
             # sort by urgency
             _exit_order = {EXIT_CONFIRMED: 0, EXIT_SIGNAL: 1, EXIT_WATCH: 2, EXIT_HOLD: 3}
-            positions_sorted = sorted(
-                positions,
+            valid_positions = [
+              p for p in positions
+              if isinstance(p, dict) and p.get("symbol")
+            ]
+              positions_sorted = sorted(
+                valid_positions,
                 key=lambda p: _exit_order.get(
                     exit_results[p["symbol"]].verdict
-                    if p["symbol"] in exit_results else EXIT_HOLD, 3
+                    if p["symbol"] in exit_results else EXIT_HOLD,
+                    3
                 )
             )
 
             for pos in positions_sorted:
                 sym = pos["symbol"]
+                if not sym:
+                    continue
                 er  = exit_results.get(sym)
                 _render_exit_card(pos, er)
 
