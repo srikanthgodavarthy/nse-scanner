@@ -1805,7 +1805,13 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
-
+# TEMP DEBUG — remove after fixing
+with st.expander("🔧 Debug secrets"):
+    try:
+        all_keys = list(st.secrets.keys())
+        st.write("Secret keys found:", all_keys)
+    except Exception as e:
+        st.error(f"st.secrets not available: {e}")
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=DM+Sans:wght@400;500;600&family=Syne:wght@600;700&display=swap');
