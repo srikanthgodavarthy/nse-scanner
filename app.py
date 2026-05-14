@@ -3528,21 +3528,21 @@ with tab_analytics:
 # ═══════════════════════════════════════════════════════════════════════════════
 # 💼 PORTFOLIO TAB  (open positions with exit signals)
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab_portfolio:
 
+with tab_portfolio:
     st.markdown(
         '<div style="font-family:Syne,sans-serif;font-size:18px;font-weight:700;'
         'color:#e8e8f4;margin-bottom:12px;">💼 Open Positions & Exit Signals</div>',
         unsafe_allow_html=True,
     )
-    # ── Add position ───────────────────────────────────────────
+
+    # Add position form inline
     with st.expander("➕ Add Position", expanded=False):
         pf1, pf2, pf3, pf4 = st.columns([2, 2, 1, 1])
-        ap_sym = pf1.text_input("Symbol", key="pf_sym").upper()
+        ap_sym   = pf1.text_input("Symbol", key="pf_sym").upper()
         ap_entry = pf2.number_input("Entry Price ₹", min_value=0.01, value=100.0, step=0.5, key="pf_ep")
-        ap_qty = pf3.number_input("Qty", min_value=1, value=100, step=1, key="pf_qty")
-        ap_mode = pf4.selectbox("Mode", list(MODE_CFG.keys()), index=1, key="pf_mode")
-
+        ap_qty   = pf3.number_input("Qty", min_value=1, value=100, step=1, key="pf_qty")
+        ap_mode  = pf4.selectbox("Mode", list(MODE_CFG.keys()), index=1, key="pf_mode")
         if st.button("Add", type="primary", key="pf_add_btn"):
             if ap_sym:
                 add_position(ap_sym, ap_entry, int(ap_qty), ap_mode)
@@ -3551,148 +3551,127 @@ with tab_portfolio:
     positions = st.session_state.get("open_positions") or []
 
     if not positions:
-        st.info("No open positions.")
+        st.info("No open positions. Add from this page, from the Scanner, or via the sidebar.")
     else:
-
-        # ── Refresh exit signals ────────────────────────────────
         col_refresh, _ = st.columns([1, 5])
         with col_refresh:
-            if st.button("🔄 Refresh Exit Signals", use_container_width=True):
+            if st.button("🔄 Refresh Exit Signals", use_container_width=True, key="pf_refresh"):
                 vix_pf, _ = fetch_vix()
                 with st.spinner("Scanning exits…"):
                     st.session_state["exit_results"] = run_exit_scan(positions, vix_pf)
 
         exit_res = st.session_state.get("exit_results", {})
 
-        # ── Summary strip ───────────────────────────────────────
+        # Summary strip
         counts = {EXIT_HOLD: 0, EXIT_WATCH_LBL: 0, EXIT_SIGNAL_LBL: 0, EXIT_CONFIRM_LBL: 0}
+        for p in positions:
+            if not isinstance(p, dict): continue
+            sym = p.get("symbol")
+            if not sym: continue
+            er = exit_res.get(sym)
+            lbl = er.verdict if er else EXIT_HOLD
+            counts[lbl] = counts.get(lbl, 0) + 1
 
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("🟢 Hold",        counts[EXIT_HOLD])
+        p2.metric("🟡 Watch",       counts[EXIT_WATCH_LBL])
+        p3.metric("🟠 Exit Signal", counts[EXIT_SIGNAL_LBL])
+        p4.metric("🔴 Exit Now",    counts[EXIT_CONFIRM_LBL])
+        st.markdown('<div style="border-top:1px solid #1e1e40;margin:10px 0;"></div>', unsafe_allow_html=True)
+
+        _exit_ord = {EXIT_CONFIRM_LBL: 0, EXIT_SIGNAL_LBL: 1, EXIT_WATCH_LBL: 2, EXIT_HOLD: 3}
         valid_pos = [p for p in positions if isinstance(p, dict) and p.get("symbol")]
+        pos_sorted = sorted(valid_pos, key=lambda p: _exit_ord.get(
+            exit_res[p["symbol"]].verdict if p["symbol"] in exit_res else EXIT_HOLD, 3))
 
-        for pos in valid_pos:
-            sym = pos["symbol"]
-            er = exit_res.get(sym)
-            verdict = er.verdict if er else EXIT_HOLD
-            counts[verdict] += 1
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("🟢 Hold", counts[EXIT_HOLD])
-        c2.metric("🟡 Watch", counts[EXIT_WATCH_LBL])
-        c3.metric("🟠 Signal", counts[EXIT_SIGNAL_LBL])
-        c4.metric("🔴 Exit Now", counts[EXIT_CONFIRM_LBL])
-
-        st.markdown('<hr style="border:1px solid #1e1e40;">', unsafe_allow_html=True)
-
-        # ── GROUPING (THIS is the key fix) ──────────────────────
-        grouped = {
-            EXIT_CONFIRM_LBL: [],
-            EXIT_SIGNAL_LBL: [],
-            EXIT_WATCH_LBL: [],
-            EXIT_HOLD: []
-        }
-
-        for pos in valid_pos:
-            sym = pos["symbol"]
-            er = exit_res.get(sym)
-            verdict = er.verdict if er else EXIT_HOLD
-            grouped.setdefault(verdict, []).append((pos, er))
-
-        # sort inside groups
-        for k in grouped:
-            grouped[k].sort(key=lambda x: x[1].exit_score if x[1] else 0, reverse=True)
-
-        # ── CARD FUNCTION ───────────────────────────────────────
-        def render_card(pos, er):
-            sym = pos["symbol"]
+        for pos in pos_sorted:
+            sym      = pos["symbol"]
+            er       = exit_res.get(sym)
+            verdict  = er.verdict if er else EXIT_HOLD
+            ex_score = er.exit_score if er else 0
+            triggers = er.triggers if er else []
+            trail_sl = er.trailing_stop if er else None
             entry_px = pos.get("entry_price", 0)
-            qty = pos.get("qty", 0)
-            mode_p = pos.get("mode", "Swing")
+            curr_px  = (er.current_price if (er and er.current_price) else entry_px)
+            qty      = pos.get("qty", 0)
+            mode_p   = pos.get("mode", "Swing")
+            day_pct  = er.day_pct if er else 0.0   # FIX-11
 
-            verdict = er.verdict if er else EXIT_HOLD
-            score = er.exit_score if er else 0
-            curr_px = er.current_price if er and er.current_price else entry_px
-            day_pct = er.day_pct if er else 0
+            pnl_pct  = (curr_px - entry_px) / entry_px * 100 if entry_px else 0
+            pnl_abs  = (curr_px - entry_px) * qty
+            pnl_col  = "#22c55e" if pnl_pct >= 0 else "#ef4444"
+            day_col  = "#22c55e" if day_pct >= 0 else "#ef4444"   # FIX-11
+            day_str  = f"+{day_pct:.2f}%" if day_pct >= 0 else f"{day_pct:.2f}%"  # FIX-11
+            vc       = EXIT_COLORS.get(verdict, "#22aa55")
+            bar      = min(int(ex_score), 100)
 
-            pnl_pct = (curr_px - entry_px) / entry_px * 100 if entry_px else 0
-            pnl_abs = (curr_px - entry_px) * qty
+            trig_html = "".join(
+                f'<span style="background:#1e1e40;border:1px solid #555;color:#ccc;'
+                f'padding:2px 8px;border-radius:4px;font-size:9px;margin:1px;">⚡ {t}</span>'
+                for t in triggers
+            ) or '<span style="color:#3a3a60;font-size:9px;">No exit triggers</span>'
 
-            vc = EXIT_COLORS.get(verdict, "#22aa55")
-            pnl_col = "#22c55e" if pnl_pct >= 0 else "#ef4444"
-            day_col = "#22c55e" if day_pct >= 0 else "#ef4444"
+            trail_bit = (
+                f'<div style="flex:0 0 auto;">'
+                f'<div style="color:#cbd5e1;font-size:9px;">TRAIL SL</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#f59e0b;font-size:13px;font-weight:600;">₹{trail_sl:,.2f}</div>'
+                f'</div>'
+            ) if trail_sl else ""
 
-            # caution
-            caution = ""
-            if verdict == EXIT_CONFIRM_LBL:
-                caution = "⚠ EXIT NOW"
-            elif verdict == EXIT_SIGNAL_LBL:
-                caution = "🔶 Reduce"
-            elif verdict == EXIT_WATCH_LBL:
-                caution = "👁 Watch"
+            # FIX-12: render portfolio cards in a scanner-sized card (360px wide)
+            # wrapped in a flex container so they flow side-by-side like scanner cards.
+            st.markdown(
+                f'<div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:4px;">'
+                f'<div style="background:#111120;border:1.5px solid {vc};border-radius:12px;'
+                f'overflow:hidden;box-shadow:0 2px 12px {vc}22;'
+                f'width:360px;min-width:320px;max-width:380px;flex:1 1 360px;">'
+                # header
+                f'<div style="display:flex;justify-content:space-between;align-items:center;'
+                f'padding:12px 16px 10px;border-bottom:1px solid #1e1e40;">'
+                f'<div><span style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:16px;font-weight:700;">{sym}</span>'
+                f'<span style="color:#cbd5e1;font-size:11px;font-family:DM Sans,sans-serif;margin-left:8px;">'
+                f'{SECTOR_MAP.get(sym,"—")} · {mode_p}</span></div>'
+                f'<span style="background:{vc}22;border:1px solid {vc};color:{vc};'
+                f'padding:4px 12px;border-radius:6px;font-size:11px;font-weight:700;">{verdict}</span>'
+                f'</div>'
+                # metrics
+                f'<div style="display:flex;gap:16px;flex-wrap:wrap;padding:12px 16px;">'
+                f'<div><div style="color:#cbd5e1;font-size:9px;">ENTRY</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#aaa;font-size:13px;">₹{entry_px:,.2f}</div></div>'
+                f'<div><div style="color:#cbd5e1;font-size:9px;">CURRENT</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:13px;">₹{curr_px:,.2f}</div></div>'
+                f'<div><div style="color:#cbd5e1;font-size:9px;">DAY</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:{day_col};font-size:13px;font-weight:600;">{day_str}</div></div>'
+                f'<div><div style="color:#cbd5e1;font-size:9px;">QTY</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#aaa;font-size:13px;">{qty}</div></div>'
+                f'<div><div style="color:#cbd5e1;font-size:9px;">P&L</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:{pnl_col};font-size:13px;font-weight:700;">'
+                f'{"+"}' + f'{pnl_pct:.1f}% (₹{pnl_abs:+,.0f})</div></div>'
+                + trail_bit +
+                f'</div>'
+                # exit pressure bar
+                f'<div style="padding:4px 16px 8px;">'
+                f'<div style="display:flex;justify-content:space-between;margin-bottom:3px;">'
+                f'<span style="color:#cbd5e1;font-size:9px;">EXIT PRESSURE</span>'
+                f'<span style="color:{vc};font-size:9px;font-weight:700;">{bar}/100</span></div>'
+                f'<div style="background:#1e1e40;border-radius:2px;height:4px;">'
+                f'<div style="background:{vc};width:{bar}%;height:4px;border-radius:2px;"></div></div></div>'
+                # triggers
+                f'<div style="padding:4px 16px 10px;">{trig_html}</div>'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
 
-            st.markdown(f"""
-              <div style="background:#111120;border:1.5px solid {vc};
-              border-radius:12px;padding:10px;margin-bottom:10px;
-              box-shadow:0 3px 12px {vc}33;">
-              
-                  <div style="display:flex;justify-content:space-between;">
-                      <div>
-                          <div style="font-weight:700;color:#e8e8f4;">{sym}</div>
-                          <div style="font-size:10px;color:#94a3b8;">{mode_p}</div>
-                      </div>
-                      <div style="color:{vc};font-weight:700;">{verdict}</div>
-                  </div>
-              
-                  <div style="font-size:20px;">₹{curr_px:,.2f}</div>
-                  <div style="color:{day_col};font-size:12px;">{day_pct:+.2f}%</div>
-              
-                  <div style="font-size:11px;margin-top:6px;">
-                      Entry ₹{entry_px} | Qty {qty} |
-                      <span style="color:{pnl_col};">{pnl_pct:+.1f}%</span>
-                  </div>
-              
-                  <div style="margin-top:6px;font-size:10px;">
-                      EXIT {score}/100
-                  </div>
-              
-                  <div style="background:#1e1e40;height:4px;">
-                      <div style="background:{vc};width:{score}%;height:4px;"></div>
-                  </div>
-              
-                  <div style="margin-top:6px;color:#f59e0b;font-size:11px;">
-                      {caution}
-                  </div>
-              
-              </div>
-              """, unsafe_allow_html=True)
-              ``
-            with col1:
-                if verdict == EXIT_SIGNAL_LBL:
-                    if st.button("➖ Reduce", key=f"reduce_{sym}"):
-                        st.info(f"Reduce {sym}")
-
-            with col3:
-                if st.button("🗑", key=f"rm_{sym}_{pos.get('entry_date','')}"):
+            ac1, ac2, ac3 = st.columns([3, 2, 1])
+            with ac1:
+                if verdict == EXIT_CONFIRM_LBL: st.error("⚠️ Consider full exit or tight trailing stop")
+                elif verdict == EXIT_SIGNAL_LBL: st.warning("🔶 Consider 50% exit to lock gains")
+                elif verdict == EXIT_WATCH_LBL: st.info("👁 Monitor closely — tighten stop")
+            with ac3:
+                if st.button("🗑 Remove", key=f"rm_{sym}_{pos.get('entry_date','')}"):
                     st.session_state["open_positions"] = [
                         p for p in st.session_state["open_positions"]
                         if not (p.get("symbol") == sym and p.get("entry_date") == pos.get("entry_date"))
                     ]
                     _db_save("bs_positions", st.session_state["open_positions"])
                     st.rerun()
-
-        # ── SECTION RENDER ──────────────────────────────────────
-        def render_section(title, items, expanded=True):
-            if not items:
-                return
-
-            with st.expander(f"{title} ({len(items)})", expanded=expanded):
-                for pos, er in items:
-                    render_card(pos, er)
-
-        # ── FINAL OUTPUT ORDER ──────────────────────────────────
-        if grouped[EXIT_CONFIRM_LBL]:
-            st.error(f"⚠ {len(grouped[EXIT_CONFIRM_LBL])} positions need immediate exit")
-
-        render_section("🔴 EXIT NOW", grouped[EXIT_CONFIRM_LBL], True)
-        render_section("🟠 EXIT SIGNAL", grouped[EXIT_SIGNAL_LBL], True)
-        render_section("🟡 EXIT WATCH", grouped[EXIT_WATCH_LBL], False)
-        render_section("🟢 HOLD", grouped[EXIT_HOLD], False)
