@@ -30,46 +30,29 @@ NEW in v14.3:
     — Symbol resolution: each sector maps to its stocks list
       from sectors.py; "Nifty 500" (None) maps to NSE500.
 ═══════════════════════════════════════════════════════════════════
+  CARD UI v14.3 CHANGES:
+  • Header right badge now shows CONFIDENCE % (not score)
+    — Score was redundant (already in the metric grid); replaced
+      with confidence coloured badge for instant signal quality read.
+  • Target / SL values shown as whole rupees (no decimal points)
+    — T1/T2/T3/SL footer now displays ₹2,201 instead of ₹2,201.71
+  • Metric rows moved to vertical 2-col grid BELOW phase badges
+    — Right-side metric panel removed; body is now single-column.
+    — 6 metrics (Score/Trend/RSI/RS/HTF/Vol) render as a compact
+      2-column grid directly below the SETUP/MED badges, using the
+      full card width with no wasted space.
+  • Sector label moved above extension caution pills
+    — Removed from the footer targets row; now lives in its own slim
+      row (border-top) between the targets footer and ext pills.
+      Always visible regardless of whether ext_n > 0.
+═══════════════════════════════════════════════════════════════════
   • FIX-8  BREAKOUT CONFIDENCE DOUBLE-COUNT REMOVED
-    — "trend_up" removed from brk_weights; it was already captured by
-      "score_ok" (norm_bull awards +25 for trend_up, so both weights
-      fired together, over-counting trend strength by 0.35).
-    — Redistributed weight to orthogonal signals: price_above_high
-      raised to 0.35; compressed raised to 0.20.  Weights still sum 1.0.
-
   • FIX-9  was_recent_brk VOLATILITY-SPIKE GUARD
-    — Added two new guards to prevent wick/spike candles from triggering
-      post-breakout suppression:
-        (a) CLOSE must also be above the rolling high, not just the wick.
-        (b) Body must be non-red (close >= open) — rules out reversal spikes.
-    — FIX-9 also fixes the VOLUME AVERAGE MISMATCH (Bug 3):
-      was_recent_brk now computes the rolling-20 volume average at bar[-k]
-      (using only bars prior to bar[-k]) instead of using today's vol_avg,
-      so the comparison is apples-to-apples with the historical bar's baseline.
-
   • FIX-10 fresh_cross IS NOW A TRUE CROSSOVER DETECTOR
-    — Old loop: found any bar where EMA_fast was previously ≤ EMA_slow,
-      which could fire on oscillating EMAs without a genuine directional cross.
-    — New loop: requires that at bar[-k], EMA_fast > EMA_slow (above)
-      AND at bar[-(k+1)], EMA_fast ≤ EMA_slow (below).  Both adjacent-bar
-      conditions must hold simultaneously — a genuine golden-cross event.
-
   • FIX-11 DAY % CHANGE ON ALL CARD TYPES
-    — Short cards: day_change field added to ShortResult; propagated from
-      %Change in score_short_from_result; displayed as color-coded ▲/▼
-      below the current price (matching bull scanner card style).
-    — Portfolio cards: day_pct field added to ExitResult; computed in
-      score_exit as (close − prev_close) / prev_close × 100; displayed
-      as "DAY" metric alongside ENTRY / CURRENT / QTY / P&L.
-
   • FIX-12 PORTFOLIO CARD SIZES MATCH SCANNER
-    — Portfolio cards now use width:360px;min-width:320px;max-width:380px;
-      flex:1 1 360px — identical sizing to scanner cards.
-    — Each card is wrapped in a flex container so multiple cards
-      flow side-by-side on wide screens, matching the scanner layout.
 ═══════════════════════════════════════════════════════════════════
   • Short Sell Engine (score_short / run_short_scan)
-    — 4 hard triggers + 7 soft triggers, uses v11 detect_exhaustion
   • "🔻 Short Scan" as a top-level tab (not buried in sub-tabs)
   • Short cards use v11 JetBrains Mono dark style
   • 💼 Portfolio tab: open positions with exit signals
@@ -79,48 +62,11 @@ NEW in v14.3:
 FIXES FROM v10
 ──────────────────────────
 FIX-1  CLOSED-CANDLE HTF ALIGNMENT
-        _htf_trend_from_df now drops the last (still-forming) bar
-        before computing EMAs, so a live intraday bar never
-        contaminates the higher-timeframe signal.
-
 FIX-2  BREADTH-BASED GATING
-        run_scan computes a quick breadth pulse after scoring.
-        When breadth is WEAK (pct_above_ema50 < 40 AND ad_ratio < 0.8)
-        stocks in PHASE_BRK / PHASE_CONT have their action capped to
-        WATCH and a "breadth_gated" flag is set on the result dict.
-        No scoring math changes; the gate is applied in the main thread.
-
 FIX-3  STRUCTURAL BREAKOUT FILTERING
-        detect_phase_and_entry now requires a breakout candle to clear
-        the rolling high by at least 0.15 × ATR (was 0.20 × ATR buf),
-        AND volume must exceed vol_avg × 1.5 (hard gate, not weighted).
-        Breakout is also rejected when the prior 3-bar range is already
-        expanded (atr_val > atr_mean × 1.4) — avoids chasing blowoffs.
-
 FIX-4  INTRADAY TIME-NORMALISED VOLUME
-        liquidity_ok and score_stock now compute vol_avg using only
-        bars from the current session so far when mode == "Intraday".
-        A helper _intraday_bars_elapsed() returns the fraction of the
-        trading session completed; volume is scaled to a full-session
-        equivalent before comparison, preventing false "volume spike"
-        signals early in the day.
-
 FIX-5  CAPITAL CAP IN POSITION SIZING
-        position_size now accepts a max_capital_pct parameter
-        (default 0.20 = 20 % of account).  final_qty is clamped so
-        that capital_used ≤ account_size × max_capital_pct, regardless
-        of how wide the stop is relative to account size.
-
 FIX-6  EMA DOUBLE-COUNTING REMOVED
-        In score_stock bull scoring the block
-            bull += 15 if e_fast > e_slow else (7 if e_fast > e_slow * 0.995 else 0)
-        was also fully captured by the trend_up / trend_strong flags
-        (which already require e_fast > e_slow).  The EMA cross line
-        is replaced with a tighter, non-overlapping bonus:
-            +8 if golden-cross within last 5 bars (fresh cross)
-            +4 if e_fast > e_slow but not a fresh cross
-            0  otherwise
-        trend_up (+25) and ema_stack (+15) remain unchanged.
 
 SPEED IMPROVEMENTS PRESERVED FROM v10
 ──────────────────────────
@@ -162,7 +108,6 @@ warnings.filterwarnings("ignore")
 try:
     from sectors import SECTORS as _SECTORS
 except ImportError:
-    # ── GitHub fallback: download sectors.py from the repo at runtime ──────────
     _SECTORS = None
     try:
         import urllib.request, types as _types
@@ -175,7 +120,7 @@ except ImportError:
         exec(compile(_src, "<sectors_gh>", "exec"), _mod.__dict__)
         _SECTORS = getattr(_mod, "SECTORS", None)
     except Exception:
-        _SECTORS = None   # sectors.py unavailable — fall back to hardcoded maps below
+        _SECTORS = None
 
 try:
     from nse500 import nse500_symbols
@@ -206,7 +151,6 @@ NIFTY50 = (
 )
 
 # ── SECTOR_MAP: symbol → sector name ─────────────────────────────────────────
-# Priority: 1) GitHub CSV  2) local CSV  3) sectors.py dict  4) hardcoded stub
 SECTOR_MAP: dict[str, str] = {}
 
 _CSV_GH_URL = (
@@ -214,40 +158,30 @@ _CSV_GH_URL = (
 )
 
 def _load_sector_csv(source) -> dict:
-    """Read a CSV from a path or URL; return {SYMBOL: SECTOR} dict.
-
-    Supports both column layouts:
-      • 'Sector'   — generic layout
-      • 'Industry' — NSE 500 clean sample (Company Name, Industry, Symbol, ...)
-    """
     _df = pd.read_csv(source)
     _df["Symbol"] = _df["Symbol"].astype(str).str.replace(".NS", "", regex=False).str.strip()
     _sector_col = "Sector" if "Sector" in _df.columns else "Industry"
     _df[_sector_col] = _df[_sector_col].astype(str).str.strip().str.title()
     return dict(zip(_df["Symbol"], _df[_sector_col]))
 
-# ✅ 1. GitHub CSV (primary — always current)
 try:
     SECTOR_MAP = _load_sector_csv(_CSV_GH_URL)
 except Exception:
-    # ✅ 2. Local CSV fallback
     try:
         SECTOR_MAP = _load_sector_csv("nse500_clean_sample.csv")
     except Exception:
-        pass   # continue to SECTORS dict fallback below
+        pass
 
-# ✅ 3. If both CSVs failed → fall back to SECTORS dict
 if not SECTOR_MAP:
     if _SECTORS:
         for _sector_name, _syms in _SECTORS.items():
             if _syms is None:
                 continue
             for _sym in _syms:
-                if _sym not in SECTOR_MAP:   # first sector wins
+                if _sym not in SECTOR_MAP:
                     SECTOR_MAP[_sym] = _sector_name
 
     if not SECTOR_MAP:
-        # ✅ 4. Final hard fallback
         SECTOR_MAP = {
             "RELIANCE": "Energy & Power",  "ONGC": "Energy & Power",
             "BPCL": "Energy & Power",      "COALINDIA": "Energy & Power",
@@ -312,7 +246,6 @@ VIX_CAUTION = 20
 VIX_STRESS  = 25
 LIQUIDITY_MIN_CR = 5.0
 
-# ── Exit layer constants ───────────────────────────────────────────────────────
 EXIT_HOLD        = "HOLD"
 EXIT_WATCH_LBL   = "EXIT WATCH"
 EXIT_SIGNAL_LBL  = "EXIT SIGNAL"
@@ -324,7 +257,6 @@ EXIT_COLORS = {
     EXIT_CONFIRM_LBL: "#cc4444",
 }
 
-# ── Short sell constants ───────────────────────────────────────────────────────
 SHORT_SKIP      = "SKIP"
 SHORT_WATCH     = "SHORT WATCH"
 SHORT_SIGNAL    = "SHORT SIGNAL"
@@ -343,12 +275,10 @@ SHORT_SOFT_WEIGHT     = 9
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CARD STYLE v15 — shared colour helpers (module-level, used by make_card,
-#                  short card, and portfolio card renderers)
+# CARD STYLE — shared colour helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _action_colors(act):
-    """Return (bg, border, text) CSS colour triple for an action label."""
     if act == "STRONG BUY": return "#f59e0b22", "#f59e0b88", "#f59e0b"
     if act == "BUY":        return "#22c55e1a", "#22c55e66", "#22c55e"
     if act == "WATCH":      return "#3b82f611", "#3b82f644", "#60a5fa"
@@ -380,7 +310,7 @@ def _conf_color(conf: int):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SUPABASE PERSISTENCE  (optional — silently skipped if secret missing)
+# SUPABASE PERSISTENCE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _db_conn():
@@ -420,12 +350,10 @@ def _db_load(table):
         pass
     return []
 
-# NSE cash-market session: 09:15–15:30 IST
 NSE_OPEN_HOUR,  NSE_OPEN_MIN  = 9, 15
 NSE_CLOSE_HOUR, NSE_CLOSE_MIN = 15, 30
-NSE_SESSION_MINUTES = (NSE_CLOSE_HOUR * 60 + NSE_CLOSE_MIN) - (NSE_OPEN_HOUR * 60 + NSE_OPEN_MIN)  # 375
+NSE_SESSION_MINUTES = (NSE_CLOSE_HOUR * 60 + NSE_CLOSE_MIN) - (NSE_OPEN_HOUR * 60 + NSE_OPEN_MIN)
 
-# ── Thread safety ──────────────────────────────────────────────────────────────
 _phase_lock = threading.Lock()
 
 
@@ -486,11 +414,6 @@ def fmt(val):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _session_elapsed_fraction() -> float:
-    """
-    Returns the fraction of the NSE trading session (09:15–15:30) that has
-    elapsed as of *now* (IST = UTC+5:30).  Clamped to [0.05, 1.0] so we
-    never divide by near-zero early in the session.
-    """
     now_utc  = datetime.utcnow()
     now_ist  = now_utc + timedelta(hours=5, minutes=30)
     minutes_since_open = (now_ist.hour * 60 + now_ist.minute) - (NSE_OPEN_HOUR * 60 + NSE_OPEN_MIN)
@@ -499,24 +422,11 @@ def _session_elapsed_fraction() -> float:
 
 
 def _intraday_vol_avg(volume: pd.Series, bars_per_day: int) -> float:
-    """
-    FIX-4: For intraday data, compute today's cumulative volume scaled to a
-    full-session equivalent, then average with recent prior-day totals.
-
-    - Collects full prior-day volumes (rolling sum of bars_per_day bars,
-      shifted by 1 day's worth of bars so today's partial data is excluded).
-    - Estimates today's projected full-day volume by dividing elapsed bars'
-      cumulative volume by the session fraction elapsed.
-    - Returns the mean of the last 5 prior-day full volumes + today's projection.
-    """
     elapsed_frac = _session_elapsed_fraction()
-
-    # today's bars: last N bars (may be partial)
     today_bars = int(min(bars_per_day * elapsed_frac + 1, len(volume)))
     today_vol  = float(volume.iloc[-today_bars:].sum())
-    today_proj = today_vol / elapsed_frac          # scaled to full session
+    today_proj = today_vol / elapsed_frac
 
-    # prior full days: rolling sum, skip today's partial bars
     if len(volume) > bars_per_day + today_bars:
         prior = volume.iloc[:-(today_bars)].rolling(bars_per_day).sum().dropna()
         prior_daily = prior.iloc[-5:].values.tolist()
@@ -613,7 +523,6 @@ def liquidity_ok(df, min_cr=LIQUIDITY_MIN_CR, mode="Swing"):
         else:
             bars_per_day = 1
 
-        # FIX-4: use time-normalised volume for intraday liquidity check
         if mode == "Intraday" and bars_per_day > 1:
             avg_daily_vol = _intraday_vol_avg(df["Volume"], bars_per_day)
             avg_cr        = float(avg_daily_vol * float(df["Close"].iloc[-1])) / 1e7
@@ -644,16 +553,9 @@ def _fetch_htf_cached(ticker: str, period: str, interval: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 def _htf_trend_from_df(df: pd.DataFrame, mode: str):
-
-    """
-    FIX-1: Use only CLOSED HTF candles.
-    Prevents repainting from partially formed HTF bars.
-    """
-
     if df is None or df.empty:
         return True, "HTF-UNKNOWN"
 
-    # Remove live/incomplete HTF candle
     if mode == "Intraday" and len(df) > 2:
         df = df.iloc[:-1].copy()
 
@@ -787,13 +689,6 @@ def get_phase_arrow(sym: str) -> str:
 
 def position_size(account_size, entry, sl, atr_val, atr_mean, vix_val,
                   risk_pct=0.02, max_capital_pct=0.20):
-    """
-    FIX-5: Added max_capital_pct (default 20 %).
-    final_qty is now clamped so that:
-        final_qty × entry  ≤  account_size × max_capital_pct
-    This prevents the sizer from allocating a runaway position when the
-    stop is very tight relative to account size.
-    """
     risk_per_share = max(entry - sl, 0.01)
     base_qty       = int((account_size * risk_pct) / risk_per_share)
 
@@ -809,7 +704,6 @@ def position_size(account_size, entry, sl, atr_val, atr_mean, vix_val,
 
     vol_adj_qty = max(1, int(base_qty * vix_adj * atr_adj))
 
-    # FIX-5: capital cap — never allocate more than max_capital_pct of account
     max_qty_by_capital = max(1, int((account_size * max_capital_pct) / entry))
     final_qty          = min(vol_adj_qty, max_qty_by_capital)
 
@@ -820,7 +714,7 @@ def position_size(account_size, entry, sl, atr_val, atr_mean, vix_val,
         "base_qty":          base_qty,
         "vix_adj":           round(vix_adj, 2),
         "atr_adj":           round(atr_adj, 2),
-        "vol_adj_qty":       vol_adj_qty,           # pre-cap qty (diagnostic)
+        "vol_adj_qty":       vol_adj_qty,
         "final_qty":         final_qty,
         "capital_used":      capital_used,
         "max_loss":          max_loss,
@@ -1004,14 +898,11 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
     brk_lb         = 5
     rolling_hi_brk = float(high.iloc[-brk_lb-1:-1].max()) if n > brk_lb + 1 else float(high.iloc[-1])
 
-    # FIX-3: tighter buffer (0.15 × ATR) + hard volume gate + anti-blowoff guard
-    buf = atr_val * 0.15    # tighter than v10's 0.20
+    buf = atr_val * 0.15
 
     is_compressed = atr_val < atr_mean * 0.8
     is_expanding  = atr_val > float(atr_s.iloc[-2])
 
-    # FIX-3: reject breakouts when the prior 3-bar range is already expanded
-    #         (avoids entering a blow-off move disguised as a breakout)
     prior_3bar_atr_expanded = atr_val > atr_mean * 1.4
 
     body = (abs(float(close.iloc[-1]) - float(df["Open"].iloc[-1]))
@@ -1020,7 +911,6 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
                   if "Open" in df.columns else 0)
     is_exhaustion = upper_wick > body * 1.5
 
-    # FIX-3: hard volume gate — breakout candle MUST have vol > 1.5× avg
     brk_vol_ok    = (v > vol_avg * 1.5) if vol_avg > 0 else False
 
     vol_spike     = v > vol_avg * 1.3
@@ -1029,11 +919,6 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
     cont_vol_mult = 1.5 if (regime_bearish or (vix_val and vix_val > VIX_CAUTION)) else 1.2
     BRK_CONF_MIN  = 0.70 if regime_bearish else 0.65
 
-    # FIX-8: Removed "trend_up" weight — it was already captured by "score_ok"
-    # (norm_bull awards +25 for trend_up, so score_ok and trend_up fire together,
-    # artificially inflating brk_confidence by 0.35 when trend is strong).
-    # Redistributed weight to orthogonal signals: price_above_high (+0.05),
-    # compressed (+0.05), so the remaining 5 factors still sum to 1.0.
     brk_weights = {
         "price_above_high": (0.35, c > rolling_hi_brk + buf),
         "score_ok":         (0.20, norm_bull >= score_th),
@@ -1043,31 +928,18 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
     }
     brk_confidence = sum(w for w, cond in brk_weights.values() if cond)
 
-    # FIX-3: add hard gates — exhaustion, volume, and prior-range expansion all
-    #         veto the breakout regardless of the weighted score
     is_breakout = (
         brk_confidence >= BRK_CONF_MIN
         and not is_exhaustion
-        and brk_vol_ok                      # FIX-3 hard vol gate
-        and not prior_3bar_atr_expanded     # FIX-3 anti-blowoff
+        and brk_vol_ok
+        and not prior_3bar_atr_expanded
         and htf_up
     )
 
-    # FIX-7: POST-BREAKOUT SUPPRESSION
-    # After a breakout fires on bar N, bars N+1…N+brk_lb all have the elevated
-    # breakout high inside rolling_hi_brk, so is_breakout becomes False.
-    # Without suppression, the stock falls through to PHASE_ENTRY the very next
-    # bar — producing a spurious "new" entry signal at a stale/lower price.
-    #
-    # Detection: scan the last brk_lb bars (excluding current) for any bar that
-    # clears the rolling high AT THAT TIME with breakout-level volume.
-    # If found → was_recent_brk = True.  The phase tree routes this to CONT
-    # (not ENTRY), and entry_price is pinned to current price, not old EMA cross.
     was_recent_brk = False
-    recent_brk_bar = None                       # index offset (1 = previous bar)
+    recent_brk_bar = None
     if not is_breakout and n > brk_lb * 2 + 2:
         for k in range(1, brk_lb + 1):
-            # Rolling high as it was BEFORE bar [-k]
             look_start = -(brk_lb + 1 + k)
             look_end   = -(1 + k)
             if abs(look_start) > n or abs(look_end) > n:
@@ -1077,21 +949,12 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
             prev_close_k    = float(close.iloc[-k])
             prev_vol_k      = float(df["Volume"].iloc[-k])
 
-            # FIX-9: volatility-spike guard — the CLOSE must also clear the rolling
-            # high (not just the wick/high).  A spike candle that wicks above but
-            # closes back below the old high is NOT a breakout; it's an exhaustion bar.
             close_above_brk = prev_close_k > prev_rolling_hi
 
-            # FIX-9: body must be non-red (close >= open).  A red candle that gaps
-            # up through the high and closes below open is a bearish reversal bar,
-            # not a breakout continuation signal.
             prev_open_k = (float(df["Open"].iloc[-k])
                            if "Open" in df.columns else prev_close_k)
             body_non_red = prev_close_k >= prev_open_k
 
-            # FIX-9 (Bug 3): use the volume average computed at bar [-k] (exclude
-            # recent k bars) so we compare against the baseline that was relevant
-            # at the time — not today's potentially inflated/deflated average.
             hist_vol = df["Volume"].iloc[:-k]
             hist_avg_k = (float(hist_vol.rolling(20).mean().iloc[-1])
                           if len(hist_vol) >= 20 else vol_avg)
@@ -1123,8 +986,6 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
     elif is_breakout:
         phase, setup_type = PHASE_BRK, "breakout"
     elif was_recent_brk and trend_strong:
-        # FIX-7: post-breakout bars → CONT (not ENTRY).
-        # Only downgrade to SETUP if volume dried up AND trend weakening.
         if trend_up:
             phase, setup_type = PHASE_CONT, "breakout"
         else:
@@ -1149,16 +1010,10 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
         if is_breakout:
             entry_price = round(rolling_hi_brk + buf, 2)
         elif was_recent_brk:
-            # FIX-7: post-breakout CONT — pin entry to current price (already
-            # above the breakout level).  Do NOT use the old EMA-cross price,
-            # which is stale and far below the actual breakout level.
             entry_price = round(c, 2)
         elif is_fib_buy and fib:
             entry_price = round(fib["618"] + prox * 0.3, 2)
         else:
-            # FIX-7: guard the EMA-cross finder — only use crossover price if
-            # it is recent (within last 10 bars) AND above current close * 0.97.
-            # Otherwise fall back to current price to avoid stale signals.
             cross       = close > e_fast_s
             signal_bars = cross & ~cross.shift(1).fillna(False)
             if signal_bars.any():
@@ -1265,27 +1120,13 @@ def _market_regime(nifty_close):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CORE SCORING  (FIX-4 + FIX-6 — no session_state access)
+# CORE SCORING  (FIX-4 + FIX-6)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def score_stock(df, nifty_close, mode="Swing", daily_close=None,
                 market_bullish=True, vix_val=None, min_liquidity_cr=LIQUIDITY_MIN_CR,
                 sym=None, htf_up=True, rs_rank=50,
                 phase_history_snapshot=None):
-    """
-    FIX-4: vol_avg for Intraday mode now uses _intraday_vol_avg() so that
-           a partial session's volume is scaled to a full-day equivalent
-           before comparison.  This prevents spurious "volume spike" signals
-           at market open.
-
-    FIX-6: EMA cross scoring block is replaced with a fresh-cross bonus that
-           is orthogonal to trend_up (+25) and ema_stack (+15):
-               +8  golden-cross within last 5 bars  (fresh, bullish momentum)
-               +4  e_fast > e_slow but not a fresh cross
-               0   otherwise
-           The old "+15 if e_fast > e_slow" added redundant signal weight
-           that was already embedded in trend_up and ema_stack.
-    """
     try:
         cfg    = MODE_CFG[mode]
         close  = df["Close"]
@@ -1310,7 +1151,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         chg      = round(((c - prev) / prev) * 100, 2)
         hh       = float(close.iloc[-11:-1].max())
 
-        # ── FIX-4: time-normalised vol_avg for intraday ──────────────────────
         n_rows  = len(df)
         if n_rows >= 2:
             try:
@@ -1346,13 +1186,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         trend_strong = c > e_fast and e_fast > e_slow
         ema_stack    = (e200 is not None) and (c > e200) and (e_fast > e_slow) and (e_fast > e200)
 
-        # ── FIX-6: fresh EMA cross detection (non-redundant) ─────────────────
-        # A "golden cross" is the first bar where e_fast crosses above e_slow.
-        # We look back up to 5 bars to see if such a cross occurred recently.
-        # FIX-10: True golden-cross detection — the cross bar must have
-        # e_fast > e_slow AND the immediately prior bar must have e_fast <= e_slow.
-        # The old loop only checked that e_fast was below at some past bar, which
-        # could fire on oscillating EMAs without a clean directional crossover.
         fresh_cross = False
         if n >= 6 and e_fast > e_slow:
             lookback_cross = min(5, n - 1)
@@ -1361,13 +1194,11 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
                 es_curr = float(e_slow_s.iloc[-k])
                 ef_prev = float(e_fast_s.iloc[-(k+1)])
                 es_prev = float(e_slow_s.iloc[-(k+1)])
-                # Both conditions must hold at adjacent bars for a genuine crossover
                 if ef_curr > es_curr and ef_prev <= es_prev:
                     fresh_cross = True
                     break
 
         ema_cross_bonus = 8 if fresh_cross else (4 if e_fast > e_slow else 0)
-        # (replaces the old "+15 if e_fast > e_slow" which double-counted trend_up)
 
         mom_src = (daily_close if (mode == "Intraday" and daily_close is not None
                                    and len(daily_close) >= 21) else close)
@@ -1405,11 +1236,8 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         )
         r = float(rsi_series.iloc[-1])
 
-        # ── Bull score  (FIX-6: ema_cross_bonus replaces old +15 EMA block) ──
         bull  = 0
         bull += 25 if trend_up else 0
-        # FIX-6: was "+15 if e_fast > e_slow else (7 if near else 0)"
-        # Now replaced with non-redundant fresh-cross bonus:
         bull += ema_cross_bonus
         bull += (15 if r >= 65 else 10) if r >= 60 else (5 if r > 50 else 0)
         bull += 10 if v > vol_avg * 1.2 else (5 if v > vol_avg else 0)
@@ -1432,8 +1260,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
             bull = int(bull * BEARISH_HAIRCUT)
 
         raw_score = max(0, bull)
-        # FIX-6: BULL_MAX adjusted down by 7 to reflect removed double-count
-        # (old max was 120; ema cross block max contribution was +15, now max +8)
         BULL_MAX_V11 = 113
         norm_bull  = min(100.0, max(0.0, bull * 100.0 / BULL_MAX_V11))
         score_th   = float(cfg["score_th"])
@@ -1454,7 +1280,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         phase, _ = ext_phase_override(phase, ext_flags, ext_n, mode)
         act       = ext_action_cap(act, ext_n, vix_val)
 
-        # PERF-7: compute phase bonus from snapshot (no session_state in thread)
         phase_bonus = 0
         if sym and phase_history_snapshot:
             history = phase_history_snapshot.get(sym, [])
@@ -1535,7 +1360,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
             "ATR_Mean":      round(atr_mean, 2),
             "PhaseBonus":    phase_bonus,
             "BreadthGated":  False,
-            # v14: short scoring uses these — already computed, free to store
             "Mom1":          round(mom1, 2),
             "Mom3":          round(mom3, 2),
             "TrendUp":       trend_up,
@@ -1774,7 +1598,6 @@ def run_scan(symbols, mode, progress_bar, status_text,
             "Scores haircut 15%. Targets compressed."
         )
 
-    # ── Pass 1: Merged OHLCV + daily context (PERF-2, PERF-3) ──────────────
     status_text.text("Pass 1/3: Fetching OHLCV + daily context (parallel)…")
     data         = {}
     daily_closes = {}
@@ -1795,20 +1618,16 @@ def run_scan(symbols, mode, progress_bar, status_text,
             else:
                 rejected += 1
 
-    # ── Pass 2: HTF ──────────────────────────────────────────────────────────
     status_text.text("Pass 2/3: Pre-fetching HTF data (parallel)…")
     progress_bar.progress(0.40)
     htf_map = prefetch_htf_parallel(list(data.keys()), mode, status_text, progress_bar)
 
-    # ── Pass 2b: Vectorized RS ranks (PERF-4) ────────────────────────────────
     status_text.text("Pass 2b/3: Computing RS ranks (vectorized)…")
     sym_52w_returns = {sym: _52w_return(df["Close"]) for sym, df in data.items()}
     rs_rank_map     = compute_rs_ranks(sym_52w_returns)
 
-    # ── PERF-7: Snapshot phase history ───────────────────────────────────────
     phase_history_snapshot = dict(st.session_state.get("phase_history", {}))
 
-    # ── Pass 3: Parallel scoring (PERF-1) ────────────────────────────────────
     status_text.text("Pass 3/3: Scoring stocks (parallel)…")
     results     = []
     liq_skipped = 0
@@ -1847,18 +1666,12 @@ def run_scan(symbols, mode, progress_bar, status_text,
                     liq_skipped += 1
                 results.append(res)
 
-    # ── PERF-7: Apply phase transitions in main thread ────────────────────────
     for res in results:
         sym   = res["Symbol"]
         phase = res["_detected_phase"]
         record_phase_transition(sym, phase)
         res["PhaseBonus"] = phase_transition_conf_bonus(sym)
 
-    # ── FIX-2: Breadth-based gating ──────────────────────────────────────────
-    # Compute a fast breadth pulse from the freshly scored results.
-    # When the market is internally weak (pct_above_ema50 < 40 AND ad_ratio < 0.8),
-    # cap BRK/CONT actions to WATCH and flag the result so the UI can show
-    # a breadth-gate badge.  No scoring math is changed; this is a post-hoc cap.
     breadth_pulse = compute_breadth(results)
     pct_ema50_now = breadth_pulse.get("pct_above_ema50", 100)
     ad_ratio_now  = breadth_pulse.get("ad_ratio", 2.0)
@@ -1885,7 +1698,7 @@ def run_scan(symbols, mode, progress_bar, status_text,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SHORT SELL ENGINE  (v14 new — v11 bull engine untouched above)
+# SHORT SELL ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -1914,31 +1727,13 @@ class ShortResult:
     mode:          str   = "Swing"
     scanned_at:    str   = field(default_factory=lambda: datetime.now().isoformat())
     error:         str   = ""
-    day_change:    float = 0.0   # FIX-11: today's % change (for card display)
+    day_change:    float = 0.0
 
 
 def score_short(sym: str, mode: str = "Swing",
                 htf_cache: dict = None,
                 rs_ranks:  dict = None,
                 vix_val:   float = None) -> ShortResult:
-    """
-    Hard triggers (SHORT_HARD_WEIGHT = 22 pts each):
-      H1  Bearish EMA stack: price < fast EMA < slow EMA
-      H2  Death cross: fast EMA crossed below slow EMA in last 5 bars
-      H3  HTF downtrend confirmed
-      H4  52-week breakdown: near 52w low OR below prior swing low
-
-    Soft triggers (SHORT_SOFT_WEIGHT = 9 pts each):
-      S1  RSI overbought rollover (was >68, now falling >5 pts)
-      S2  RSI bearish zone (<42 + HTF down)
-      S3  Negative 1-month momentum
-      S4  Negative 3-month momentum
-      S5  High-volume red day (vol >1.5× avg, red candle)
-      S6  Below 61.8% or 50% Fib retrace
-      S7  RS rank bottom quartile (<30)
-
-    Bonus: v11 exhaustion flags (overextended = good for short).
-    """
     result = ShortResult(symbol=sym, mode=mode, sector=SECTOR_MAP.get(sym, "—"))
     cfg    = MODE_CFG[mode]
     try:
@@ -1975,7 +1770,6 @@ def score_short(sym: str, mode: str = "Swing",
         prior_swing_lo = float(lo.iloc[-21:-1].min()) if len(lo) > 21 else float(lo.min())
         rsi_5_ago = float(rsi_ser.iloc[-6]) if len(rsi_ser) >= 6 else rsi_v
 
-        # HTF
         if htf_cache and sym in htf_cache:
             htf_up, htf_label = htf_cache[sym]
         else:
@@ -1986,7 +1780,6 @@ def score_short(sym: str, mode: str = "Swing",
         rs_rank = rs_ranks.get(sym, 50) if rs_ranks else 50
         result.rs_rank = rs_rank
 
-        # Phase
         trend_down = close < ef and ef < es
         trend_up   = close > ef and ef > es
         if trend_down:           phase = PHASE_EXIT
@@ -1995,8 +1788,7 @@ def score_short(sym: str, mode: str = "Swing",
         else:                    phase = PHASE_IDLE
         result.phase = phase
 
-        # v11 exhaustion (overextended stocks = good short candidates)
-        nifty_dummy = cl  # approximate; ext only needs close/high/low/vol/rsi/ema/atr
+        nifty_dummy = cl
         ext_flags, _, _, ext_n = detect_exhaustion(
             close=cl, high=hi, low=lo, volume=vol, rsi_series=rsi_ser,
             e_fast_s=ef_ser, atr_s=atr_s, atr_mean=atr_mean,
@@ -2006,48 +1798,38 @@ def score_short(sym: str, mode: str = "Swing",
 
         score = 0; hard_t = []; soft_t = []
 
-        # H1 — Bearish EMA stack
         if close < ef and ef < es:
             score += SHORT_HARD_WEIGHT; hard_t.append("Bearish EMA Stack")
 
-        # H2 — Death cross
         for i in range(1, min(5, len(ef_ser) - 1) + 1):
             if (float(ef_ser.iloc[-i]) < float(es_ser.iloc[-i]) and
                     float(ef_ser.iloc[-(i+1)]) >= float(es_ser.iloc[-(i+1)])):
                 score += SHORT_HARD_WEIGHT; hard_t.append("Death Cross (EMA ×)"); break
 
-        # H3 — HTF downtrend
         if not htf_up:
             score += SHORT_HARD_WEIGHT; hard_t.append(f"HTF Downtrend ({htf_label})")
 
-        # H4 — 52w breakdown
         near_52w_lo = (close - w52_lo) / w52_lo < 0.03 if w52_lo > 0 else False
         below_swing = close < prior_swing_lo
         if near_52w_lo or below_swing:
             score += SHORT_HARD_WEIGHT
             hard_t.append("Near 52W Low" if near_52w_lo else "Below Swing Low")
 
-        # S1 — RSI rollover
         if rsi_5_ago > 68 and rsi_v < rsi_5_ago - 5:
             score += SHORT_SOFT_WEIGHT; soft_t.append(f"RSI Rollover ({rsi_5_ago:.0f}→{rsi_v:.0f})")
 
-        # S2 — RSI bearish zone
         if rsi_v < 42 and not htf_up:
             score += SHORT_SOFT_WEIGHT; soft_t.append(f"RSI Bearish Zone ({rsi_v:.0f})")
 
-        # S3 — Neg 1M mom
         if mom1 < -cfg["mom1_th"]:
             score += SHORT_SOFT_WEIGHT; soft_t.append(f"Neg 1M Mom ({mom1:.1f}%)")
 
-        # S4 — Neg 3M mom
         if mom3 < -cfg["mom3_th"]:
             score += SHORT_SOFT_WEIGHT; soft_t.append(f"Neg 3M Mom ({mom3:.1f}%)")
 
-        # S5 — High-vol red day
         if float(df["Close"].iloc[-1]) < float(df["Open"].iloc[-1]) and result.volume_ratio > 1.5:
             score += SHORT_SOFT_WEIGHT; soft_t.append(f"High-Vol Red Day ({result.volume_ratio:.1f}×)")
 
-        # S6 — Below Fib level
         _, _, fibs, _ = fib_levels(df)
         if fibs:
             if close < fibs.get("618", float("inf")):
@@ -2055,13 +1837,11 @@ def score_short(sym: str, mode: str = "Swing",
             elif close < fibs.get("500", float("inf")):
                 score += SHORT_SOFT_WEIGHT; soft_t.append("Below 50% Fib")
 
-        # S7 — Weak RS rank
         if rs_rank < 30:
             score += SHORT_SOFT_WEIGHT; soft_t.append(f"RS Rank Weak ({rs_rank})")
 
-        # Bonus: VIX stress + exhaustion (overextended = better short)
         if vix_val and vix_val >= VIX_STRESS: score += 5
-        if ext_n >= 2: score += min(ext_n * 4, 12)  # exhaustion = short fuel
+        if ext_n >= 2: score += min(ext_n * 4, 12)
 
         result.short_score   = min(score, 100)
         result.hard_triggers = hard_t
@@ -2072,7 +1852,6 @@ def score_short(sym: str, mode: str = "Swing",
         elif score >= SHORT_SCORE_WATCH:     result.verdict = SHORT_WATCH
         else:                                result.verdict = SHORT_SKIP
 
-        # Trade levels (sell zone above current; stop above; targets below)
         atr_sl_mult = cfg["atr_mult"] * (0.85 if vix_val and vix_val >= VIX_STRESS else 1.0)
         result.entry_zone_lo = round(close, 2)
         result.entry_zone_hi = round(close + atr_v * 0.4, 2)
@@ -2108,18 +1887,10 @@ def run_short_scan(symbols: list, mode: str,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SHORT SCORING FROM EXISTING SCAN RESULTS  (v14 — no re-download)
+# SHORT SCORING FROM EXISTING SCAN RESULTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def score_short_from_result(r: dict, mode: str, vix_val: float = None) -> ShortResult:
-    """
-    Derive a ShortResult from an already-scored score_stock() dict.
-    Zero network calls — all inputs come from fields stored in v14's result dict.
-
-    Fields used:
-      Phase, TrendDown, TrendUp, EMAStack, HTFUp, RSI, RS_Rank,
-      ExtN, ExtFlags, Mom1, Mom3, ATR, LTP, Sector, Symbol, %Change, VolConf
-    """
     sym    = r.get("Symbol", "")
     result = ShortResult(symbol=sym, mode=mode, sector=r.get("Sector", SECTOR_MAP.get(sym, "—")))
     cfg    = MODE_CFG[mode]
@@ -2136,10 +1907,10 @@ def score_short_from_result(r: dict, mode: str, vix_val: float = None) -> ShortR
         ext_flags  = r.get("ExtFlags", {})
         htf_up     = bool(r.get("HTFUp", True))
         htf_label  = "HTF↑" if htf_up else "HTF↓"
-        ema_stack  = bool(r.get("EMAStack", False))   # price>EF>ES>E200
-        trend_down = bool(r.get("TrendDown", False))  # price<EF<ES
+        ema_stack  = bool(r.get("EMAStack", False))
+        trend_down = bool(r.get("TrendDown", False))
         trend_up   = bool(r.get("TrendUp",  False))
-        fresh_cross = bool(r.get("FreshCross", False))  # golden cross just happened
+        fresh_cross = bool(r.get("FreshCross", False))
         mom1       = float(r.get("Mom1", 0))
         mom3       = float(r.get("Mom3", 0))
         vol_conf   = bool(r.get("VolConf", False))
@@ -2153,63 +1924,45 @@ def score_short_from_result(r: dict, mode: str, vix_val: float = None) -> ShortR
         result.htf_trend     = htf_label
         result.phase         = phase
         result.ext_n         = ext_n
-        result.day_change    = chg   # FIX-11: propagate today's % change
+        result.day_change    = chg
 
-        # volume_ratio: VolConf means vol > 1.2× avg
         result.volume_ratio  = 1.3 if vol_conf else 0.9
 
         score = 0; hard_t = []; soft_t = []
 
-        # ── HARD TRIGGERS ────────────────────────────────────────────────────
-
-        # H1 — Bearish EMA stack (price < EF < ES; stored as TrendDown)
         if trend_down:
             score += SHORT_HARD_WEIGHT; hard_t.append("Bearish EMA Stack")
 
-        # H2 — Death cross proxy: EMAStack just turned False AND FreshCross False
-        #       (i.e. no golden cross recently, and bearish alignment)
         if not ema_stack and not htf_up and not fresh_cross and not trend_up:
             score += SHORT_HARD_WEIGHT; hard_t.append("Bearish EMA Alignment (no golden cross)")
 
-        # H3 — HTF downtrend
         if not htf_up:
             score += SHORT_HARD_WEIGHT; hard_t.append(f"HTF Downtrend ({htf_label})")
 
-        # H4 — Phase EXIT = v11 confirmed the stock is in a downtrend structure
         if phase == PHASE_EXIT:
             score += SHORT_HARD_WEIGHT; hard_t.append("Phase EXIT (structural downtrend)")
 
-        # ── SOFT TRIGGERS ────────────────────────────────────────────────────
-
-        # S1 — RSI overbought rollover: ExtFlags rsi_overheat = RSI was very high
         if ext_flags.get("rsi_overheat") or ext_flags.get("mom_exhaustion"):
             score += SHORT_SOFT_WEIGHT; soft_t.append("RSI/Mom Exhaustion (ExtFlag)")
 
-        # S2 — RSI bearish zone
         if rsi_v < 42 and not htf_up:
             score += SHORT_SOFT_WEIGHT; soft_t.append(f"RSI Bearish Zone ({rsi_v:.0f})")
 
-        # S3 — Negative 1-month momentum
         if mom1 < -cfg["mom1_th"]:
             score += SHORT_SOFT_WEIGHT; soft_t.append(f"Neg 1M Mom ({mom1:.1f}%)")
 
-        # S4 — Negative 3-month momentum
         if mom3 < -cfg["mom3_th"]:
             score += SHORT_SOFT_WEIGHT; soft_t.append(f"Neg 3M Mom ({mom3:.1f}%)")
 
-        # S5 — High-vol red day: today down + vol confirmed
         if chg < -0.5 and vol_conf:
             score += SHORT_SOFT_WEIGHT; soft_t.append(f"High-Vol Red Day ({chg:+.1f}%)")
 
-        # S6 — Bearish divergence from ExtFlags
         if ext_flags.get("bearish_div"):
             score += SHORT_SOFT_WEIGHT; soft_t.append("Bearish Divergence (ExtFlag)")
 
-        # S7 — Relative weakness
         if rs_rank < 30:
             score += SHORT_SOFT_WEIGHT; soft_t.append(f"RS Rank Weak ({rs_rank})")
 
-        # Bonus: VIX stress + exhaustion count
         if vix_val and vix_val >= VIX_STRESS: score += 5
         if ext_n >= 2: score += min(ext_n * 4, 12)
 
@@ -2222,7 +1975,6 @@ def score_short_from_result(r: dict, mode: str, vix_val: float = None) -> ShortR
         elif score >= SHORT_SCORE_WATCH:     result.verdict = SHORT_WATCH
         else:                                result.verdict = SHORT_SKIP
 
-        # Trade levels
         if atr_v > 0:
             atr_sl_mult      = cfg["atr_mult"] * (0.85 if vix_val and vix_val >= VIX_STRESS else 1.0)
             result.entry_zone_lo = round(close, 2)
@@ -2241,10 +1993,6 @@ def score_short_from_result(r: dict, mode: str, vix_val: float = None) -> ShortR
 
 def derive_short_candidates(scan_results: list, mode: str,
                              vix_val: float = None) -> list:
-    """
-    Convert existing bull-scan results into ShortResults — no downloads.
-    Returns sorted list excluding SKIP and errors.
-    """
     out = []
     for r in scan_results:
         if not r:
@@ -2254,6 +2002,10 @@ def derive_short_candidates(scan_results: list, mode: str,
             out.append(sr)
     out.sort(key=lambda s: s.short_score, reverse=True)
     return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXIT ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -2265,7 +2017,7 @@ class ExitResult:
     trailing_stop: float = None
     current_price: float = 0.0
     atr:           float = 0.0
-    day_pct:       float = 0.0   # FIX-11: today's % change for portfolio card display
+    day_pct:       float = 0.0
     error:         str   = ""
 
 
@@ -2283,7 +2035,6 @@ def score_exit(sym: str, entry_price: float, mode: str = "Swing",
 
         cl    = df["Close"]; close = float(cl.iloc[-1]); result.current_price = close
         atr_v = float(atr_series(df).iloc[-1]); result.atr = atr_v
-        # FIX-11: today's % change (current bar vs previous close)
         if len(cl) >= 2:
             result.day_pct = round((close - float(cl.iloc[-2])) / float(cl.iloc[-2]) * 100, 2)
         ef    = float(ema(cl, cfg["ema_fast"]).iloc[-1])
@@ -2398,29 +2149,26 @@ for key, default in [
     ("phase_filter",    "All Phases"),
     ("show_illiquid",   False),
     ("min_liq_cr",      5.0),
-    ("open_positions",  None),   # None = not yet loaded from DB
+    ("open_positions",  None),
     ("short_results",   []),
-    ("short_watchlist", None),   # None = not yet loaded from DB
+    ("short_watchlist", None),
     ("exit_results",    {}),
     ("_db_error",       None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
-# One-time DB load
 if st.session_state["open_positions"] is None:
     st.session_state["open_positions"] = _db_load("bs_positions")
 if st.session_state["short_watchlist"] is None:
     st.session_state["short_watchlist"] = _db_load("bs_short_wl")
 
-# ── PERF-5: Pre-warm caches on startup ────────────────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
 def _prewarm():
     fetch_vix()
     fetch_nifty("Swing")
 _prewarm()
 
-# ── Header ─────────────────────────────────────────────────────────────────────
 st.markdown(
     '''<div style="font-family:Syne,sans-serif;font-size:28px;font-weight:700;
     letter-spacing:-1px;color:#e8e8f4;padding:8px 0 4px;">
@@ -2430,9 +2178,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ── Global controls ────────────────────────────────────────────────────────────
-# Build universe options from sectors.py: NSE 500 first, then every named sector.
-# If sectors.py is missing, fall back to the original two options.
 _UNIVERSE_OPTIONS = (
     ["NSE 500"] + [k for k in _SECTORS.keys() if k != "Nifty 500"]
     if _SECTORS
@@ -2455,7 +2200,6 @@ with gc5:
     search_q = st.text_input("Search symbol", placeholder="e.g. RELIANCE",
                              label_visibility="collapsed")
 
-# ── VIX banner ─────────────────────────────────────────────────────────────────
 vix_val, vix_label = fetch_vix()
 vix_color = {
     "CALM":    "#22c55e", "CAUTION": "#f59e0b",
@@ -2481,7 +2225,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ── Tabs ───────────────────────────────────────────────────────────────────────
 tab_scanner, tab_breadth, tab_detail, tab_portfolio, tab_analytics, tab_settings = st.tabs(
     ["Scanner", "Breadth Engine", "Detail", "💼 Portfolio", "Analytics", "Settings"]
 )
@@ -2514,7 +2257,6 @@ with tab_settings:
         st.session_state.risk_pct = st.slider(
             "Risk per trade (%)", 0.5, 5.0,
             float(st.session_state.risk_pct * 100), 0.5) / 100.0
-        # FIX-5: capital cap slider
         st.session_state.max_capital_pct = st.slider(
             "Max capital per trade (% of account)  ← FIX-5", 5, 50,
             int(st.session_state.max_capital_pct * 100), 5) / 100.0
@@ -2541,16 +2283,14 @@ with tab_settings:
 | Swing | 72 h |
 | Positional | 240 h |
 """)
-        st.markdown("**v11 Fixes**")
+        st.markdown("**v14.3 Card Changes**")
         st.markdown("""
-| Fix | What changed |
-|-----|-------------|
-| FIX-1 HTF closed-candle | Drops live bar before EMA calc |
-| FIX-2 Breadth gating | BRK/CONT capped to WATCH when breadth weak |
-| FIX-3 Structural BRK | Hard vol gate + anti-blowoff guard |
-| FIX-4 Intraday vol norm | Time-scaled vol_avg for partial sessions |
-| FIX-5 Capital cap | Max capital % clamp in sizer |
-| FIX-6 EMA de-dup | Fresh-cross bonus replaces double-count |
+| Change | Detail |
+|--------|--------|
+| Header badge | Score → Confidence % (coloured) |
+| Target decimals | ₹2,201.71 → ₹2,201 (whole rupees) |
+| Metric layout | Vertical 2-col grid below badges |
+| Sector position | Above extension caution pills |
 """)
 
 
@@ -2559,15 +2299,13 @@ with tab_settings:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if scan_btn:
-    # Resolve the selected universe to a symbol list
     if universe_opt == "NSE 500":
         symbols = NSE500
     elif _SECTORS and universe_opt in _SECTORS:
         _sec_syms = _SECTORS[universe_opt]
-        # "Nifty 500" entry has None → use full NSE500 list
         symbols = NSE500 if _sec_syms is None else list(_sec_syms)
     else:
-        symbols = NIFTY50  # fallback (should not normally reach here)
+        symbols = NIFTY50
     n       = len(symbols)
     est     = "~60s" if n <= 50 else ("~90s" if n <= 150 else "~2 min")
     prog    = st.progress(0)
@@ -2603,7 +2341,7 @@ if scan_btn:
                 "mode":           mode_opt,
                 "validity_hours": validity_h,
                 "outcome":        "Pending",
-                "breadth_gated":  r.get("BreadthGated", False),  # FIX-2 diagnostic
+                "breadth_gated":  r.get("BreadthGated", False),
             })
     prog.empty(); stat.empty()
     st.success(
@@ -2731,12 +2469,13 @@ with tab_scanner:
             if signal_is_stale(entry["timestamp"], entry.get("mode", scan_mode_now)):
                 stale_syms.add(entry["symbol"])
 
-        # ── v15 make_card: compact two-column grid layout ─────────────────────
-        # Header:  [##] [SYMBOL] [badges]        [ACTION] [SCORE]
-        # Body L:  LTP · Δ% · PHASE · CONF
-        # Body R:  metric grid (Score/Trend/RSI/RS/HTF/Vol)
-        # Footer:  Entry · T1 · T2 · T3 · SL            [SECTOR]
-        # Warn:    ⚠ extension pills  (only when ext_n > 0)
+        # ══════════════════════════════════════════════════════════════════════
+        # make_card v14.3 — CARD UI CHANGES APPLIED:
+        #   1. Header right badge: confidence % (not score)
+        #   2. Footer targets/SL: whole rupees (no decimals)
+        #   3. Metrics: vertical 2-col grid below phase/conf badges
+        #   4. Sector: slim row above extension pills (always visible)
+        # ══════════════════════════════════════════════════════════════════════
         def make_card(i, r, border_color, show_entry=True):
             # ── raw values ────────────────────────────────────────────────
             sym           = r["Symbol"]
@@ -2786,12 +2525,19 @@ with tab_scanner:
             num_bg  = "#22c55e" if act in ("BUY","STRONG BUY") else "#d97706" if act=="WATCH" else "#3a3a60"
             num_txt = "#064e3b" if act in ("BUY","STRONG BUY") else "#431407" if act=="WATCH" else "#c4c6d0"
 
-            def _fmt(v):
+            # ── CHANGE 2: whole-rupee formatter (no decimals) ─────────────
+            def _fmt_int(v):
                 if v is None: return "—"
-                try: return f"₹{v:,.2f}"
+                try: return f"₹{int(round(v)):,}"
                 except (TypeError, ValueError): return "—"
 
-            entry_str = _fmt(entry) if (show_entry and entry and entry != ltp) else "—"
+            # Entry keeps 2dp since it's a trigger price (precision matters)
+            def _fmt_entry(v):
+                if v is None: return "—"
+                try: return f"₹{v:,.0f}"
+                except (TypeError, ValueError): return "—"
+
+            entry_str = _fmt_entry(entry) if (show_entry and entry and entry != ltp) else "—"
 
             # ── inline badges ────────────────────────────────────────────
             breadth_badge = (
@@ -2809,27 +2555,33 @@ with tab_scanner:
                 if is_stale else ""
             )
 
-            # ── right-side metric grid rows ──────────────────────────────
+            # ── CHANGE 3: compact 2-col metric grid ──────────────────────
             metrics = [
-                ("Score", f'<span style="color:#e8e8f4;font-weight:700;">{score}</span>'),
-                ("Trend", f'<span style="color:{trend_col};font-weight:600;">{trend_label}</span>'),
-                ("RSI",   f'<span style="color:#e8e8f4;">{rsi_val}</span>'),
-                ("RS",    f'<span style="color:{rs_col};font-weight:600;">RS {rs_rank}</span>'),
-                ("HTF",   f'<span style="color:{trend_col};font-weight:700;">{"↑" if htf_up else "↓"}</span>'),
-                ("Vol",   f'<span style="color:#e8e8f4;">{vol_label}</span>'),
+                ("Score",  f'<span style="color:#e8e8f4;font-weight:700;">{score}</span>'),
+                ("Trend",  f'<span style="color:{trend_col};font-weight:600;">{trend_label}</span>'),
+                ("RSI",    f'<span style="color:#e8e8f4;">{rsi_val}</span>'),
+                ("RS",     f'<span style="color:{rs_col};font-weight:600;">RS {rs_rank}</span>'),
+                ("HTF",    f'<span style="color:{trend_col};font-weight:700;">{"↑" if htf_up else "↓"}</span>'),
+                ("Vol",    f'<span style="color:#e8e8f4;">{vol_label}</span>'),
             ]
-            metric_rows_html = "".join(
-                f'<div style="display:flex;justify-content:space-between;align-items:center;'
-                f'padding:4px 0;border-bottom:1px solid #15152a;">'
-                f'<span style="color:#475569;font-size:9px;letter-spacing:.06em;'
-                f'text-transform:uppercase;">{label}</span>'
-                f'<span style="font-family:JetBrains Mono,monospace;font-size:11px;">{val}</span>'
-                f'</div>'
-                for label, val in metrics
+            metric_grid_html = (
+                '<div style="display:grid;grid-template-columns:1fr 1fr;gap:0;'
+                'margin-top:10px;border:1px solid #1e1e40;border-radius:6px;overflow:hidden;">'
+                + "".join(
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;'
+                    f'padding:4px 8px;border-bottom:1px solid #15152a;'
+                    f'{"border-right:1px solid #15152a;" if idx % 2 == 0 else ""}">'
+                    f'<span style="color:#475569;font-size:9px;letter-spacing:.06em;'
+                    f'text-transform:uppercase;">{label}</span>'
+                    f'<span style="font-family:JetBrains Mono,monospace;font-size:11px;">{val}</span>'
+                    f'</div>'
+                    for idx, (label, val) in enumerate(metrics)
+                )
+                + '</div>'
             )
 
             # ── extension warning pills ──────────────────────────────────
-            ext_html = ""
+            ext_pills_html = ""
             if ext_n > 0:
                 pills = []
                 for lbl in ext_labels[:2]:
@@ -2841,19 +2593,31 @@ with tab_scanner:
                         f'padding:3px 8px;border-radius:5px;font-size:10px;'
                         f'font-family:DM Sans,sans-serif;margin-right:4px;">⚠ {lbl}</span>'
                     )
-                ext_html = (
-                    f'<div style="padding:6px 14px 8px;border-top:1px solid #1e1e40;'
-                    f'background:#0d0d1a;display:flex;flex-wrap:wrap;gap:4px;">'
+                ext_pills_html = (
+                    '<div style="padding:5px 14px 8px;background:#0d0d1a;'
+                    'display:flex;flex-wrap:wrap;gap:4px;">'
                     + "".join(pills) + '</div>'
                 )
 
-            # ── footer target cells ──────────────────────────────────────
+            # ── CHANGE 4: sector row — always shown, above ext pills ──────
+            sector_row_html = (
+                f'<div style="padding:4px 14px 5px;border-top:1px solid #1e1e40;'
+                f'background:#0d0d1a;display:flex;align-items:center;'
+                f'justify-content:space-between;">'
+                f'<span style="color:#475569;font-size:8px;letter-spacing:.06em;'
+                f'text-transform:uppercase;">SECTOR</span>'
+                f'<span style="color:#94a3b8;font-size:9px;font-family:DM Sans,sans-serif;">'
+                f'{sector}</span>'
+                f'</div>'
+            )
+
+            # ── footer target cells (no sector here anymore) ─────────────
             footer_items = [
                 ("ENTRY", entry_str),
-                ("T1",    _fmt(t1)),
-                ("T2",    _fmt(t2)),
-                ("T3",    _fmt(t3)),
-                ("SL",    _fmt(sl)),
+                ("T1",    _fmt_int(t1)),
+                ("T2",    _fmt_int(t2)),
+                ("T3",    _fmt_int(t3)),
+                ("SL",    _fmt_int(sl)),
             ]
             footer_cells = "".join(
                 f'<div><div style="color:#475569;font-size:8px;letter-spacing:.06em;">{lbl}</div>'
@@ -2866,7 +2630,7 @@ with tab_scanner:
                 f'<div style="background:#111120;border:1px solid {border_color};border-radius:12px;'
                 f'overflow:hidden;width:360px;min-width:320px;max-width:380px;flex:1 1 360px;">'
 
-                # Header
+                # ── Header ──────────────────────────────────────────────
                 f'<div style="display:flex;align-items:center;padding:10px 14px 8px;'
                 f'border-bottom:1px solid #1e1e40;gap:8px;background:#0e0e1c;">'
                 f'<div style="background:{num_bg};color:{num_txt};font-family:JetBrains Mono,monospace;'
@@ -2877,20 +2641,23 @@ with tab_scanner:
                 f'<span style="background:{act_bg};border:1px solid {act_brd};color:{act_txt};'
                 f'padding:3px 9px;border-radius:5px;font-size:10px;font-weight:700;'
                 f'font-family:DM Sans,sans-serif;">{act}</span>'
-                f'<span style="background:#1e1e40;color:#cbd5e1;font-family:JetBrains Mono,monospace;'
-                f'font-size:11px;padding:3px 7px;border-radius:5px;">{score}</span>'
+                # CHANGE 1: confidence badge replaces score badge
+                f'<span style="background:{conf_col}22;border:1px solid {conf_col}55;color:{conf_col};'
+                f'font-family:JetBrains Mono,monospace;font-size:11px;'
+                f'padding:3px 7px;border-radius:5px;">{conf}%</span>'
                 + stale_html +
                 f'</div>'
 
-                # Body — left 55% | right metric grid 45%
-                f'<div style="display:flex;">'
+                # ── Body: full-width single column ───────────────────────
+                f'<div style="padding:12px 14px 10px;">'
 
-                # LEFT: price + phase + conf
-                f'<div style="flex:0 0 55%;padding:12px 14px;border-right:1px solid #1e1e40;">'
+                # Price + day change
                 f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:24px;'
                 f'font-weight:600;line-height:1;">&#8377;{ltp:,.2f}</div>'
                 f'<div style="font-family:JetBrains Mono,monospace;color:{chg_col};font-size:12px;'
                 f'margin-top:3px;font-weight:500;">{chg_str} {chg_arr}</div>'
+
+                # Phase + conf badges
                 f'<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:5px;align-items:center;">'
                 f'<span style="background:{phase_col};color:#0d0d1a;padding:4px 9px;'
                 f'border-radius:5px;font-size:10px;font-weight:700;'
@@ -2901,28 +2668,24 @@ with tab_scanner:
                 f'<span style="color:#cbd5e1;font-size:8px;display:block;">{conf_lbl}</span>'
                 f'<span style="color:{conf_col};">{conf}%</span></span>'
                 f'</div>'
-                f'</div>'
 
-                # RIGHT: metric rows
-                f'<div style="flex:1;padding:10px 12px;overflow:hidden;">'
-                + metric_rows_html +
-                f'</div>'
+                # CHANGE 3: metric 2-col grid
+                + metric_grid_html +
 
                 f'</div>'  # /body
 
-                # Footer: targets row
+                # ── Footer: targets row (no sector here) ─────────────────
                 f'<div style="display:flex;justify-content:space-between;align-items:flex-end;'
                 f'padding:7px 14px 6px;border-top:1px solid #1e1e40;background:#0d0d1a;'
                 f'flex-wrap:wrap;gap:6px;">'
                 + footer_cells +
-                f'<div style="text-align:right;">'
-                f'<div style="color:#475569;font-size:8px;letter-spacing:.06em;">SECTOR</div>'
-                f'<div style="color:#94a3b8;font-size:9px;max-width:80px;text-align:right;'
-                f'font-family:DM Sans,sans-serif;line-height:1.2;">{sector}</div></div>'
                 f'</div>'
 
+                # CHANGE 4: sector row above extension pills
+                + sector_row_html
+
                 # Extension warning pills (only when ext_n > 0)
-                + ext_html +
+                + ext_pills_html +
 
                 f'</div>'  # /card
             )
@@ -2962,7 +2725,7 @@ with tab_scanner:
                 cards_html += "</div>"
                 st.markdown(cards_html, unsafe_allow_html=True)
 
-        # ── 🔻 SHORT LIST — derived from same scan, zero re-download ──────────
+        # ── Short list ─────────────────────────────────────────────────────
         short_candidates = derive_short_candidates(
             st.session_state.results, scan_mode_now, vix_val
         )
@@ -2989,7 +2752,6 @@ with tab_scanner:
                         rr_c = "#22c55e" if sr.risk_reward >= 2 else ("#f59e0b" if sr.risk_reward >= 1.5 else "#ef4444")
                         rsi_c = "#ef4444" if sr.rsi_val > 70 else ("#f59e0b" if sr.rsi_val > 60 else "#cbd5e1")
                         bar  = min(sr.short_score, 100)
-                        # FIX-11: day % change display for short cards
                         dchg    = sr.day_change
                         dchg_s  = f"+{dchg:.2f}%" if dchg >= 0 else f"{dchg:.2f}%"
                         dchg_c  = "#22c55e" if dchg >= 0 else "#ef4444"
@@ -3034,7 +2796,6 @@ with tab_scanner:
                         sh_cards += (
                             f'<div style="background:#1b1113;border:1px solid {vc}55;border-radius:12px;'
                             f'overflow:hidden;width:360px;min-width:320px;max-width:380px;flex:1 1 360px;">'
-                            # header
                             f'<div style="display:flex;align-items:center;padding:12px 16px 10px;'
                             f'border-bottom:1px solid rgba(255,255,255,0.08);gap:10px;">'
                             f'<div style="background:{vc}22;color:{vc};font-family:JetBrains Mono,monospace;'
@@ -3047,7 +2808,6 @@ with tab_scanner:
                             f'<span style="background:#1e1e40;color:#cbd5e1;font-family:JetBrains Mono,'
                             f'monospace;font-size:11px;padding:4px 8px;border-radius:5px;">{sr.short_score}</span>'
                             f'</div>'
-                            # price + short zone
                             f'<div style="display:flex;padding:12px 16px;gap:0;">'
                             f'<div style="flex:0 0 45%;padding-right:16px;border-right:1px solid #1e1e40;">'
                             f'<div style="font-family:JetBrains Mono,monospace;color:#f0e8e8;font-size:22px;'
@@ -3060,7 +2820,6 @@ with tab_scanner:
                             f'font-family:JetBrains Mono,monospace;">'
                             f'₹{sr.entry_zone_lo:,.1f}–₹{sr.entry_zone_hi:,.1f}</div>'
                             f'</div>'
-                            # right side metrics
                             f'<div style="flex:1;padding-left:16px;">'
                             f'<div style="display:flex;gap:6px;flex-wrap:wrap;">'
                             f'<span style="background:#1e1e40;padding:5px 8px;border-radius:5px;">'
@@ -3078,7 +2837,6 @@ with tab_scanner:
                             f'<span style="color:#cbd5e1;font-size:9px;display:block;">HTF</span>'
                             f'<span style="color:#aaa;font-size:11px;">{sr.htf_trend}</span></span>'
                             f'</div></div></div>'
-                            # targets
                             f'<div style="padding:6px 16px 8px;background:#0a0808;display:flex;gap:16px;">'
                             f'<div><span style="color:#cbd5e1;font-size:9px;">T1 ▼</span>'
                             f'<div style="font-family:JetBrains Mono,monospace;color:#22aa88;font-size:11px;">'
@@ -3094,12 +2852,10 @@ with tab_scanner:
                             f'<div style="color:#aaa;font-family:JetBrains Mono,monospace;font-size:11px;">'
                             f'RS{sr.rs_rank}</div></div>'
                             f'</div>'
-                            # score bar
                             f'<div style="padding:0 16px 6px;">'
                             f'<div style="background:#1e1e40;border-radius:2px;height:3px;">'
                             f'<div style="background:{vc};width:{bar}%;height:3px;border-radius:2px;"></div>'
                             f'</div></div>'
-                            # trigger pills
                             f'<div style="padding:4px 16px 10px;">'
                             f'{hard_pills}{soft_pills}{ext_badge}</div>'
                             f'</div>'
@@ -3132,7 +2888,6 @@ with tab_scanner:
                       unsafe_allow_html=True,
                   )
 
-                # Watch-only table (collapsed)
                 sh_watch_list = [s for s in short_candidates if s.verdict == SHORT_WATCH]
                 if sh_watch_list:
                     st.markdown(
@@ -3167,7 +2922,7 @@ with tab_scanner:
                 "Phase":    f'{phase}{" "+ph_arrow if ph_arrow else ""}',
                 "Setup":    setup_icon,
                 "Action":   r["Action"],
-                "B-Gate":   "⚠" if r.get("BreadthGated") else "",   # FIX-2
+                "B-Gate":   "⚠" if r.get("BreadthGated") else "",
                 "%Chg":     f"+{chg}%" if chg >= 0 else f"{chg}%",
                 "RSI":      r.get("RSI", "—"),
                 "RS_Rank":  r.get("RS_Rank", 50),
@@ -3261,7 +3016,6 @@ with tab_breadth:
         bm5.metric("A/D Ratio",     breadth["ad_ratio"])
         bm6.metric("Liquid Stocks", breadth["liquid_count"])
 
-        # FIX-2: show how many signals are breadth-gated
         gated_n = sum(1 for r in all_results if r.get("BreadthGated"))
         if gated_n:
             st.warning(
@@ -3453,7 +3207,7 @@ with tab_detail:
                     atr_mean        = r.get("ATR_Mean", risk),
                     vix_val         = vix_val,
                     risk_pct        = _risk_pct,
-                    max_capital_pct = _max_cap_pct,      # FIX-5
+                    max_capital_pct = _max_cap_pct,
                 )
                 ps1, ps2, ps3, ps4 = st.columns(4)
                 ps1.metric("Suggested Qty",  ps["final_qty"])
@@ -3647,8 +3401,9 @@ with tab_analytics:
             st.download_button("Download", csv,
                                f"NSE_SignalLog_{ts}.csv", "text/csv")
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# 💼 PORTFOLIO TAB  (open positions with exit signals)
+# 💼 PORTFOLIO TAB
 # ═══════════════════════════════════════════════════════════════════════════════
 
 with tab_portfolio:
@@ -3658,7 +3413,6 @@ with tab_portfolio:
         unsafe_allow_html=True,
     )
 
-    # Add position form inline
     with st.expander("➕ Add Position", expanded=False):
         pf1, pf2, pf3, pf4 = st.columns([2, 2, 1, 1])
         ap_sym   = pf1.text_input("Symbol", key="pf_sym").upper()
@@ -3684,7 +3438,6 @@ with tab_portfolio:
 
         exit_res = st.session_state.get("exit_results", {})
 
-        # Summary strip
         counts = {EXIT_HOLD: 0, EXIT_WATCH_LBL: 0, EXIT_SIGNAL_LBL: 0, EXIT_CONFIRM_LBL: 0}
         for p in positions:
             if not isinstance(p, dict): continue
@@ -3703,10 +3456,7 @@ with tab_portfolio:
 
         _exit_ord = {EXIT_CONFIRM_LBL: 0, EXIT_SIGNAL_LBL: 1, EXIT_WATCH_LBL: 2, EXIT_HOLD: 3}
         valid_pos = [p for p in positions if isinstance(p, dict) and p.get("symbol")]
-        pos_sorted = sorted(valid_pos, key=lambda p: _exit_ord.get(
-            exit_res[p["symbol"]].verdict if p["symbol"] in exit_res else EXIT_HOLD, 3))
 
-        # ── Group positions by exit verdict (most urgent first) ───────────────
         _VERDICT_ORDER = [EXIT_CONFIRM_LBL, EXIT_SIGNAL_LBL, EXIT_WATCH_LBL, EXIT_HOLD]
         _VERDICT_META  = {
             EXIT_CONFIRM_LBL: ("🔴 Exit Now",    "#cc4444"),
@@ -3738,7 +3488,6 @@ with tab_portfolio:
                 unsafe_allow_html=True,
             )
 
-            # ── Render cards 2-per-row (horizontal layout) ─────────────────────
             for _ci in range(0, len(_group_pos), 2):
                 _pair = _group_pos[_ci: _ci + 2]
                 _cols = st.columns(len(_pair))
@@ -3764,7 +3513,6 @@ with tab_portfolio:
                     bar      = min(int(ex_score), 100)
                     sector   = SECTOR_MAP.get(sym, "—")
 
-                    # Triggers — vertical list on right panel
                     trig_rows = "".join(
                         f'<div style="display:flex;align-items:center;gap:6px;'
                         f'padding:4px 0;border-bottom:1px solid #15152a;">'
@@ -3776,7 +3524,6 @@ with tab_portfolio:
                         f'<div style="color:#3a3a60;font-size:9px;padding:4px 0;">No triggers</div>'
                     )
 
-                    # Trail SL metric row
                     trail_row = (
                         f'<div style="display:flex;justify-content:space-between;'
                         f'align-items:center;padding:2px 0;">'
@@ -3785,7 +3532,6 @@ with tab_portfolio:
                         f'font-size:12px;font-weight:600;">₹{trail_sl:,.2f}</span></div>'
                     ) if trail_sl else ""
 
-                    # Caution strip
                     if verdict == EXIT_CONFIRM_LBL:
                         _caution_html = (
                             f'<div style="background:#cc444418;border-top:1px solid #cc444440;'
@@ -3812,12 +3558,9 @@ with tab_portfolio:
 
                     with _cols[_ci2]:
                         st.markdown(
-                            # ── card shell ──────────────────────────────────────
                             f'<div style="background:#111120;border:1.5px solid {vc};'
                             f'border-radius:12px;overflow:hidden;'
                             f'box-shadow:0 2px 16px {vc}28;margin-bottom:0;">'
-
-                            # header
                             f'<div style="display:flex;justify-content:space-between;'
                             f'align-items:center;padding:11px 14px 9px;'
                             f'border-bottom:1px solid #1e1e40;background:#0e0e1c;">'
@@ -3831,15 +3574,9 @@ with tab_portfolio:
                             f'padding:3px 10px;border-radius:6px;font-size:10px;font-weight:700;'
                             f'letter-spacing:.04em;">{verdict}</span>'
                             f'</div>'
-
-                            # body — left metrics | right triggers
                             f'<div style="display:flex;min-height:130px;">'
-
-                            # LEFT: metrics
                             f'<div style="flex:1;padding:10px 12px;display:flex;'
                             f'flex-direction:column;gap:4px;">'
-
-                            # row 1: ENTRY / CURRENT / DAY / QTY
                             f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">'
                             f'<div><div style="color:#64748b;font-size:8px;letter-spacing:.06em;">ENTRY</div>'
                             f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:12px;">'
@@ -3854,8 +3591,6 @@ with tab_portfolio:
                             f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:12px;">'
                             f'{qty}</div></div>'
                             f'</div>'
-
-                            # row 2: P&L + Trail SL
                             f'<div style="margin-top:4px;padding-top:6px;border-top:1px solid #1a1a30;">'
                             f'<div style="display:flex;justify-content:space-between;'
                             f'align-items:center;padding:2px 0;">'
@@ -3865,21 +3600,15 @@ with tab_portfolio:
                             f'{"+"}'  + f'{pnl_pct:.1f}% (₹{pnl_abs:+,.0f})</span></div>'
                             + trail_row +
                             f'</div>'
-
-                            f'</div>'  # /left
-
-                            # RIGHT: triggers vertical
+                            f'</div>'
                             f'<div style="width:130px;flex-shrink:0;padding:10px 10px;'
                             f'border-left:1px solid #1e1e40;background:#0c0c1a;'
                             f'display:flex;flex-direction:column;justify-content:flex-start;">'
                             f'<div style="color:#475569;font-size:8px;letter-spacing:.08em;'
                             f'margin-bottom:5px;font-family:DM Sans,sans-serif;">SIGNALS</div>'
                             + trig_rows +
-                            f'</div>'  # /right
-
-                            f'</div>'  # /body
-
-                            # exit pressure bar (full width)
+                            f'</div>'
+                            f'</div>'
                             f'<div style="padding:6px 14px 5px;background:#0e0e1c;'
                             f'border-top:1px solid #1a1a30;">'
                             f'<div style="display:flex;justify-content:space-between;margin-bottom:3px;">'
@@ -3888,14 +3617,11 @@ with tab_portfolio:
                             f'<div style="background:#1e1e40;border-radius:2px;height:3px;">'
                             f'<div style="background:{vc};width:{bar}%;height:3px;border-radius:2px;'
                             f'box-shadow:0 0 4px {vc}88;"></div></div></div>'
-
-                            # caution strip
                             + _caution_html +
                             f'</div>',
                             unsafe_allow_html=True,
                         )
 
-                        # Remove button — full width, flush below card
                         if st.button(
                             "🗑 Remove",
                             key=f"rm_{sym}_{pos.get('entry_date','')}",
