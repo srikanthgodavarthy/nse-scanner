@@ -1,5 +1,129 @@
 """BULL SUTRA Pro — v14.3
 ═══════════════════════════════════════════════════════════════════
+BASE: v14.2 — all FIX-1…FIX-12 100% preserved.
+NEW in v14.3:
+  • sectors.py FULLY INTEGRATED
+    — Imported at startup with graceful ImportError fallback.
+
+    — SECTOR_MAP rebuilt from sectors.py (symbol → sector name)
+      covering 300+ NSE stocks across 18 sectors instead of the
+      old 50-stock hardcoded dict with generic labels ("IT", "FMCG").
+      New labels match sectors.py: "IT & Technology",
+      "Banking & Finance", "Pharma & Healthcare", etc.
+
+    — NIFTY50 list replaced with sectors.py "Nifty 50" group,
+      which includes the current correct composition (ETERNAL,
+      JIOFIN, SHRIRAMFIN, LTIM) that was missing from the old
+      hardcoded list.
+
+    — Universe selector upgraded from a 2-option radio
+      ("NSE 500" / "Nifty 50") to a full selectbox showing
+      ALL sectors from sectors.py:
+        NSE 500, Nifty 50, Banking & Finance, IT & Technology,
+        Pharma & Healthcare, Auto & Auto Ancillaries,
+        FMCG & Consumer, Metals & Mining, Energy & Power,
+        Infrastructure & Construction, Real Estate,
+        Capital Goods & Engineering, Chemicals & Fertilizers,
+        Telecom & Media, Retail & E-Commerce,
+        Logistics & Shipping, Paints & Chemicals, Textiles, PSU.
+
+    — Symbol resolution: each sector maps to its stocks list
+      from sectors.py; "Nifty 500" (None) maps to NSE500.
+═══════════════════════════════════════════════════════════════════
+  • FIX-8  BREAKOUT CONFIDENCE DOUBLE-COUNT REMOVED
+    — "trend_up" removed from brk_weights; it was already captured by
+      "score_ok" (norm_bull awards +25 for trend_up, so both weights
+      fired together, over-counting trend strength by 0.35).
+    — Redistributed weight to orthogonal signals: price_above_high
+      raised to 0.35; compressed raised to 0.20.  Weights still sum 1.0.
+
+  • FIX-9  was_recent_brk VOLATILITY-SPIKE GUARD
+    — Added two new guards to prevent wick/spike candles from triggering
+      post-breakout suppression:
+        (a) CLOSE must also be above the rolling high, not just the wick.
+        (b) Body must be non-red (close >= open) — rules out reversal spikes.
+    — FIX-9 also fixes the VOLUME AVERAGE MISMATCH (Bug 3):
+      was_recent_brk now computes the rolling-20 volume average at bar[-k]
+      (using only bars prior to bar[-k]) instead of using today's vol_avg,
+      so the comparison is apples-to-apples with the historical bar's baseline.
+
+  • FIX-10 fresh_cross IS NOW A TRUE CROSSOVER DETECTOR
+    — Old loop: found any bar where EMA_fast was previously ≤ EMA_slow,
+      which could fire on oscillating EMAs without a genuine directional cross.
+    — New loop: requires that at bar[-k], EMA_fast > EMA_slow (above)
+      AND at bar[-(k+1)], EMA_fast ≤ EMA_slow (below).  Both adjacent-bar
+      conditions must hold simultaneously — a genuine golden-cross event.
+
+  • FIX-11 DAY % CHANGE ON ALL CARD TYPES
+    — Short cards: day_change field added to ShortResult; propagated from
+      %Change in score_short_from_result; displayed as color-coded ▲/▼
+      below the current price (matching bull scanner card style).
+    — Portfolio cards: day_pct field added to ExitResult; computed in
+      score_exit as (close − prev_close) / prev_close × 100; displayed
+      as "DAY" metric alongside ENTRY / CURRENT / QTY / P&L.
+
+  • FIX-12 PORTFOLIO CARD SIZES MATCH SCANNER
+    — Portfolio cards now use width:360px;min-width:320px;max-width:380px;
+      flex:1 1 360px — identical sizing to scanner cards.
+    — Each card is wrapped in a flex container so multiple cards
+      flow side-by-side on wide screens, matching the scanner layout.
+═══════════════════════════════════════════════════════════════════
+  • Short Sell Engine (score_short / run_short_scan)
+    — 4 hard triggers + 7 soft triggers, uses v11 detect_exhaustion
+  • "🔻 Short Scan" as a top-level tab (not buried in sub-tabs)
+  • Short cards use v11 JetBrains Mono dark style
+  • 💼 Portfolio tab: open positions with exit signals
+  • Supabase persistence (optional, silently skipped if no secret)
+  • v11 bull scoring math completely untouched
+═══════════════════════════════════════════════════════════════════
+FIXES FROM v10
+──────────────────────────
+FIX-1  CLOSED-CANDLE HTF ALIGNMENT
+        _htf_trend_from_df now drops the last (still-forming) bar
+        before computing EMAs, so a live intraday bar never
+        contaminates the higher-timeframe signal.
+
+FIX-2  BREADTH-BASED GATING
+        run_scan computes a quick breadth pulse after scoring.
+        When breadth is WEAK (pct_above_ema50 < 40 AND ad_ratio < 0.8)
+        stocks in PHASE_BRK / PHASE_CONT have their action capped to
+        WATCH and a "breadth_gated" flag is set on the result dict.
+        No scoring math changes; the gate is applied in the main thread.
+
+FIX-3  STRUCTURAL BREAKOUT FILTERING
+        detect_phase_and_entry now requires a breakout candle to clear
+        the rolling high by at least 0.15 × ATR (was 0.20 × ATR buf),
+        AND volume must exceed vol_avg × 1.5 (hard gate, not weighted).
+        Breakout is also rejected when the prior 3-bar range is already
+        expanded (atr_val > atr_mean × 1.4) — avoids chasing blowoffs.
+
+FIX-4  INTRADAY TIME-NORMALISED VOLUME
+        liquidity_ok and score_stock now compute vol_avg using only
+        bars from the current session so far when mode == "Intraday".
+        A helper _intraday_bars_elapsed() returns the fraction of the
+        trading session completed; volume is scaled to a full-session
+        equivalent before comparison, preventing false "volume spike"
+        signals early in the day.
+
+FIX-5  CAPITAL CAP IN POSITION SIZING
+        position_size now accepts a max_capital_pct parameter
+        (default 0.20 = 20 % of account).  final_qty is clamped so
+        that capital_used ≤ account_size × max_capital_pct, regardless
+        of how wide the stop is relative to account size.
+
+FIX-6  EMA DOUBLE-COUNTING REMOVED
+        In score_stock bull scoring the block
+            bull += 15 if e_fast > e_slow else (7 if e_fast > e_slow * 0.995 else 0)
+        was also fully captured by the trend_up / trend_strong flags
+        (which already require e_fast > e_slow).  The EMA cross line
+        is replaced with a tighter, non-overlapping bonus:
+            +8 if golden-cross within last 5 bars (fresh cross)
+            +4 if e_fast > e_slow but not a fresh cross
+            0  otherwise
+        trend_up (+25) and ema_stack (+15) remain unchanged.
+
+SPEED IMPROVEMENTS PRESERVED FROM v10
+──────────────────────────
 PERF-1  Parallel scoring (ThreadPoolExecutor, 32 workers)
 PERF-2  Merged OHLCV + daily context fetch
 PERF-3  No throttle sleep; 32 workers
@@ -321,7 +445,7 @@ def fmt(val):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HELPER — intraday time-normalised volume
+# FIX-4 HELPER — intraday time-normalised volume
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _session_elapsed_fraction() -> float:
@@ -339,7 +463,7 @@ def _session_elapsed_fraction() -> float:
 
 def _intraday_vol_avg(volume: pd.Series, bars_per_day: int) -> float:
     """
-    For intraday data, compute today's cumulative volume scaled to a
+    FIX-4: For intraday data, compute today's cumulative volume scaled to a
     full-session equivalent, then average with recent prior-day totals.
 
     - Collects full prior-day volumes (rolling sum of bars_per_day bars,
@@ -452,7 +576,7 @@ def liquidity_ok(df, min_cr=LIQUIDITY_MIN_CR, mode="Swing"):
         else:
             bars_per_day = 1
 
-        # Use time-normalised volume for intraday liquidity check
+        # FIX-4: use time-normalised volume for intraday liquidity check
         if mode == "Intraday" and bars_per_day > 1:
             avg_daily_vol = _intraday_vol_avg(df["Volume"], bars_per_day)
             avg_cr        = float(avg_daily_vol * float(df["Close"].iloc[-1])) / 1e7
@@ -466,7 +590,7 @@ def liquidity_ok(df, min_cr=LIQUIDITY_MIN_CR, mode="Swing"):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HTF — CACHED FETCH + TREND   (closed-candle only)
+# HTF — CACHED FETCH + TREND   (FIX-1: closed-candle only)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=900)
@@ -485,7 +609,7 @@ def _fetch_htf_cached(ticker: str, period: str, interval: str) -> pd.DataFrame:
 def _htf_trend_from_df(df: pd.DataFrame, mode: str):
 
     """
-    Use only CLOSED HTF candles.
+    FIX-1: Use only CLOSED HTF candles.
     Prevents repainting from partially formed HTF bars.
     """
 
@@ -621,13 +745,13 @@ def get_phase_arrow(sym: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# VOLATILITY-NORMALIZED POSITION SIZING  (with capital cap)
+# FIX-5  VOLATILITY-NORMALIZED POSITION SIZING  (with capital cap)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def position_size(account_size, entry, sl, atr_val, atr_mean, vix_val,
                   risk_pct=0.02, max_capital_pct=0.20):
     """
-    Added max_capital_pct (default 20 %).
+    FIX-5: Added max_capital_pct (default 20 %).
     final_qty is now clamped so that:
         final_qty × entry  ≤  account_size × max_capital_pct
     This prevents the sizer from allocating a runaway position when the
@@ -648,7 +772,7 @@ def position_size(account_size, entry, sl, atr_val, atr_mean, vix_val,
 
     vol_adj_qty = max(1, int(base_qty * vix_adj * atr_adj))
 
-    # Capital cap — never allocate more than max_capital_pct of account
+    # FIX-5: capital cap — never allocate more than max_capital_pct of account
     max_qty_by_capital = max(1, int((account_size * max_capital_pct) / entry))
     final_qty          = min(vol_adj_qty, max_qty_by_capital)
 
@@ -821,7 +945,7 @@ def confidence_label(conf):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PHASE + ENTRY   (structural breakout filtering)
+# PHASE + ENTRY   (FIX-3: structural breakout filtering)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
@@ -843,13 +967,13 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
     brk_lb         = 5
     rolling_hi_brk = float(high.iloc[-brk_lb-1:-1].max()) if n > brk_lb + 1 else float(high.iloc[-1])
 
-    # Tighter buffer (0.15 × ATR) + hard volume gate + anti-blowoff guard
+    # FIX-3: tighter buffer (0.15 × ATR) + hard volume gate + anti-blowoff guard
     buf = atr_val * 0.15    # tighter than v10's 0.20
 
     is_compressed = atr_val < atr_mean * 0.8
     is_expanding  = atr_val > float(atr_s.iloc[-2])
 
-    # Reject breakouts when the prior 3-bar range is already expanded
+    # FIX-3: reject breakouts when the prior 3-bar range is already expanded
     #         (avoids entering a blow-off move disguised as a breakout)
     prior_3bar_atr_expanded = atr_val > atr_mean * 1.4
 
@@ -859,7 +983,7 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
                   if "Open" in df.columns else 0)
     is_exhaustion = upper_wick > body * 1.5
 
-    # Hard volume gate — breakout candle MUST have vol > 1.5× avg
+    # FIX-3: hard volume gate — breakout candle MUST have vol > 1.5× avg
     brk_vol_ok    = (v > vol_avg * 1.5) if vol_avg > 0 else False
 
     vol_spike     = v > vol_avg * 1.3
@@ -868,7 +992,7 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
     cont_vol_mult = 1.5 if (regime_bearish or (vix_val and vix_val > VIX_CAUTION)) else 1.2
     BRK_CONF_MIN  = 0.70 if regime_bearish else 0.65
 
-    # Removed "trend_up" weight — it was already captured by "score_ok"
+    # FIX-8: Removed "trend_up" weight — it was already captured by "score_ok"
     # (norm_bull awards +25 for trend_up, so score_ok and trend_up fire together,
     # artificially inflating brk_confidence by 0.35 when trend is strong).
     # Redistributed weight to orthogonal signals: price_above_high (+0.05),
@@ -882,17 +1006,17 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
     }
     brk_confidence = sum(w for w, cond in brk_weights.values() if cond)
 
-    # Add hard gates — exhaustion, volume, and prior-range expansion all
+    # FIX-3: add hard gates — exhaustion, volume, and prior-range expansion all
     #         veto the breakout regardless of the weighted score
     is_breakout = (
         brk_confidence >= BRK_CONF_MIN
         and not is_exhaustion
-        and brk_vol_ok                      # hard vol gate
-        and not prior_3bar_atr_expanded     # anti-blowoff
+        and brk_vol_ok                      # FIX-3 hard vol gate
+        and not prior_3bar_atr_expanded     # FIX-3 anti-blowoff
         and htf_up
     )
 
-    # POST-BREAKOUT SUPPRESSION
+    # FIX-7: POST-BREAKOUT SUPPRESSION
     # After a breakout fires on bar N, bars N+1…N+brk_lb all have the elevated
     # breakout high inside rolling_hi_brk, so is_breakout becomes False.
     # Without suppression, the stock falls through to PHASE_ENTRY the very next
@@ -916,19 +1040,19 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
             prev_close_k    = float(close.iloc[-k])
             prev_vol_k      = float(df["Volume"].iloc[-k])
 
-            # volatility-spike guard — the CLOSE must also clear the rolling
+            # FIX-9: volatility-spike guard — the CLOSE must also clear the rolling
             # high (not just the wick/high).  A spike candle that wicks above but
             # closes back below the old high is NOT a breakout; it's an exhaustion bar.
             close_above_brk = prev_close_k > prev_rolling_hi
 
-            # body must be non-red (close >= open).  A red candle that gaps
+            # FIX-9: body must be non-red (close >= open).  A red candle that gaps
             # up through the high and closes below open is a bearish reversal bar,
             # not a breakout continuation signal.
             prev_open_k = (float(df["Open"].iloc[-k])
                            if "Open" in df.columns else prev_close_k)
             body_non_red = prev_close_k >= prev_open_k
 
-            # use the volume average computed at bar [-k] (exclude
+            # FIX-9 (Bug 3): use the volume average computed at bar [-k] (exclude
             # recent k bars) so we compare against the baseline that was relevant
             # at the time — not today's potentially inflated/deflated average.
             hist_vol = df["Volume"].iloc[:-k]
@@ -962,7 +1086,7 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
     elif is_breakout:
         phase, setup_type = PHASE_BRK, "breakout"
     elif was_recent_brk and trend_strong:
-        # post-breakout bars → CONT (not ENTRY).
+        # FIX-7: post-breakout bars → CONT (not ENTRY).
         # Only downgrade to SETUP if volume dried up AND trend weakening.
         if trend_up:
             phase, setup_type = PHASE_CONT, "breakout"
@@ -988,14 +1112,14 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
         if is_breakout:
             entry_price = round(rolling_hi_brk + buf, 2)
         elif was_recent_brk:
-            # post-breakout CONT — pin entry to current price (already
+            # FIX-7: post-breakout CONT — pin entry to current price (already
             # above the breakout level).  Do NOT use the old EMA-cross price,
             # which is stale and far below the actual breakout level.
             entry_price = round(c, 2)
         elif is_fib_buy and fib:
             entry_price = round(fib["618"] + prox * 0.3, 2)
         else:
-            # guard the EMA-cross finder — only use crossover price if
+            # FIX-7: guard the EMA-cross finder — only use crossover price if
             # it is recent (within last 10 bars) AND above current close * 0.97.
             # Otherwise fall back to current price to avoid stale signals.
             cross       = close > e_fast_s
@@ -1104,7 +1228,7 @@ def _market_regime(nifty_close):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CORE SCORING  (no session_state access)
+# CORE SCORING  (FIX-4 + FIX-6 — no session_state access)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def score_stock(df, nifty_close, mode="Swing", daily_close=None,
@@ -1112,12 +1236,12 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
                 sym=None, htf_up=True, rs_rank=50,
                 phase_history_snapshot=None):
     """
-    vol_avg for Intraday mode now uses _intraday_vol_avg() so that
+    FIX-4: vol_avg for Intraday mode now uses _intraday_vol_avg() so that
            a partial session's volume is scaled to a full-day equivalent
            before comparison.  This prevents spurious "volume spike" signals
            at market open.
 
-    EMA cross scoring block is replaced with a fresh-cross bonus that
+    FIX-6: EMA cross scoring block is replaced with a fresh-cross bonus that
            is orthogonal to trend_up (+25) and ema_stack (+15):
                +8  golden-cross within last 5 bars  (fresh, bullish momentum)
                +4  e_fast > e_slow but not a fresh cross
@@ -1149,7 +1273,7 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         chg      = round(((c - prev) / prev) * 100, 2)
         hh       = float(close.iloc[-11:-1].max())
 
-        # ──  time-normalised vol_avg for intraday ──────────────────────
+        # ── FIX-4: time-normalised vol_avg for intraday ──────────────────────
         n_rows  = len(df)
         if n_rows >= 2:
             try:
@@ -1185,10 +1309,10 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         trend_strong = c > e_fast and e_fast > e_slow
         ema_stack    = (e200 is not None) and (c > e200) and (e_fast > e_slow) and (e_fast > e200)
 
-        #fresh EMA cross detection (non-redundant) ─────────────────
+        # ── FIX-6: fresh EMA cross detection (non-redundant) ─────────────────
         # A "golden cross" is the first bar where e_fast crosses above e_slow.
         # We look back up to 5 bars to see if such a cross occurred recently.
-        # True golden-cross detection — the cross bar must have
+        # FIX-10: True golden-cross detection — the cross bar must have
         # e_fast > e_slow AND the immediately prior bar must have e_fast <= e_slow.
         # The old loop only checked that e_fast was below at some past bar, which
         # could fire on oscillating EMAs without a clean directional crossover.
@@ -1244,9 +1368,11 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         )
         r = float(rsi_series.iloc[-1])
 
-        # ── Bull score  ( ema_cross_bonus replaces old +15 EMA block) ──
+        # ── Bull score  (FIX-6: ema_cross_bonus replaces old +15 EMA block) ──
         bull  = 0
         bull += 25 if trend_up else 0
+        # FIX-6: was "+15 if e_fast > e_slow else (7 if near else 0)"
+        # Now replaced with non-redundant fresh-cross bonus:
         bull += ema_cross_bonus
         bull += (15 if r >= 65 else 10) if r >= 60 else (5 if r > 50 else 0)
         bull += 10 if v > vol_avg * 1.2 else (5 if v > vol_avg else 0)
@@ -1269,6 +1395,8 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
             bull = int(bull * BEARISH_HAIRCUT)
 
         raw_score = max(0, bull)
+        # FIX-6: BULL_MAX adjusted down by 7 to reflect removed double-count
+        # (old max was 120; ema cross block max contribution was +15, now max +8)
         BULL_MAX_V11 = 113
         norm_bull  = min(100.0, max(0.0, bull * 100.0 / BULL_MAX_V11))
         score_th   = float(cfg["score_th"])
@@ -1588,7 +1716,7 @@ def fetch_indices(mode="Swing"):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# breadth gating
+# RUN SCAN  — v11 with FIX-2 breadth gating
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_scan(symbols, mode, progress_bar, status_text,
@@ -1689,7 +1817,7 @@ def run_scan(symbols, mode, progress_bar, status_text,
         record_phase_transition(sym, phase)
         res["PhaseBonus"] = phase_transition_conf_bonus(sym)
 
-    # ── Breadth-based gating ──────────────────────────────────────────
+    # ── FIX-2: Breadth-based gating ──────────────────────────────────────────
     # Compute a fast breadth pulse from the freshly scored results.
     # When the market is internally weak (pct_above_ema50 < 40 AND ad_ratio < 0.8),
     # cap BRK/CONT actions to WATCH and flag the result so the UI can show
@@ -1749,7 +1877,7 @@ class ShortResult:
     mode:          str   = "Swing"
     scanned_at:    str   = field(default_factory=lambda: datetime.now().isoformat())
     error:         str   = ""
-    day_change:    float = 0.0   
+    day_change:    float = 0.0   # FIX-11: today's % change (for card display)
 
 
 def score_short(sym: str, mode: str = "Swing",
@@ -1988,7 +2116,7 @@ def score_short_from_result(r: dict, mode: str, vix_val: float = None) -> ShortR
         result.htf_trend     = htf_label
         result.phase         = phase
         result.ext_n         = ext_n
-        result.day_change    = chg 
+        result.day_change    = chg   # FIX-11: propagate today's % change
 
         # volume_ratio: VolConf means vol > 1.2× avg
         result.volume_ratio  = 1.3 if vol_conf else 0.9
@@ -2100,7 +2228,7 @@ class ExitResult:
     trailing_stop: float = None
     current_price: float = 0.0
     atr:           float = 0.0
-    day_pct:       float = 0.0   
+    day_pct:       float = 0.0   # FIX-11: today's % change for portfolio card display
     error:         str   = ""
 
 
@@ -2118,6 +2246,7 @@ def score_exit(sym: str, entry_price: float, mode: str = "Swing",
 
         cl    = df["Close"]; close = float(cl.iloc[-1]); result.current_price = close
         atr_v = float(atr_series(df).iloc[-1]); result.atr = atr_v
+        # FIX-11: today's % change (current bar vs previous close)
         if len(cl) >= 2:
             result.day_pct = round((close - float(cl.iloc[-2])) / float(cl.iloc[-2]) * 100, 2)
         ef    = float(ema(cl, cfg["ema_fast"]).iloc[-1])
@@ -2348,9 +2477,9 @@ with tab_settings:
         st.session_state.risk_pct = st.slider(
             "Risk per trade (%)", 0.5, 5.0,
             float(st.session_state.risk_pct * 100), 0.5) / 100.0
-        # capital cap slider
+        # FIX-5: capital cap slider
         st.session_state.max_capital_pct = st.slider(
-            "Max capital per trade (% of account)  ← 5, 50,
+            "Max capital per trade (% of account)  ← FIX-5", 5, 50,
             int(st.session_state.max_capital_pct * 100), 5) / 100.0
         st.caption(
             f"Current cap: ₹{st.session_state.account_size * st.session_state.max_capital_pct:,.0f} "
