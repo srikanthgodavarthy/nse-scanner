@@ -1,17 +1,72 @@
-"""BULL SUTRA Pro — v14.1
+"""BULL SUTRA Pro — v14.3
 ═══════════════════════════════════════════════════════════════════
-BASE: v14 — all FIX-1…FIX-6 + PERF-1…PERF-7 100% preserved.
-NEW in v14.1:
-  • FIX-7  POST-BREAKOUT ENTRY SUPPRESSION
-    — was_recent_brk scans last brk_lb bars for a valid breakout
-      signature (high > prior rolling-high + buf, vol > 1.5× avg).
-    — When found: routes to PHASE_CONT (not PHASE_ENTRY), preventing
-      a spurious "new entry" signal the bar after a breakout fires.
-    — entry_price for post-breakout CONT is pinned to current price
-      (not the stale EMA-cross price that was sometimes 20+ bars old).
-    — EMA-cross entry_price guarded: only used if cross is ≤10 bars
-      old AND cross price ≥ current price × 0.97; else falls back to
-      current price.
+BASE: v14.2 — all FIX-1…FIX-12 100% preserved.
+NEW in v14.3:
+  • sectors.py FULLY INTEGRATED
+    — Imported at startup with graceful ImportError fallback.
+
+    — SECTOR_MAP rebuilt from sectors.py (symbol → sector name)
+      covering 300+ NSE stocks across 18 sectors instead of the
+      old 50-stock hardcoded dict with generic labels ("IT", "FMCG").
+      New labels match sectors.py: "IT & Technology",
+      "Banking & Finance", "Pharma & Healthcare", etc.
+
+    — NIFTY50 list replaced with sectors.py "Nifty 50" group,
+      which includes the current correct composition (ETERNAL,
+      JIOFIN, SHRIRAMFIN, LTIM) that was missing from the old
+      hardcoded list.
+
+    — Universe selector upgraded from a 2-option radio
+      ("NSE 500" / "Nifty 50") to a full selectbox showing
+      ALL sectors from sectors.py:
+        NSE 500, Nifty 50, Banking & Finance, IT & Technology,
+        Pharma & Healthcare, Auto & Auto Ancillaries,
+        FMCG & Consumer, Metals & Mining, Energy & Power,
+        Infrastructure & Construction, Real Estate,
+        Capital Goods & Engineering, Chemicals & Fertilizers,
+        Telecom & Media, Retail & E-Commerce,
+        Logistics & Shipping, Paints & Chemicals, Textiles, PSU.
+
+    — Symbol resolution: each sector maps to its stocks list
+      from sectors.py; "Nifty 500" (None) maps to NSE500.
+═══════════════════════════════════════════════════════════════════
+  • FIX-8  BREAKOUT CONFIDENCE DOUBLE-COUNT REMOVED
+    — "trend_up" removed from brk_weights; it was already captured by
+      "score_ok" (norm_bull awards +25 for trend_up, so both weights
+      fired together, over-counting trend strength by 0.35).
+    — Redistributed weight to orthogonal signals: price_above_high
+      raised to 0.35; compressed raised to 0.20.  Weights still sum 1.0.
+
+  • FIX-9  was_recent_brk VOLATILITY-SPIKE GUARD
+    — Added two new guards to prevent wick/spike candles from triggering
+      post-breakout suppression:
+        (a) CLOSE must also be above the rolling high, not just the wick.
+        (b) Body must be non-red (close >= open) — rules out reversal spikes.
+    — FIX-9 also fixes the VOLUME AVERAGE MISMATCH (Bug 3):
+      was_recent_brk now computes the rolling-20 volume average at bar[-k]
+      (using only bars prior to bar[-k]) instead of using today's vol_avg,
+      so the comparison is apples-to-apples with the historical bar's baseline.
+
+  • FIX-10 fresh_cross IS NOW A TRUE CROSSOVER DETECTOR
+    — Old loop: found any bar where EMA_fast was previously ≤ EMA_slow,
+      which could fire on oscillating EMAs without a genuine directional cross.
+    — New loop: requires that at bar[-k], EMA_fast > EMA_slow (above)
+      AND at bar[-(k+1)], EMA_fast ≤ EMA_slow (below).  Both adjacent-bar
+      conditions must hold simultaneously — a genuine golden-cross event.
+
+  • FIX-11 DAY % CHANGE ON ALL CARD TYPES
+    — Short cards: day_change field added to ShortResult; propagated from
+      %Change in score_short_from_result; displayed as color-coded ▲/▼
+      below the current price (matching bull scanner card style).
+    — Portfolio cards: day_pct field added to ExitResult; computed in
+      score_exit as (close − prev_close) / prev_close × 100; displayed
+      as "DAY" metric alongside ENTRY / CURRENT / QTY / P&L.
+
+  • FIX-12 PORTFOLIO CARD SIZES MATCH SCANNER
+    — Portfolio cards now use width:360px;min-width:320px;max-width:380px;
+      flex:1 1 360px — identical sizing to scanner cards.
+    — Each card is wrapped in a flex container so multiple cards
+      flow side-by-side on wide screens, matching the scanner layout.
 ═══════════════════════════════════════════════════════════════════
   • Short Sell Engine (score_short / run_short_scan)
     — 4 hard triggers + 7 soft triggers, uses v11 detect_exhaustion
@@ -105,6 +160,11 @@ warnings.filterwarnings("ignore")
 # ── Universes ──────────────────────────────────────────────────────────────────
 
 try:
+    from sectors import SECTORS as _SECTORS
+except ImportError:
+    _SECTORS = None   # sectors.py missing — fall back to hardcoded maps below
+
+try:
     from nse500 import nse500_symbols
     NSE500 = list(dict.fromkeys([s.strip().upper().replace(".NS", "") for s in nse500_symbols]))
 except ImportError:
@@ -118,34 +178,58 @@ except ImportError:
         "HEROMOTOCO","APOLLOHOSP","GRASIM","SBILIFE","HDFCLIFE","ICICIPRULI","VEDL","NMDC",
     ]
 
-NIFTY50 = [
-    "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR","ITC","SBIN",
-    "BHARTIARTL","KOTAKBANK","LT","AXISBANK","ASIANPAINT","MARUTI","TITAN",
-    "NESTLEIND","WIPRO","ULTRACEMCO","POWERGRID","NTPC","BAJFINANCE","HCLTECH",
-    "SUNPHARMA","TECHM","INDUSINDBK","ONGC","COALINDIA","TATASTEEL","JSWSTEEL",
-    "HINDALCO","TATAMOTORS","M&M","BAJAJFINSV","DIVISLAB","DRREDDY","CIPLA",
-    "EICHERMOT","ADANIENT","ADANIPORTS","BPCL","TATACONSUM","BRITANNIA",
-    "HEROMOTOCO","APOLLOHOSP","GRASIM","SBILIFE","HDFCLIFE","ICICIPRULI","BAJAJ-AUTO","UPL",
-]
+NIFTY50 = (
+    _SECTORS["Nifty 50"]
+    if _SECTORS and "Nifty 50" in _SECTORS
+    else [
+        "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR","ITC","SBIN",
+        "BHARTIARTL","KOTAKBANK","LT","AXISBANK","ASIANPAINT","MARUTI","TITAN",
+        "NESTLEIND","WIPRO","ULTRACEMCO","POWERGRID","NTPC","BAJFINANCE","HCLTECH",
+        "SUNPHARMA","TECHM","INDUSINDBK","ONGC","COALINDIA","TATASTEEL","JSWSTEEL",
+        "HINDALCO","TATAMOTORS","M&M","BAJAJFINSV","DIVISLAB","DRREDDY","CIPLA",
+        "EICHERMOT","ADANIENT","ADANIPORTS","BPCL","TATACONSUM","BRITANNIA",
+        "HEROMOTOCO","APOLLOHOSP","GRASIM","SBILIFE","HDFCLIFE","ICICIPRULI","BAJAJ-AUTO","UPL",
+    ]
+)
 
-SECTOR_MAP = {
-    "RELIANCE":"Energy","ONGC":"Energy","BPCL":"Energy","COALINDIA":"Energy",
-    "NTPC":"Utilities","POWERGRID":"Utilities","ADANIENT":"Utilities",
-    "ADANIPORTS":"Industrials","LT":"Industrials","BHEL":"Industrials",
-    "HDFCBANK":"Financials","ICICIBANK":"Financials","SBIN":"Financials",
-    "KOTAKBANK":"Financials","AXISBANK":"Financials","BAJFINANCE":"Financials",
-    "BAJAJFINSV":"Financials","SBILIFE":"Financials","HDFCLIFE":"Financials",
-    "ICICIPRULI":"Financials","INDUSINDBK":"Financials",
-    "TCS":"IT","INFY":"IT","WIPRO":"IT","HCLTECH":"IT","TECHM":"IT",
-    "SUNPHARMA":"Healthcare","DRREDDY":"Healthcare","CIPLA":"Healthcare",
-    "DIVISLAB":"Healthcare","APOLLOHOSP":"Healthcare",
-    "HINDUNILVR":"FMCG","ITC":"FMCG","NESTLEIND":"FMCG","BRITANNIA":"FMCG","TATACONSUM":"FMCG",
-    "ASIANPAINT":"Chemicals","ULTRACEMCO":"Materials","GRASIM":"Materials",
-    "TATASTEEL":"Metals","JSWSTEEL":"Metals","HINDALCO":"Metals","VEDL":"Metals","NMDC":"Metals",
-    "MARUTI":"Auto","TATAMOTORS":"Auto","M&M":"Auto","EICHERMOT":"Auto",
-    "HEROMOTOCO":"Auto","BAJAJ-AUTO":"Auto",
-    "TITAN":"Consumer","BHARTIARTL":"Telecom",
-}
+# ── SECTOR_MAP: built from sectors.py (symbol → sector name) ──────────────────
+# If sectors.py is available, invert the SECTORS dict so every symbol maps to
+# its primary sector (first matching sector wins).  Falls back to the compact
+# hardcoded map when sectors.py is missing.
+if _SECTORS:
+    SECTOR_MAP: dict[str, str] = {}
+    for _sector_name, _syms in _SECTORS.items():
+        if _syms is None:   # "Nifty 500" → None = use nse500 list, skip for map
+            continue
+        for _sym in _syms:
+            if _sym not in SECTOR_MAP:       # first sector listed wins
+                SECTOR_MAP[_sym] = _sector_name
+else:
+    SECTOR_MAP = {
+        "RELIANCE":"Energy & Power","ONGC":"Energy & Power","BPCL":"Energy & Power",
+        "COALINDIA":"Energy & Power","NTPC":"Energy & Power","POWERGRID":"Energy & Power",
+        "ADANIENT":"Energy & Power",
+        "ADANIPORTS":"Infrastructure & Construction","LT":"Infrastructure & Construction",
+        "BHEL":"Capital Goods & Engineering",
+        "HDFCBANK":"Banking & Finance","ICICIBANK":"Banking & Finance","SBIN":"Banking & Finance",
+        "KOTAKBANK":"Banking & Finance","AXISBANK":"Banking & Finance","BAJFINANCE":"Banking & Finance",
+        "BAJAJFINSV":"Banking & Finance","SBILIFE":"Banking & Finance","HDFCLIFE":"Banking & Finance",
+        "ICICIPRULI":"Banking & Finance","INDUSINDBK":"Banking & Finance",
+        "TCS":"IT & Technology","INFY":"IT & Technology","WIPRO":"IT & Technology",
+        "HCLTECH":"IT & Technology","TECHM":"IT & Technology",
+        "SUNPHARMA":"Pharma & Healthcare","DRREDDY":"Pharma & Healthcare",
+        "CIPLA":"Pharma & Healthcare","DIVISLAB":"Pharma & Healthcare","APOLLOHOSP":"Pharma & Healthcare",
+        "HINDUNILVR":"FMCG & Consumer","ITC":"FMCG & Consumer","NESTLEIND":"FMCG & Consumer",
+        "BRITANNIA":"FMCG & Consumer","TATACONSUM":"FMCG & Consumer",
+        "ASIANPAINT":"Paints & Chemicals","ULTRACEMCO":"Infrastructure & Construction",
+        "GRASIM":"Infrastructure & Construction",
+        "TATASTEEL":"Metals & Mining","JSWSTEEL":"Metals & Mining","HINDALCO":"Metals & Mining",
+        "VEDL":"Metals & Mining","NMDC":"Metals & Mining",
+        "MARUTI":"Auto & Auto Ancillaries","TATAMOTORS":"Auto & Auto Ancillaries",
+        "M&M":"Auto & Auto Ancillaries","EICHERMOT":"Auto & Auto Ancillaries",
+        "HEROMOTOCO":"Auto & Auto Ancillaries","BAJAJ-AUTO":"Auto & Auto Ancillaries",
+        "TITAN":"FMCG & Consumer","BHARTIARTL":"Telecom & Media",
+    }
 
 MODE_CFG = {
     "Intraday":   dict(period="5d",  interval="5m",  ema_fast=9,  ema_slow=21,
@@ -868,12 +952,16 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
     cont_vol_mult = 1.5 if (regime_bearish or (vix_val and vix_val > VIX_CAUTION)) else 1.2
     BRK_CONF_MIN  = 0.70 if regime_bearish else 0.65
 
+    # FIX-8: Removed "trend_up" weight — it was already captured by "score_ok"
+    # (norm_bull awards +25 for trend_up, so score_ok and trend_up fire together,
+    # artificially inflating brk_confidence by 0.35 when trend is strong).
+    # Redistributed weight to orthogonal signals: price_above_high (+0.05),
+    # compressed (+0.05), so the remaining 5 factors still sum to 1.0.
     brk_weights = {
-        "price_above_high": (0.30, c > rolling_hi_brk + buf),
-        "trend_up":         (0.20, trend_up),
-        "score_ok":         (0.15, norm_bull >= score_th),
-        "compressed":       (0.15, is_compressed),
-        "expanding":        (0.10, is_expanding),
+        "price_above_high": (0.35, c > rolling_hi_brk + buf),
+        "score_ok":         (0.20, norm_bull >= score_th),
+        "compressed":       (0.20, is_compressed),
+        "expanding":        (0.15, is_expanding),
         "vol_spike":        (0.10, vol_spike),
     }
     brk_confidence = sum(w for w, cond in brk_weights.values() if cond)
@@ -909,9 +997,33 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
                 break
             prev_rolling_hi = float(high.iloc[look_start:look_end].max())
             prev_hi_k       = float(high.iloc[-k])
+            prev_close_k    = float(close.iloc[-k])
             prev_vol_k      = float(df["Volume"].iloc[-k])
+
+            # FIX-9: volatility-spike guard — the CLOSE must also clear the rolling
+            # high (not just the wick/high).  A spike candle that wicks above but
+            # closes back below the old high is NOT a breakout; it's an exhaustion bar.
+            close_above_brk = prev_close_k > prev_rolling_hi
+
+            # FIX-9: body must be non-red (close >= open).  A red candle that gaps
+            # up through the high and closes below open is a bearish reversal bar,
+            # not a breakout continuation signal.
+            prev_open_k = (float(df["Open"].iloc[-k])
+                           if "Open" in df.columns else prev_close_k)
+            body_non_red = prev_close_k >= prev_open_k
+
+            # FIX-9 (Bug 3): use the volume average computed at bar [-k] (exclude
+            # recent k bars) so we compare against the baseline that was relevant
+            # at the time — not today's potentially inflated/deflated average.
+            hist_vol = df["Volume"].iloc[:-k]
+            hist_avg_k = (float(hist_vol.rolling(20).mean().iloc[-1])
+                          if len(hist_vol) >= 20 else vol_avg)
+            vol_gate = (hist_avg_k == 0 or prev_vol_k > hist_avg_k * 1.5)
+
             if (prev_hi_k > prev_rolling_hi + buf
-                    and (vol_avg == 0 or prev_vol_k > vol_avg * 1.5)):
+                    and close_above_brk
+                    and body_non_red
+                    and vol_gate):
                 was_recent_brk = True
                 recent_brk_bar = k
                 break
@@ -1160,13 +1272,20 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         # ── FIX-6: fresh EMA cross detection (non-redundant) ─────────────────
         # A "golden cross" is the first bar where e_fast crosses above e_slow.
         # We look back up to 5 bars to see if such a cross occurred recently.
+        # FIX-10: True golden-cross detection — the cross bar must have
+        # e_fast > e_slow AND the immediately prior bar must have e_fast <= e_slow.
+        # The old loop only checked that e_fast was below at some past bar, which
+        # could fire on oscillating EMAs without a clean directional crossover.
         fresh_cross = False
         if n >= 6 and e_fast > e_slow:
             lookback_cross = min(5, n - 1)
             for k in range(1, lookback_cross + 1):
+                ef_curr = float(e_fast_s.iloc[-k])
+                es_curr = float(e_slow_s.iloc[-k])
                 ef_prev = float(e_fast_s.iloc[-(k+1)])
                 es_prev = float(e_slow_s.iloc[-(k+1)])
-                if ef_prev <= es_prev:   # was below or equal → this is the cross bar
+                # Both conditions must hold at adjacent bars for a genuine crossover
+                if ef_curr > es_curr and ef_prev <= es_prev:
                     fresh_cross = True
                     break
 
@@ -1718,6 +1837,7 @@ class ShortResult:
     mode:          str   = "Swing"
     scanned_at:    str   = field(default_factory=lambda: datetime.now().isoformat())
     error:         str   = ""
+    day_change:    float = 0.0   # FIX-11: today's % change (for card display)
 
 
 def score_short(sym: str, mode: str = "Swing",
@@ -1956,6 +2076,7 @@ def score_short_from_result(r: dict, mode: str, vix_val: float = None) -> ShortR
         result.htf_trend     = htf_label
         result.phase         = phase
         result.ext_n         = ext_n
+        result.day_change    = chg   # FIX-11: propagate today's % change
 
         # volume_ratio: VolConf means vol > 1.2× avg
         result.volume_ratio  = 1.3 if vol_conf else 0.9
@@ -2067,6 +2188,7 @@ class ExitResult:
     trailing_stop: float = None
     current_price: float = 0.0
     atr:           float = 0.0
+    day_pct:       float = 0.0   # FIX-11: today's % change for portfolio card display
     error:         str   = ""
 
 
@@ -2084,6 +2206,9 @@ def score_exit(sym: str, entry_price: float, mode: str = "Swing",
 
         cl    = df["Close"]; close = float(cl.iloc[-1]); result.current_price = close
         atr_v = float(atr_series(df).iloc[-1]); result.atr = atr_v
+        # FIX-11: today's % change (current bar vs previous close)
+        if len(cl) >= 2:
+            result.day_pct = round((close - float(cl.iloc[-2])) / float(cl.iloc[-2]) * 100, 2)
         ef    = float(ema(cl, cfg["ema_fast"]).iloc[-1])
         es    = float(ema(cl, cfg["ema_slow"]).iloc[-1])
         rsi_v = float(rsi(cl, cfg["rsi_len"]).iloc[-1])
@@ -2229,9 +2354,18 @@ st.markdown(
 )
 
 # ── Global controls ────────────────────────────────────────────────────────────
+# Build universe options from sectors.py: NSE 500 first, then every named sector.
+# If sectors.py is missing, fall back to the original two options.
+_UNIVERSE_OPTIONS = (
+    ["NSE 500"] + [k for k in _SECTORS.keys() if k != "Nifty 500"]
+    if _SECTORS
+    else ["NSE 500", "Nifty 50"]
+)
+
 gc1, gc2, gc3, gc4, gc5 = st.columns([2, 2, 1, 2, 2])
 with gc1:
-    universe_opt = st.radio("Universe", ["NSE 500", "Nifty 50"], horizontal=True)
+    universe_opt = st.selectbox("Universe", _UNIVERSE_OPTIONS, index=0,
+                                label_visibility="visible")
 with gc2:
     mode_opt = st.radio("Mode", ["Swing", "Intraday", "Positional"], horizontal=True)
 with gc3:
@@ -2348,7 +2482,15 @@ with tab_settings:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if scan_btn:
-    symbols = NSE500 if universe_opt == "NSE 500" else NIFTY50
+    # Resolve the selected universe to a symbol list
+    if universe_opt == "NSE 500":
+        symbols = NSE500
+    elif _SECTORS and universe_opt in _SECTORS:
+        _sec_syms = _SECTORS[universe_opt]
+        # "Nifty 500" entry has None → use full NSE500 list
+        symbols = NSE500 if _sec_syms is None else list(_sec_syms)
+    else:
+        symbols = NIFTY50  # fallback (should not normally reach here)
     n       = len(symbols)
     est     = "~60s" if n <= 50 else ("~90s" if n <= 150 else "~2 min")
     prog    = st.progress(0)
@@ -2725,6 +2867,11 @@ with tab_scanner:
                         rr_c = "#22c55e" if sr.risk_reward >= 2 else ("#f59e0b" if sr.risk_reward >= 1.5 else "#ef4444")
                         rsi_c = "#ef4444" if sr.rsi_val > 70 else ("#f59e0b" if sr.rsi_val > 60 else "#cbd5e1")
                         bar  = min(sr.short_score, 100)
+                        # FIX-11: day % change display for short cards
+                        dchg    = sr.day_change
+                        dchg_s  = f"+{dchg:.2f}%" if dchg >= 0 else f"{dchg:.2f}%"
+                        dchg_c  = "#22c55e" if dchg >= 0 else "#ef4444"
+                        dchg_arr = "▲" if dchg >= 0 else "▼"
                         hard_pills = "".join(
                             f'<span style="background:#0b0b0f;'
                             f'border:1px solid rgba(239,68,68,0.20);'
@@ -2783,6 +2930,8 @@ with tab_scanner:
                             f'<div style="flex:0 0 45%;padding-right:16px;border-right:1px solid #1e1e40;">'
                             f'<div style="font-family:JetBrains Mono,monospace;color:#f0e8e8;font-size:22px;'
                             f'font-weight:600;line-height:1;">₹{sr.current_price:,.1f}</div>'
+                            f'<div style="font-family:JetBrains Mono,monospace;color:{dchg_c};font-size:13px;'
+                            f'margin-top:4px;font-weight:500;">{dchg_s} {dchg_arr}</div>'
                             f'<div style="color:#f8fafc;font-size:11px;margin-top:3px;'
                             f'font-family:JetBrains Mono,monospace;">Short zone</div>'
                             f'<div style="color:#f8fafc;font-size:12px;font-weight:600;'
@@ -3446,10 +3595,13 @@ with tab_portfolio:
             curr_px  = (er.current_price if (er and er.current_price) else entry_px)
             qty      = pos.get("qty", 0)
             mode_p   = pos.get("mode", "Swing")
+            day_pct  = er.day_pct if er else 0.0   # FIX-11
 
             pnl_pct  = (curr_px - entry_px) / entry_px * 100 if entry_px else 0
             pnl_abs  = (curr_px - entry_px) * qty
             pnl_col  = "#22c55e" if pnl_pct >= 0 else "#ef4444"
+            day_col  = "#22c55e" if day_pct >= 0 else "#ef4444"   # FIX-11
+            day_str  = f"+{day_pct:.2f}%" if day_pct >= 0 else f"{day_pct:.2f}%"  # FIX-11
             vc       = EXIT_COLORS.get(verdict, "#22aa55")
             bar      = min(int(ex_score), 100)
 
@@ -3466,9 +3618,13 @@ with tab_portfolio:
                 f'</div>'
             ) if trail_sl else ""
 
+            # FIX-12: render portfolio cards in a scanner-sized card (360px wide)
+            # wrapped in a flex container so they flow side-by-side like scanner cards.
             st.markdown(
+                f'<div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:4px;">'
                 f'<div style="background:#111120;border:1.5px solid {vc};border-radius:12px;'
-                f'overflow:hidden;margin-bottom:12px;box-shadow:0 2px 12px {vc}22;">'
+                f'overflow:hidden;box-shadow:0 2px 12px {vc}22;'
+                f'width:360px;min-width:320px;max-width:380px;flex:1 1 360px;">'
                 # header
                 f'<div style="display:flex;justify-content:space-between;align-items:center;'
                 f'padding:12px 16px 10px;border-bottom:1px solid #1e1e40;">'
@@ -3479,15 +3635,17 @@ with tab_portfolio:
                 f'padding:4px 12px;border-radius:6px;font-size:11px;font-weight:700;">{verdict}</span>'
                 f'</div>'
                 # metrics
-                f'<div style="display:flex;gap:20px;flex-wrap:wrap;padding:12px 16px;">'
+                f'<div style="display:flex;gap:16px;flex-wrap:wrap;padding:12px 16px;">'
                 f'<div><div style="color:#cbd5e1;font-size:9px;">ENTRY</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#aaa;font-size:14px;">₹{entry_px:,.2f}</div></div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#aaa;font-size:13px;">₹{entry_px:,.2f}</div></div>'
                 f'<div><div style="color:#cbd5e1;font-size:9px;">CURRENT</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:14px;">₹{curr_px:,.2f}</div></div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:13px;">₹{curr_px:,.2f}</div></div>'
+                f'<div><div style="color:#cbd5e1;font-size:9px;">DAY</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:{day_col};font-size:13px;font-weight:600;">{day_str}</div></div>'
                 f'<div><div style="color:#cbd5e1;font-size:9px;">QTY</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#aaa;font-size:14px;">{qty}</div></div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#aaa;font-size:13px;">{qty}</div></div>'
                 f'<div><div style="color:#cbd5e1;font-size:9px;">P&L</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:{pnl_col};font-size:14px;font-weight:700;">'
+                f'<div style="font-family:JetBrains Mono,monospace;color:{pnl_col};font-size:13px;font-weight:700;">'
                 f'{"+"}' + f'{pnl_pct:.1f}% (₹{pnl_abs:+,.0f})</div></div>'
                 + trail_bit +
                 f'</div>'
@@ -3500,7 +3658,7 @@ with tab_portfolio:
                 f'<div style="background:{vc};width:{bar}%;height:4px;border-radius:2px;"></div></div></div>'
                 # triggers
                 f'<div style="padding:4px 16px 10px;">{trig_html}</div>'
-                f'</div>',
+                f'</div></div>',
                 unsafe_allow_html=True,
             )
 
