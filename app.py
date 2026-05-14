@@ -343,6 +343,43 @@ SHORT_SOFT_WEIGHT     = 9
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# CARD STYLE v15 — shared colour helpers (module-level, used by make_card,
+#                  short card, and portfolio card renderers)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _action_colors(act):
+    """Return (bg, border, text) CSS colour triple for an action label."""
+    if act == "STRONG BUY": return "#f59e0b22", "#f59e0b88", "#f59e0b"
+    if act == "BUY":        return "#22c55e1a", "#22c55e66", "#22c55e"
+    if act == "WATCH":      return "#3b82f611", "#3b82f644", "#60a5fa"
+    return "#cbd5e111", "#cbd5e133", "#cbd5e1"
+
+def _phase_color(ph):
+    return {
+        "BREAKOUT": "#00dd88",
+        "CONT":     "#22aa55",
+        "ENTRY":    "#2255cc",
+        "SETUP":    "#b87333",
+        "IDLE":     "#555577",
+        "EXIT":     "#cc4444",
+    }.get(ph, "#555577")
+
+def _trend_color(up: bool):
+    return "#22c55e" if up else "#ef4444"
+
+def _rs_color(rank: int):
+    if rank >= 80: return "#22c55e"
+    if rank >= 60: return "#d97706"
+    return "#94a3b8"
+
+def _conf_color(conf: int):
+    if conf >= 80: return "#2ecc71"
+    if conf >= 60: return "#f39c12"
+    if conf >= 40: return "#e67e22"
+    return "#e74c3c"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SUPABASE PERSISTENCE  (optional — silently skipped if secret missing)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2694,156 +2731,201 @@ with tab_scanner:
             if signal_is_stale(entry["timestamp"], entry.get("mode", scan_mode_now)):
                 stale_syms.add(entry["symbol"])
 
-        def _action_colors(act):
-            if act == "STRONG BUY": return "#f59e0b22", "#f59e0b55", "#f59e0b"
-            if act == "BUY":        return "#22c55e1a", "#22c55e44", "#22c55e"
-            if act == "WATCH":      return "#f59e0b11", "#f59e0b33", "#d97706"
-            return "#cbd5e111", "#cbd5e133", "#cbd5e1"
-
+        # ── v15 make_card: compact two-column grid layout ─────────────────────
+        # Header:  [##] [SYMBOL] [badges]        [ACTION] [SCORE]
+        # Body L:  LTP · Δ% · PHASE · CONF
+        # Body R:  metric grid (Score/Trend/RSI/RS/HTF/Vol)
+        # Footer:  Entry · T1 · T2 · T3 · SL            [SECTOR]
+        # Warn:    ⚠ extension pills  (only when ext_n > 0)
         def make_card(i, r, border_color, show_entry=True):
-            chg = r["%Change"]
-            cs  = f"+{chg}%" if chg >= 0 else f"{chg}%"
-            cc  = "#22c55e" if chg >= 0 else "#ef4444"
-            arr = "▲" if chg >= 0 else "▼"
-            act = r["Action"]
+            # ── raw values ────────────────────────────────────────────────
+            sym           = r["Symbol"]
+            act           = r["Action"]
+            ltp           = r["LTP"]
+            chg           = r["%Change"]
+            score         = r["Score"]
+            phase         = r.get("Phase", PHASE_IDLE)
+            conf          = r.get("Confidence", 0)
+            rsi_val       = r.get("RSI", "—")
+            rs_rank       = r.get("RS_Rank", 50)
+            htf_up        = r.get("HTFUp", True)
+            vol_conf      = r.get("VolConf", False)
+            entry         = r.get("Entry")
+            sl            = r.get("SL")
+            t1            = r.get("T1")
+            t2            = r.get("T2")
+            t3            = r.get("T3")
+            ext_n         = r.get("ExtN", 0)
+            ext_labels    = r.get("ExtLabels", [])
+            sector        = r.get("Sector", SECTOR_MAP.get(sym, "—"))
+            breadth_gated = r.get("BreadthGated", False)
+            in_golden     = r.get("InGolden", False)
+            is_stale      = sym in stale_syms
+
+            # ── derived display values ────────────────────────────────────
+            chg_str   = f"+{chg:.2f}%" if chg >= 0 else f"{chg:.2f}%"
+            chg_col   = "#22c55e" if chg >= 0 else "#ef4444"
+            chg_arr   = "▲" if chg >= 0 else "▼"
+
             act_bg, act_brd, act_txt = _action_colors(act)
+            phase_col   = _phase_color(phase)
+            conf_col    = _conf_color(conf)
+            rs_col      = _rs_color(rs_rank)
+            trend_label = "+ Bullish" if htf_up else "− Bearish"
+            trend_col   = _trend_color(htf_up)
+            vol_label   = "High" if vol_conf else "Avg"
 
-            ph  = r.get("Phase", PHASE_IDLE)
-            pc  = PHASE_COLORS.get(ph, "#555")
-            ph_txt_map = {
-                "#00dd88": "#064e3b", "#22aa55": "#064e3b",
-                "#2255cc": "#dbeafe", "#b87333": "#431407",
-                "#555577": "#c4c6d0", "#cc4444": "#fee2e2",
-            }
-            ph_txt = ph_txt_map.get(pc, "#e8e8f4")
+            phase_icon  = {
+                "BREAKOUT": "📈", "CONT": "🔄", "ENTRY": "⚡",
+                "SETUP": "🔍",   "IDLE": "💤",  "EXIT":  "🚪",
+            }.get(phase, "")
+            ph_arrow    = get_phase_arrow(sym)
+            phase_txt   = f"{phase_icon} {phase}" + (f" {ph_arrow}" if ph_arrow else "")
+            conf_lbl, _ = confidence_label(conf)
 
-            conf = r.get("Confidence", 0)
-            conf_lbl, conf_col = confidence_label(conf)
+            num_bg  = "#22c55e" if act in ("BUY","STRONG BUY") else "#d97706" if act=="WATCH" else "#3a3a60"
+            num_txt = "#064e3b" if act in ("BUY","STRONG BUY") else "#431407" if act=="WATCH" else "#c4c6d0"
 
-            rsr    = r.get("RS_Rank", 50)
-            rs_col = "#22c55e" if rsr >= 80 else ("#d97706" if rsr >= 60 else "#cbd5e1")
+            def _fmt(v):
+                if v is None: return "—"
+                try: return f"₹{v:,.2f}"
+                except (TypeError, ValueError): return "—"
 
-            entry_str  = (f'₹{r["Entry"]:,.2f}' if show_entry and r["Entry"] != r["LTP"] else "")
-            ext_n      = r.get("ExtN", 0)
-            ext_labels = r.get("ExtLabels", [])
-            ph_arrow   = get_phase_arrow(r["Symbol"])
-            is_stale   = r["Symbol"] in stale_syms
-            sector     = r.get("Sector", SECTOR_MAP.get(r["Symbol"], "—"))
-            breadth_gated = r.get("BreadthGated", False)   # FIX-2
+            entry_str = _fmt(entry) if (show_entry and entry and entry != ltp) else "—"
 
-            vol_conf    = r.get("VolConf", False)
-            vol_label   = "High" if vol_conf else "Above Avg" if r.get("ATR", 0) > 0 else "Normal"
-            htf_up      = r.get("HTFUp", True)
-            trend_label = "↑ Bullish" if htf_up else "↓ Bearish"
-            trend_col   = "#22c55e" if htf_up else "#ef4444"
-            rsi_val     = r.get("RSI", "—")
-
-            num_bg  = "#22c55e" if act in ("BUY", "STRONG BUY") else "#d97706" if act == "WATCH" else "#3a3a60"
-            num_txt = "#064e3b" if act in ("BUY", "STRONG BUY") else "#431407" if act == "WATCH" else "#c4c6d0"
-            phase_icon = {
-                "BREAKOUT":"📈","CONT":"🔄","ENTRY":"⚡","SETUP":"🔍","IDLE":"💤","EXIT":"🚪"
-            }.get(ph, "")
-
-            ext_html = ""
-            if ext_n > 0:
-                for lbl in ext_labels[:2]:
-                    ec_bg  = "#3b1a0a" if ext_n >= 3 else "#2a1e00"
-                    ec_brd = "#ef444466" if ext_n >= 3 else "#f59e0b66"
-                    ec_txt = "#fca5a5" if ext_n >= 3 else "#fbbf24"
-                    ext_html += (
-                        f'<div style="margin-top:6px;background:{ec_bg};border:1px solid {ec_brd};'
-                        f'border-radius:5px;padding:5px 10px;font-size:11px;color:{ec_txt};'
-                        f'font-family:DM Sans,sans-serif;display:flex;align-items:center;gap:6px;">'
-                        f'⚠ {lbl}</div>'
-                    )
-
-            # FIX-2: breadth gate badge
+            # ── inline badges ────────────────────────────────────────────
             breadth_badge = (
                 '<span style="background:#1e2a40;border:1px solid #3b5998;color:#93b4ff;'
                 'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:4px;">B-GATE</span>'
                 if breadth_gated else ""
             )
-
             golden_badge = (
                 '<span style="background:#f59e0b22;border:1px solid #f59e0b55;color:#f59e0b;'
                 'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:4px;">GOLDEN</span>'
-                if r.get("InGolden") else ""
+                if in_golden else ""
             )
             stale_html = (
                 '<span style="color:#cbd5e1;font-size:10px;margin-left:6px;">⏱ stale</span>'
                 if is_stale else ""
             )
 
-            ltp_str   = f'&#8377;{r["LTP"]:,.2f}'
-            entry_div = (
-                f'<div style="font-family:JetBrains Mono,monospace;color:#f59e0b;font-size:12px;'
-                f'margin-top:5px;">&#9889; {entry_str}</div>'
-                if entry_str else ""
-            )
-            ph_txt_full = f'{phase_icon} {ph}' + (f' {ph_arrow}' if ph_arrow else '')
-            conf_badge  = (
-                f'<span style="background:#1e1e40;border:1px solid {conf_col}55;'
-                f'padding:6px 10px;border-radius:6px;font-size:10px;font-weight:600;'
-                f'font-family:DM Sans,sans-serif;">'
-                f'<span style="color:#cbd5e1;font-size:9px;display:block;">{conf_lbl}</span>'
-                f'<span style="color:{conf_col};font-weight:700;">{conf}%</span></span>'
-            )
-            parts = [
-                f'<div style="background:#111120;border:1px solid {border_color};'
-                f'border-radius:12px;overflow:hidden;width:360px;min-width:320px;'
-                f'max-width:380px;flex:1 1 360px;">',
-                f'<div style="display:flex;align-items:center;padding:12px 16px 10px;'
-                f'border-bottom:1px solid #1e1e40;gap:10px;">',
-                f'<div style="background:{num_bg};color:{num_txt};font-family:JetBrains Mono,'
-                f'monospace;font-size:12px;font-weight:700;padding:4px 8px;border-radius:6px;'
-                f'min-width:32px;text-align:center;">{i+1:02d}</div>',
-                f'<div style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:16px;'
-                f'font-weight:700;letter-spacing:-0.3px;flex:1;">{r["Symbol"]}'
-                f'{golden_badge}{breadth_badge}</div>',
-                f'<span style="background:{act_bg};border:1px solid {act_brd};color:{act_txt};'
-                f'padding:4px 10px;border-radius:5px;font-size:11px;font-weight:700;'
-                f'font-family:DM Sans,sans-serif;">{act}</span>',
-                f'<span style="background:#1e1e40;color:#cbd5e1;font-family:JetBrains Mono,'
-                f'monospace;font-size:11px;padding:4px 8px;border-radius:5px;">{r["Score"]}</span>',
-                stale_html, '</div>',
-                '<div style="display:flex;padding:14px 16px;gap:0;">',
-                f'<div style="flex:0 0 45%;padding-right:16px;border-right:1px solid #1e1e40;">',
-                f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:26px;'
-                f'font-weight:600;line-height:1;">{ltp_str}</div>',
-                f'<div style="font-family:JetBrains Mono,monospace;color:{cc};font-size:13px;'
-                f'margin-top:4px;font-weight:500;">{cs} {arr}</div>',
-                entry_div, '</div>',
-                '<div style="flex:1;padding-left:16px;">',
-                '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">',
-                f'<span style="background:{pc};color:{ph_txt};padding:6px 12px;border-radius:6px;'
-                f'font-size:11px;font-weight:700;font-family:DM Sans,sans-serif;">{ph_txt_full}</span>',
-                conf_badge,
-                f'<span style="background:#1e1e40;border:1px solid {rs_col}55;padding:6px 10px;'
-                f'border-radius:6px;font-size:12px;font-weight:700;font-family:JetBrains Mono,'
-                f'monospace;color:{rs_col};">RS{rsr}</span>',
-                '</div>', ext_html, '</div>', '</div>',
-                '<div style="display:flex;align-items:center;padding:9px 16px;'
-                'border-top:1px solid #1e1e40;background:#0d0d1a;">',
-                f'<div style="flex:1;"><span style="color:#cbd5e1;font-size:9px;display:block;'
-                f'text-transform:uppercase;letter-spacing:0.5px;">RSI</span>'
-                f'<span style="color:#e8e8f4;font-size:12px;font-family:JetBrains Mono,'
-                f'monospace;">{rsi_val}</span></div>',
-                '<div style="width:1px;background:#1e1e40;height:28px;margin:0 6px;"></div>',
-                f'<div style="flex:1;"><span style="color:#cbd5e1;font-size:9px;display:block;'
-                f'text-transform:uppercase;letter-spacing:0.5px;">Trend</span>'
-                f'<span style="color:{trend_col};font-size:12px;font-weight:600;">'
-                f'{trend_label}</span></div>',
-                '<div style="width:1px;background:#1e1e40;height:28px;margin:0 6px;"></div>',
-                f'<div style="flex:1;"><span style="color:#cbd5e1;font-size:9px;display:block;'
-                f'text-transform:uppercase;letter-spacing:0.5px;">Volume</span>'
-                f'<span style="color:#e8e8f4;font-size:12px;">{vol_label}</span></div>',
-                '<div style="width:1px;background:#1e1e40;height:28px;margin:0 6px;"></div>',
-                f'<div style="flex:1;"><span style="color:#cbd5e1;font-size:9px;display:block;'
-                f'text-transform:uppercase;letter-spacing:0.5px;">Sector</span>'
-                f'<span style="color:#e8e8f4;font-size:12px;">{sector}</span></div>',
-                '</div>', '</div>',
+            # ── right-side metric grid rows ──────────────────────────────
+            metrics = [
+                ("Score", f'<span style="color:#e8e8f4;font-weight:700;">{score}</span>'),
+                ("Trend", f'<span style="color:{trend_col};font-weight:600;">{trend_label}</span>'),
+                ("RSI",   f'<span style="color:#e8e8f4;">{rsi_val}</span>'),
+                ("RS",    f'<span style="color:{rs_col};font-weight:600;">RS {rs_rank}</span>'),
+                ("HTF",   f'<span style="color:{trend_col};font-weight:700;">{"↑" if htf_up else "↓"}</span>'),
+                ("Vol",   f'<span style="color:#e8e8f4;">{vol_label}</span>'),
             ]
-            return "".join(parts)
+            metric_rows_html = "".join(
+                f'<div style="display:flex;justify-content:space-between;align-items:center;'
+                f'padding:4px 0;border-bottom:1px solid #15152a;">'
+                f'<span style="color:#475569;font-size:9px;letter-spacing:.06em;'
+                f'text-transform:uppercase;">{label}</span>'
+                f'<span style="font-family:JetBrains Mono,monospace;font-size:11px;">{val}</span>'
+                f'</div>'
+                for label, val in metrics
+            )
+
+            # ── extension warning pills ──────────────────────────────────
+            ext_html = ""
+            if ext_n > 0:
+                pills = []
+                for lbl in ext_labels[:2]:
+                    ec_bg  = "#3b1a0a" if ext_n >= 3 else "#2a1e00"
+                    ec_brd = "#ef444466" if ext_n >= 3 else "#f59e0b66"
+                    ec_txt = "#fca5a5" if ext_n >= 3 else "#fbbf24"
+                    pills.append(
+                        f'<span style="background:{ec_bg};border:1px solid {ec_brd};color:{ec_txt};'
+                        f'padding:3px 8px;border-radius:5px;font-size:10px;'
+                        f'font-family:DM Sans,sans-serif;margin-right:4px;">⚠ {lbl}</span>'
+                    )
+                ext_html = (
+                    f'<div style="padding:6px 14px 8px;border-top:1px solid #1e1e40;'
+                    f'background:#0d0d1a;display:flex;flex-wrap:wrap;gap:4px;">'
+                    + "".join(pills) + '</div>'
+                )
+
+            # ── footer target cells ──────────────────────────────────────
+            footer_items = [
+                ("ENTRY", entry_str),
+                ("T1",    _fmt(t1)),
+                ("T2",    _fmt(t2)),
+                ("T3",    _fmt(t3)),
+                ("SL",    _fmt(sl)),
+            ]
+            footer_cells = "".join(
+                f'<div><div style="color:#475569;font-size:8px;letter-spacing:.06em;">{lbl}</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#e2e8f0;font-size:11px;">{val}</div></div>'
+                for lbl, val in footer_items
+            )
+
+            # ── assemble card ────────────────────────────────────────────
+            return (
+                f'<div style="background:#111120;border:1px solid {border_color};border-radius:12px;'
+                f'overflow:hidden;width:360px;min-width:320px;max-width:380px;flex:1 1 360px;">'
+
+                # Header
+                f'<div style="display:flex;align-items:center;padding:10px 14px 8px;'
+                f'border-bottom:1px solid #1e1e40;gap:8px;background:#0e0e1c;">'
+                f'<div style="background:{num_bg};color:{num_txt};font-family:JetBrains Mono,monospace;'
+                f'font-size:12px;font-weight:700;padding:3px 7px;border-radius:5px;'
+                f'min-width:28px;text-align:center;">{i+1:02d}</div>'
+                f'<div style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:15px;'
+                f'font-weight:700;letter-spacing:-.02em;flex:1;">{sym}{golden_badge}{breadth_badge}</div>'
+                f'<span style="background:{act_bg};border:1px solid {act_brd};color:{act_txt};'
+                f'padding:3px 9px;border-radius:5px;font-size:10px;font-weight:700;'
+                f'font-family:DM Sans,sans-serif;">{act}</span>'
+                f'<span style="background:#1e1e40;color:#cbd5e1;font-family:JetBrains Mono,monospace;'
+                f'font-size:11px;padding:3px 7px;border-radius:5px;">{score}</span>'
+                + stale_html +
+                f'</div>'
+
+                # Body — left 55% | right metric grid 45%
+                f'<div style="display:flex;">'
+
+                # LEFT: price + phase + conf
+                f'<div style="flex:0 0 55%;padding:12px 14px;border-right:1px solid #1e1e40;">'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:24px;'
+                f'font-weight:600;line-height:1;">&#8377;{ltp:,.2f}</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:{chg_col};font-size:12px;'
+                f'margin-top:3px;font-weight:500;">{chg_str} {chg_arr}</div>'
+                f'<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:5px;align-items:center;">'
+                f'<span style="background:{phase_col};color:#0d0d1a;padding:4px 9px;'
+                f'border-radius:5px;font-size:10px;font-weight:700;'
+                f'font-family:DM Sans,sans-serif;">{phase_txt}</span>'
+                f'<span style="background:#1e1e40;border:1px solid {conf_col}55;padding:4px 9px;'
+                f'border-radius:5px;font-size:10px;font-weight:600;'
+                f'font-family:DM Sans,sans-serif;">'
+                f'<span style="color:#cbd5e1;font-size:8px;display:block;">{conf_lbl}</span>'
+                f'<span style="color:{conf_col};">{conf}%</span></span>'
+                f'</div>'
+                f'</div>'
+
+                # RIGHT: metric rows
+                f'<div style="flex:1;padding:10px 12px;overflow:hidden;">'
+                + metric_rows_html +
+                f'</div>'
+
+                f'</div>'  # /body
+
+                # Footer: targets row
+                f'<div style="display:flex;justify-content:space-between;align-items:flex-end;'
+                f'padding:7px 14px 6px;border-top:1px solid #1e1e40;background:#0d0d1a;'
+                f'flex-wrap:wrap;gap:6px;">'
+                + footer_cells +
+                f'<div style="text-align:right;">'
+                f'<div style="color:#475569;font-size:8px;letter-spacing:.06em;">SECTOR</div>'
+                f'<div style="color:#94a3b8;font-size:9px;max-width:80px;text-align:right;'
+                f'font-family:DM Sans,sans-serif;line-height:1.2;">{sector}</div></div>'
+                f'</div>'
+
+                # Extension warning pills (only when ext_n > 0)
+                + ext_html +
+
+                f'</div>'  # /card
+            )
 
         if top_act:
             with st.expander(
@@ -3826,4 +3908,3 @@ with tab_portfolio:
                             _db_save("bs_positions", st.session_state["open_positions"])
                             st.rerun()
                 st.markdown('<div style="margin-bottom:16px;"></div>', unsafe_allow_html=True)
-
