@@ -1,7 +1,18 @@
-"""BULL SUTRA Pro — v14
+"""BULL SUTRA Pro — v14.1
 ═══════════════════════════════════════════════════════════════════
-BASE: v11 — all FIX-1…FIX-6 + PERF-1…PERF-7 100% preserved.
-NEW in v14:
+BASE: v14 — all FIX-1…FIX-6 + PERF-1…PERF-7 100% preserved.
+NEW in v14.1:
+  • FIX-7  POST-BREAKOUT ENTRY SUPPRESSION
+    — was_recent_brk scans last brk_lb bars for a valid breakout
+      signature (high > prior rolling-high + buf, vol > 1.5× avg).
+    — When found: routes to PHASE_CONT (not PHASE_ENTRY), preventing
+      a spurious "new entry" signal the bar after a breakout fires.
+    — entry_price for post-breakout CONT is pinned to current price
+      (not the stale EMA-cross price that was sometimes 20+ bars old).
+    — EMA-cross entry_price guarded: only used if cross is ≤10 bars
+      old AND cross price ≥ current price × 0.97; else falls back to
+      current price.
+═══════════════════════════════════════════════════════════════════
   • Short Sell Engine (score_short / run_short_scan)
     — 4 hard triggers + 7 soft triggers, uses v11 detect_exhaustion
   • "🔻 Short Scan" as a top-level tab (not buried in sub-tabs)
@@ -97,8 +108,15 @@ try:
     from nse500 import nse500_symbols
     NSE500 = list(dict.fromkeys([s.strip().upper().replace(".NS", "") for s in nse500_symbols]))
 except ImportError:
-    # Fallback: populated from SECTOR_MAP keys after it is defined below
-    NSE500 = []  # filled via _nse500_from_sector_map() called after SECTOR_MAP
+    NSE500 = [
+        "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR","ITC","SBIN",
+        "BHARTIARTL","KOTAKBANK","LT","AXISBANK","ASIANPAINT","MARUTI","TITAN",
+        "NESTLEIND","WIPRO","ULTRACEMCO","POWERGRID","NTPC","BAJFINANCE","HCLTECH",
+        "SUNPHARMA","TECHM","INDUSINDBK","ONGC","COALINDIA","TATASTEEL","JSWSTEEL",
+        "HINDALCO","TATAMOTORS","M&M","BAJAJFINSV","DIVISLAB","DRREDDY","CIPLA",
+        "EICHERMOT","ADANIENT","ADANIPORTS","BPCL","TATACONSUM","BRITANNIA",
+        "HEROMOTOCO","APOLLOHOSP","GRASIM","SBILIFE","HDFCLIFE","ICICIPRULI","VEDL","NMDC",
+    ]
 
 NIFTY50 = [
     "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR","ITC","SBIN",
@@ -110,253 +128,24 @@ NIFTY50 = [
     "HEROMOTOCO","APOLLOHOSP","GRASIM","SBILIFE","HDFCLIFE","ICICIPRULI","BAJAJ-AUTO","UPL",
 ]
 
-# ── Sector Map ─────────────────────────────────────────────────────────────────
-# Official NSE Industry classification for all Nifty 500 constituents.
-# Source: nsearchives.nseindia.com/content/indices/ind_nifty500list.csv
-# Updated: April 22, 2026  |  500 stocks  |  20 sectors
 SECTOR_MAP = {
-    "360ONE":"Financial Services","3MINDIA":"Diversified","ABB":"Capital Goods",
-    "ACC":"Construction Materials","ACMESOLAR":"Power","AIAENG":"Capital Goods",
-    "APLAPOLLO":"Capital Goods","AUBANK":"Financial Services",
-    "AWL":"Fast Moving Consumer Goods","AADHARHFC":"Financial Services",
-    "AARTIIND":"Chemicals","AAVAS":"Financial Services","ABBOTINDIA":"Healthcare",
-    "ACE":"Capital Goods","ACUTAAS":"Healthcare","ADANIENSOL":"Power",
-    "ADANIENT":"Metals & Mining","ADANIGREEN":"Power","ADANIPORTS":"Services",
-    "ADANIPOWER":"Power","ATGL":"Oil Gas & Consumable Fuels",
-    "ABCAPITAL":"Financial Services","ABFRL":"Consumer Services",
-    "ABLBL":"Consumer Services","ABREL":"Realty","ABSLAMC":"Financial Services",
-    "CPPLUS":"Capital Goods","AEGISLOG":"Oil Gas & Consumable Fuels",
-    "AEGISVOPAK":"Oil Gas & Consumable Fuels","AFCONS":"Construction",
-    "AFFLE":"Information Technology","AJANTPHARM":"Healthcare",
-    "AKZOINDIA":"Consumer Durables","ALKEM":"Healthcare",
-    "ABDL":"Fast Moving Consumer Goods",
-    "ARE&M":"Automobile and Auto Components","AMBER":"Consumer Durables",
-    "AMBUJACEM":"Construction Materials","ANANDRATHI":"Financial Services",
-    "ANANTRAJ":"Realty","ANGELONE":"Financial Services","ANTHEM":"Healthcare",
-    "ANURAS":"Chemicals","APARINDS":"Capital Goods","APOLLOHOSP":"Healthcare",
-    "APOLLOTYRE":"Automobile and Auto Components","APTUS":"Financial Services",
-    "ASAHIINDIA":"Automobile and Auto Components","ASHOKLEY":"Capital Goods",
-    "ASIANPAINT":"Consumer Durables","ASTERDM":"Healthcare","ASTRAL":"Capital Goods",
-    "ATHERENERG":"Automobile and Auto Components","ATUL":"Chemicals",
-    "AUROPHARMA":"Healthcare","AIIL":"Financial Services",
-    "DMART":"Consumer Services","AXISBANK":"Financial Services",
-    "BEML":"Capital Goods","BLS":"Consumer Services","BSE":"Financial Services",
-    "BAJAJ-AUTO":"Automobile and Auto Components","BAJFINANCE":"Financial Services",
-    "BAJAJFINSV":"Financial Services","BAJAJHLDNG":"Financial Services",
-    "BAJAJHFL":"Financial Services",
-    "BALKRISIND":"Automobile and Auto Components",
-    "BALRAMCHIN":"Fast Moving Consumer Goods","BANDHANBNK":"Financial Services",
-    "BANKBARODA":"Financial Services","BANKINDIA":"Financial Services",
-    "MAHABANK":"Financial Services","BATAINDIA":"Consumer Durables",
-    "BAYERCROP":"Chemicals","BELRISE":"Automobile and Auto Components",
-    "BERGEPAINT":"Consumer Durables","BDL":"Capital Goods","BEL":"Capital Goods",
-    "BHARATFORG":"Automobile and Auto Components","BHEL":"Capital Goods",
-    "BPCL":"Oil Gas & Consumable Fuels","BHARTIARTL":"Telecommunication",
-    "BHARTIHEXA":"Telecommunication","BIKAJI":"Fast Moving Consumer Goods",
-    "GROWW":"Financial Services","BIOCON":"Healthcare",
-    "BSOFT":"Information Technology","BLUEDART":"Services",
-    "BLUEJET":"Healthcare","BLUESTARCO":"Consumer Durables",
-    "BBTC":"Fast Moving Consumer Goods",
-    "BOSCHLTD":"Automobile and Auto Components","FIRSTCRY":"Consumer Services",
-    "BRIGADE":"Realty","BRITANNIA":"Fast Moving Consumer Goods",
-    "MAPMYINDIA":"Information Technology","CCL":"Fast Moving Consumer Goods",
-    "CESC":"Power","CGPOWER":"Capital Goods","CRISIL":"Financial Services",
-    "CANFINHOME":"Financial Services","CANBK":"Financial Services",
-    "CANHLIFE":"Financial Services","CAPLIPOINT":"Healthcare",
-    "CGCL":"Financial Services","CARBORUNIV":"Capital Goods",
-    "CARTRADE":"Consumer Services","CASTROLIND":"Oil Gas & Consumable Fuels",
-    "CEATLTD":"Automobile and Auto Components","CEMPRO":"Construction",
-    "CENTRALBK":"Financial Services","CDSL":"Financial Services",
-    "CHALET":"Consumer Services","CHAMBLFERT":"Chemicals",
-    "CHENNPETRO":"Oil Gas & Consumable Fuels","CHOICEIN":"Financial Services",
-    "CHOLAHLDNG":"Financial Services","CHOLAFIN":"Financial Services",
-    "CIPLA":"Healthcare","CUB":"Financial Services","CLEAN":"Chemicals",
-    "COALINDIA":"Oil Gas & Consumable Fuels","COCHINSHIP":"Capital Goods",
-    "COFORGE":"Information Technology","COHANCE":"Healthcare",
-    "COLPAL":"Fast Moving Consumer Goods","CAMS":"Financial Services",
-    "CONCORDBIO":"Healthcare","CONCOR":"Services","COROMANDEL":"Chemicals",
-    "CRAFTSMAN":"Automobile and Auto Components","CREDITACC":"Financial Services",
-    "CROMPTON":"Consumer Durables","CUMMINSIND":"Capital Goods",
-    "CYIENT":"Information Technology","DCMSHRIRAM":"Diversified","DLF":"Realty",
-    "DOMS":"Fast Moving Consumer Goods","DABUR":"Fast Moving Consumer Goods",
-    "DALBHARAT":"Construction Materials","DATAPATTNS":"Capital Goods",
-    "DEEPAKFERT":"Chemicals","DEEPAKNTR":"Chemicals","DELHIVERY":"Services",
-    "DEVYANI":"Consumer Services","DIVISLAB":"Healthcare",
-    "DIXON":"Consumer Durables","LALPATHLAB":"Healthcare","DRREDDY":"Healthcare",
-    "EIDPARRY":"Fast Moving Consumer Goods","EIHOTEL":"Consumer Services",
-    "EICHERMOT":"Automobile and Auto Components","ELECON":"Capital Goods",
-    "ELGIEQUIP":"Capital Goods","EMAMILTD":"Fast Moving Consumer Goods",
-    "EMCURE":"Healthcare","EMMVEE":"Capital Goods",
-    "ENDURANCE":"Automobile and Auto Components","ENGINERSIN":"Construction",
-    "ERIS":"Healthcare","ESCORTS":"Capital Goods","ETERNAL":"Consumer Services",
-    "EXIDEIND":"Automobile and Auto Components","NYKAA":"Consumer Services",
-    "FEDERALBNK":"Financial Services","FACT":"Chemicals","FINCABLES":"Capital Goods",
-    "FSL":"Services","FIVESTAR":"Financial Services",
-    "FORCEMOT":"Automobile and Auto Components","FORTIS":"Healthcare",
-    "GAIL":"Oil Gas & Consumable Fuels","GVT&D":"Capital Goods",
-    "GMRAIRPORT":"Services","GABRIEL":"Automobile and Auto Components",
-    "GALLANTT":"Capital Goods","GRSE":"Capital Goods",
-    "GICRE":"Financial Services","GILLETTE":"Fast Moving Consumer Goods",
-    "GLAND":"Healthcare","GLAXO":"Healthcare","GLENMARK":"Healthcare",
-    "MEDANTA":"Healthcare","GODIGIT":"Financial Services","GPIL":"Capital Goods",
-    "GODFRYPHLP":"Fast Moving Consumer Goods","GODREJCP":"Fast Moving Consumer Goods",
-    "GODREJIND":"Diversified","GODREJPROP":"Realty","GRANULES":"Healthcare",
-    "GRAPHITE":"Capital Goods","GRASIM":"Construction Materials",
-    "GRAVITA":"Metals & Mining","GESHIP":"Services",
-    "FLUOROCHEM":"Chemicals","GMDCLTD":"Metals & Mining",
-    "GSPL":"Oil Gas & Consumable Fuels","HEG":"Capital Goods",
-    "HBLENGINE":"Capital Goods","HCLTECH":"Information Technology",
-    "HDBFS":"Financial Services","HDFCAMC":"Financial Services",
-    "HDFCBANK":"Financial Services","HDFCLIFE":"Financial Services",
-    "HFCL":"Telecommunication","HAVELLS":"Consumer Durables",
-    "HEROMOTOCO":"Automobile and Auto Components",
-    "HEXT":"Information Technology","HSCL":"Chemicals",
-    "HINDALCO":"Metals & Mining","HAL":"Capital Goods",
-    "HINDCOPPER":"Metals & Mining","HINDPETRO":"Oil Gas & Consumable Fuels",
-    "HINDUNILVR":"Fast Moving Consumer Goods","HINDZINC":"Metals & Mining",
-    "POWERINDIA":"Capital Goods","HOMEFIRST":"Financial Services",
-    "HONASA":"Fast Moving Consumer Goods","HONAUT":"Capital Goods",
-    "HUDCO":"Financial Services","HYUNDAI":"Automobile and Auto Components",
-    "ICICIBANK":"Financial Services","ICICIGI":"Financial Services",
-    "ICICIAMC":"Financial Services","ICICIPRULI":"Financial Services",
-    "IDBI":"Financial Services","IDFCFIRSTB":"Financial Services",
-    "IFCI":"Financial Services","IIFL":"Financial Services",
-    "IRB":"Construction","IRCON":"Construction","ITCHOTELS":"Consumer Services",
-    "ITC":"Fast Moving Consumer Goods","ITI":"Telecommunication",
-    "INDGN":"Healthcare","INDIACEM":"Construction Materials",
-    "INDIAMART":"Consumer Services","INDIANB":"Financial Services",
-    "IEX":"Financial Services","INDHOTEL":"Consumer Services",
-    "IOC":"Oil Gas & Consumable Fuels","IOB":"Financial Services",
-    "IRCTC":"Consumer Services","IRFC":"Financial Services",
-    "IREDA":"Financial Services","IGL":"Oil Gas & Consumable Fuels",
-    "INDUSTOWER":"Telecommunication","INDUSINDBK":"Financial Services",
-    "NAUKRI":"Consumer Services","INFY":"Information Technology",
-    "INOXWIND":"Capital Goods","INTELLECT":"Information Technology",
-    "INDIGO":"Services","IGIL":"Services","IKS":"Information Technology",
-    "IPCALAB":"Healthcare","JBCHEPHARM":"Healthcare",
-    "JKCEMENT":"Construction Materials",
-    "JBMA":"Automobile and Auto Components",
-    "JKTYRE":"Automobile and Auto Components","JMFINANCIL":"Financial Services",
-    "JSWCEMENT":"Construction Materials","JSWENERGY":"Power",
-    "JSWINFRA":"Services","JSWSTEEL":"Metals & Mining",
-    "JAINREC":"Metals & Mining","JPPOWER":"Power",
-    "J&KBANK":"Financial Services","JINDALSAW":"Capital Goods",
-    "JSL":"Metals & Mining","JINDALSTEL":"Metals & Mining",
-    "JIOFIN":"Financial Services","JUBLFOOD":"Consumer Services",
-    "JUBLINGREA":"Chemicals","JUBLPHARMA":"Healthcare","JWL":"Capital Goods",
-    "JYOTICNC":"Capital Goods","KPRMILL":"Textiles","KEI":"Capital Goods",
-    "KPITTECH":"Information Technology","KAJARIACER":"Consumer Durables",
-    "KPIL":"Construction","KALYANKJIL":"Consumer Durables",
-    "KARURVYSYA":"Financial Services","KAYNES":"Capital Goods",
-    "KEC":"Construction","KFINTECH":"Financial Services",
-    "KIRLOSENG":"Capital Goods","KOTAKBANK":"Financial Services",
-    "KIMS":"Healthcare","LTF":"Financial Services",
-    "LTTS":"Information Technology","LGEINDIA":"Consumer Durables",
-    "LICHSGFIN":"Financial Services","LTFOODS":"Fast Moving Consumer Goods",
-    "LTM":"Information Technology","LT":"Construction",
-    "LATENTVIEW":"Information Technology","LAURUSLABS":"Healthcare",
-    "THELEELA":"Consumer Services","LEMONTREE":"Consumer Services",
-    "LENSKART":"Consumer Services","LICI":"Financial Services",
-    "LINDEINDIA":"Chemicals","LLOYDSME":"Metals & Mining","LODHA":"Realty",
-    "LUPIN":"Healthcare","MMTC":"Services","MRF":"Automobile and Auto Components",
-    "MGL":"Oil Gas & Consumable Fuels","M&MFIN":"Financial Services",
-    "M&M":"Automobile and Auto Components","MANAPPURAM":"Financial Services",
-    "MRPL":"Oil Gas & Consumable Fuels","MANKIND":"Healthcare",
-    "MARICO":"Fast Moving Consumer Goods",
-    "MARUTI":"Automobile and Auto Components","MFSL":"Financial Services",
-    "MAXHEALTH":"Healthcare","MAZDOCK":"Capital Goods",
-    "MEESHO":"Consumer Services","MINDACORP":"Automobile and Auto Components",
-    "MSUMI":"Automobile and Auto Components","MOTILALOFS":"Financial Services",
-    "MPHASIS":"Information Technology","MCX":"Financial Services",
-    "MUTHOOTFIN":"Financial Services","NATCOPHARM":"Healthcare",
-    "NBCC":"Construction","NCC":"Construction","NHPC":"Power","NLCINDIA":"Power",
-    "NMDC":"Metals & Mining","NSLNISP":"Metals & Mining","NTPCGREEN":"Power",
-    "NTPC":"Power","NH":"Healthcare","NATIONALUM":"Metals & Mining","NAVA":"Power",
-    "NAVINFLUOR":"Chemicals","NESTLEIND":"Fast Moving Consumer Goods",
-    "NETWEB":"Information Technology","NEULANDLAB":"Healthcare",
-    "NEWGEN":"Information Technology","NAM-INDIA":"Financial Services",
-    "NIVABUPA":"Financial Services","NUVAMA":"Financial Services",
-    "NUVOCO":"Construction Materials","OBEROIRLTY":"Realty",
-    "ONGC":"Oil Gas & Consumable Fuels","OIL":"Oil Gas & Consumable Fuels",
-    "OLAELEC":"Automobile and Auto Components",
-    "OLECTRA":"Automobile and Auto Components","PAYTM":"Financial Services",
-    "ONESOURCE":"Healthcare","OFSS":"Information Technology",
-    "POLICYBZR":"Financial Services","PCBL":"Chemicals",
-    "PGEL":"Consumer Durables","PIIND":"Chemicals",
-    "PNBHOUSING":"Financial Services","PTCIL":"Capital Goods",
-    "PVRINOX":"Media Entertainment & Publication","PAGEIND":"Textiles",
-    "PARADEEP":"Chemicals","PATANJALI":"Fast Moving Consumer Goods",
-    "PERSISTENT":"Information Technology","PETRONET":"Oil Gas & Consumable Fuels",
-    "PFIZER":"Healthcare","PHOENIXLTD":"Realty","PWL":"Consumer Services",
-    "PIDILITIND":"Chemicals","PINELABS":"Financial Services",
-    "PIRAMALFIN":"Financial Services","PPLPHARMA":"Healthcare",
-    "POLYMED":"Healthcare","POLYCAB":"Capital Goods",
-    "POONAWALLA":"Financial Services","PFC":"Financial Services",
-    "POWERGRID":"Power","PREMIERENE":"Capital Goods","PRESTIGE":"Realty",
-    "PNB":"Financial Services","RRKABEL":"Capital Goods",
-    "RBLBANK":"Financial Services","RECLTD":"Financial Services",
-    "RHIM":"Capital Goods","RITES":"Construction",
-    "RADICO":"Fast Moving Consumer Goods","RVNL":"Construction",
-    "RAILTEL":"Telecommunication","RAINBOW":"Healthcare",
-    "RKFORGE":"Automobile and Auto Components","REDINGTON":"Services",
-    "RELIANCE":"Oil Gas & Consumable Fuels","RPOWER":"Power",
-    "SBFC":"Financial Services","SBICARD":"Financial Services",
-    "SBILIFE":"Financial Services","SJVN":"Power","SRF":"Chemicals",
-    "SAGILITY":"Information Technology","SAILIFE":"Healthcare",
-    "SAMMAANCAP":"Financial Services",
-    "MOTHERSON":"Automobile and Auto Components","SAPPHIRE":"Consumer Services",
-    "SARDAEN":"Metals & Mining",
-    "SAREGAMA":"Media Entertainment & Publication",
-    "SCHAEFFLER":"Automobile and Auto Components","SCHNEIDER":"Capital Goods",
-    "SCI":"Services","SHREECEM":"Construction Materials",
-    "SHRIRAMFIN":"Financial Services","SHYAMMETL":"Capital Goods",
-    "ENRIN":"Capital Goods","SIEMENS":"Capital Goods","SIGNATURE":"Realty",
-    "SOBHA":"Realty","SOLARINDS":"Chemicals",
-    "SONACOMS":"Automobile and Auto Components",
-    "SONATSOFTW":"Information Technology","STARHEALTH":"Financial Services",
-    "SBIN":"Financial Services","SAIL":"Metals & Mining","SUMICHEM":"Chemicals",
-    "SUNPHARMA":"Healthcare","SUNTV":"Media Entertainment & Publication",
-    "SUNDARMFIN":"Financial Services","SUPREMEIND":"Capital Goods",
-    "SPLPETRO":"Chemicals","SUZLON":"Capital Goods","SWANCORP":"Chemicals",
-    "SWIGGY":"Consumer Services","SYNGENE":"Healthcare","SYRMA":"Capital Goods",
-    "TBOTEK":"Consumer Services","TVSMOTOR":"Automobile and Auto Components",
-    "TATACAP":"Financial Services","TATACHEM":"Chemicals",
-    "TATACOMM":"Telecommunication","TCS":"Information Technology",
-    "TATACONSUM":"Fast Moving Consumer Goods","TATAELXSI":"Information Technology",
-    "TATAINVEST":"Financial Services","TMCV":"Capital Goods",
-    "TMPV":"Automobile and Auto Components","TATAPOWER":"Power",
-    "TATASTEEL":"Metals & Mining","TATATECH":"Information Technology",
-    "TTML":"Telecommunication","TECHM":"Information Technology",
-    "TECHNOE":"Construction","TEGA":"Capital Goods","TEJASNET":"Telecommunication",
-    "TENNIND":"Automobile and Auto Components","NIACL":"Financial Services",
-    "RAMCOCEM":"Construction Materials","THERMAX":"Capital Goods",
-    "TIMKEN":"Capital Goods","TITAGARH":"Capital Goods",
-    "TITAN":"Consumer Durables","TORNTPHARM":"Healthcare","TORNTPOWER":"Power",
-    "TARIL":"Capital Goods","TRAVELFOOD":"Consumer Services",
-    "TRENT":"Consumer Services","TRIDENT":"Textiles","TRITURBINE":"Capital Goods",
-    "TIINDIA":"Automobile and Auto Components","UCOBANK":"Financial Services",
-    "UNOMINDA":"Automobile and Auto Components","UPL":"Chemicals",
-    "UTIAMC":"Financial Services","ULTRACEMCO":"Construction Materials",
-    "UNIONBANK":"Financial Services","UBL":"Fast Moving Consumer Goods",
-    "UNITDSPR":"Fast Moving Consumer Goods","URBANCO":"Consumer Services",
-    "USHAMART":"Capital Goods","VTL":"Textiles","VBL":"Fast Moving Consumer Goods",
-    "VEDL":"Metals & Mining","VIJAYA":"Healthcare","VMM":"Consumer Services",
-    "IDEA":"Telecommunication","VOLTAS":"Consumer Durables",
-    "WAAREEENER":"Capital Goods","WELCORP":"Capital Goods",
-    "WELSPUNLIV":"Textiles","WHIRLPOOL":"Consumer Durables",
-    "WIPRO":"Information Technology","WOCKPHARMA":"Healthcare",
-    "YESBANK":"Financial Services","ZFCVINDIA":"Automobile and Auto Components",
-    "ZEEL":"Media Entertainment & Publication","ZENTEC":"Capital Goods",
-    "ZENSARTECH":"Information Technology","ZYDUSLIFE":"Healthcare",
-    "ZYDUSWELL":"Fast Moving Consumer Goods","ECLERX":"Services",
-    # Legacy aliases kept for backward compatibility with any hardcoded watchlists
-    "TATAMOTORS": "Automobile and Auto Components",
-    "UPL":        "Chemicals",
+    "RELIANCE":"Energy","ONGC":"Energy","BPCL":"Energy","COALINDIA":"Energy",
+    "NTPC":"Utilities","POWERGRID":"Utilities","ADANIENT":"Utilities",
+    "ADANIPORTS":"Industrials","LT":"Industrials","BHEL":"Industrials",
+    "HDFCBANK":"Financials","ICICIBANK":"Financials","SBIN":"Financials",
+    "KOTAKBANK":"Financials","AXISBANK":"Financials","BAJFINANCE":"Financials",
+    "BAJAJFINSV":"Financials","SBILIFE":"Financials","HDFCLIFE":"Financials",
+    "ICICIPRULI":"Financials","INDUSINDBK":"Financials",
+    "TCS":"IT","INFY":"IT","WIPRO":"IT","HCLTECH":"IT","TECHM":"IT",
+    "SUNPHARMA":"Healthcare","DRREDDY":"Healthcare","CIPLA":"Healthcare",
+    "DIVISLAB":"Healthcare","APOLLOHOSP":"Healthcare",
+    "HINDUNILVR":"FMCG","ITC":"FMCG","NESTLEIND":"FMCG","BRITANNIA":"FMCG","TATACONSUM":"FMCG",
+    "ASIANPAINT":"Chemicals","ULTRACEMCO":"Materials","GRASIM":"Materials",
+    "TATASTEEL":"Metals","JSWSTEEL":"Metals","HINDALCO":"Metals","VEDL":"Metals","NMDC":"Metals",
+    "MARUTI":"Auto","TATAMOTORS":"Auto","M&M":"Auto","EICHERMOT":"Auto",
+    "HEROMOTOCO":"Auto","BAJAJ-AUTO":"Auto",
+    "TITAN":"Consumer","BHARTIARTL":"Telecom",
 }
-
-# If nse500.py import failed, derive the 500-symbol list from SECTOR_MAP keys
-if not NSE500:
-    NSE500 = [s for s in SECTOR_MAP if s not in ("TATAMOTORS",)]
 
 MODE_CFG = {
     "Intraday":   dict(period="5d",  interval="5m",  ema_fast=9,  ema_slow=21,
@@ -1099,6 +888,34 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
         and htf_up
     )
 
+    # FIX-7: POST-BREAKOUT SUPPRESSION
+    # After a breakout fires on bar N, bars N+1…N+brk_lb all have the elevated
+    # breakout high inside rolling_hi_brk, so is_breakout becomes False.
+    # Without suppression, the stock falls through to PHASE_ENTRY the very next
+    # bar — producing a spurious "new" entry signal at a stale/lower price.
+    #
+    # Detection: scan the last brk_lb bars (excluding current) for any bar that
+    # clears the rolling high AT THAT TIME with breakout-level volume.
+    # If found → was_recent_brk = True.  The phase tree routes this to CONT
+    # (not ENTRY), and entry_price is pinned to current price, not old EMA cross.
+    was_recent_brk = False
+    recent_brk_bar = None                       # index offset (1 = previous bar)
+    if not is_breakout and n > brk_lb * 2 + 2:
+        for k in range(1, brk_lb + 1):
+            # Rolling high as it was BEFORE bar [-k]
+            look_start = -(brk_lb + 1 + k)
+            look_end   = -(1 + k)
+            if abs(look_start) > n or abs(look_end) > n:
+                break
+            prev_rolling_hi = float(high.iloc[look_start:look_end].max())
+            prev_hi_k       = float(high.iloc[-k])
+            prev_vol_k      = float(df["Volume"].iloc[-k])
+            if (prev_hi_k > prev_rolling_hi + buf
+                    and (vol_avg == 0 or prev_vol_k > vol_avg * 1.5)):
+                was_recent_brk = True
+                recent_brk_bar = k
+                break
+
     is_cont = (
         n >= 4
         and c > float(close.iloc[-4:-1].max())
@@ -1116,6 +933,13 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
         phase, setup_type = PHASE_EXIT, "norm"
     elif is_breakout:
         phase, setup_type = PHASE_BRK, "breakout"
+    elif was_recent_brk and trend_strong:
+        # FIX-7: post-breakout bars → CONT (not ENTRY).
+        # Only downgrade to SETUP if volume dried up AND trend weakening.
+        if trend_up:
+            phase, setup_type = PHASE_CONT, "breakout"
+        else:
+            phase, setup_type = PHASE_SETUP, "breakout"
     elif (is_fib_buy or norm_bull >= score_th) and is_cont and trend_up:
         phase, setup_type = PHASE_CONT, ("fib" if is_fib_buy else "norm")
     elif (is_fib_buy or norm_bull >= score_th) and trend_up:
@@ -1135,13 +959,28 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
         prox = atr_val * 0.3
         if is_breakout:
             entry_price = round(rolling_hi_brk + buf, 2)
+        elif was_recent_brk:
+            # FIX-7: post-breakout CONT — pin entry to current price (already
+            # above the breakout level).  Do NOT use the old EMA-cross price,
+            # which is stale and far below the actual breakout level.
+            entry_price = round(c, 2)
         elif is_fib_buy and fib:
             entry_price = round(fib["618"] + prox * 0.3, 2)
         else:
+            # FIX-7: guard the EMA-cross finder — only use crossover price if
+            # it is recent (within last 10 bars) AND above current close * 0.97.
+            # Otherwise fall back to current price to avoid stale signals.
             cross       = close > e_fast_s
             signal_bars = cross & ~cross.shift(1).fillna(False)
             if signal_bars.any():
-                entry_price = round(float(close[signal_bars[::-1].idxmax()]), 2)
+                last_cross_idx = signal_bars[::-1].idxmax()
+                cross_pos      = close.index.get_loc(last_cross_idx)
+                bars_ago       = (n - 1) - cross_pos
+                cross_px       = float(close[last_cross_idx])
+                if bars_ago <= 10 and cross_px >= c * 0.97:
+                    entry_price = round(cross_px, 2)
+                else:
+                    entry_price = round(c, 2)
             else:
                 entry_price = round(c, 2)
 
