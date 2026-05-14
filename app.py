@@ -162,7 +162,20 @@ warnings.filterwarnings("ignore")
 try:
     from sectors import SECTORS as _SECTORS
 except ImportError:
-    _SECTORS = None   # sectors.py missing — fall back to hardcoded maps below
+    # ── GitHub fallback: download sectors.py from the repo at runtime ──────────
+    _SECTORS = None
+    try:
+        import urllib.request, types as _types
+        _GH_SECTORS_URL = (
+            "https://raw.githubusercontent.com/srikanthgodavarthy/nse-scan/main/sectors.py"
+        )
+        with urllib.request.urlopen(_GH_SECTORS_URL, timeout=10) as _resp:
+            _src = _resp.read().decode("utf-8")
+        _mod = _types.ModuleType("sectors_remote")
+        exec(compile(_src, "<sectors_gh>", "exec"), _mod.__dict__)
+        _SECTORS = getattr(_mod, "SECTORS", None)
+    except Exception:
+        _SECTORS = None   # sectors.py unavailable — fall back to hardcoded maps below
 
 try:
     from nse500 import nse500_symbols
@@ -192,27 +205,39 @@ NIFTY50 = (
     ]
 )
 
-# ── SECTOR_MAP: built from sectors.py (symbol → sector name) ──────────────────
-# If sectors.py is available, invert the SECTORS dict so every symbol maps to
-# its primary sector (first matching sector wins).  Falls back to the compact
-# hardcoded map when sectors.py is missing.
+# ── SECTOR_MAP: symbol → sector name ─────────────────────────────────────────
+# Priority: 1) GitHub CSV  2) local CSV  3) sectors.py dict  4) hardcoded stub
 SECTOR_MAP: dict[str, str] = {}
 
-# ✅ 1. Try loading from CSV (preferred)
+_CSV_GH_URL = (
+    "https://raw.githubusercontent.com/srikanthgodavarthy/nse-scan/main/nse500_clean_sample.csv"
+)
+
+def _load_sector_csv(source) -> dict:
+    """Read a CSV from a path or URL; return {SYMBOL: SECTOR} dict.
+
+    Supports both column layouts:
+      • 'Sector'   — generic layout
+      • 'Industry' — NSE 500 clean sample (Company Name, Industry, Symbol, ...)
+    """
+    _df = pd.read_csv(source)
+    _df["Symbol"] = _df["Symbol"].astype(str).str.replace(".NS", "", regex=False).str.strip()
+    _sector_col = "Sector" if "Sector" in _df.columns else "Industry"
+    _df[_sector_col] = _df[_sector_col].astype(str).str.strip().str.title()
+    return dict(zip(_df["Symbol"], _df[_sector_col]))
+
+# ✅ 1. GitHub CSV (primary — always current)
 try:
-    df = pd.read_csv("nse500_clean_sample.csv")  # or your GitHub raw URL
-
-    # clean symbols (important)
-    df["Symbol"] = df["Symbol"].astype(str).str.replace(".NS", "", regex=False).str.strip()
-
-    # optional: normalize sector names
-    df["Sector"] = df["Sector"].astype(str).str.upper().str.strip()
-
-    SECTOR_MAP = dict(zip(df["Symbol"], df["Sector"]))
-
-# ✅ 2. If CSV fails → fall back to SECTORS dict
+    SECTOR_MAP = _load_sector_csv(_CSV_GH_URL)
 except Exception:
+    # ✅ 2. Local CSV fallback
+    try:
+        SECTOR_MAP = _load_sector_csv("nse500_clean_sample.csv")
+    except Exception:
+        pass   # continue to SECTORS dict fallback below
 
+# ✅ 3. If both CSVs failed → fall back to SECTORS dict
+if not SECTOR_MAP:
     if _SECTORS:
         for _sector_name, _syms in _SECTORS.items():
             if _syms is None:
@@ -221,50 +246,28 @@ except Exception:
                 if _sym not in SECTOR_MAP:   # first sector wins
                     SECTOR_MAP[_sym] = _sector_name
 
-    else:
-        # ✅ 3. Final hard fallback
+    if not SECTOR_MAP:
+        # ✅ 4. Final hard fallback
         SECTOR_MAP = {
-            "RELIANCE": "ENERGY & POWER",
-            "ONGC": "ENERGY & POWER",
-            "BPCL": "ENERGY & POWER",
-            "COALINDIA": "ENERGY & POWER",
-            "NTPC": "ENERGY & POWER",
-            "POWERGRID": "ENERGY & POWER",
-            "ADANIENT": "ENERGY & POWER",
-
-            "ADANIPORTS": "INFRASTRUCTURE",
-            "LT": "INFRASTRUCTURE",
-            "BHEL": "CAPITAL GOODS",
-
-            "HDFCBANK": "FINANCIALS",
-            "ICICIBANK": "FINANCIALS",
-            "SBIN": "FINANCIALS",
-            "KOTAKBANK": "FINANCIALS",
-            "AXISBANK": "FINANCIALS",
-            "BAJFINANCE": "FINANCIALS",
-            "BAJAJFINSV": "FINANCIALS",
-
-            "TCS": "IT",
-            "INFY": "IT",
-            "WIPRO": "IT",
-            "HCLTECH": "IT",
-            "TECHM": "IT",
-
-            "SUNPHARMA": "PHARMA",
-            "DRREDDY": "PHARMA",
-            "CIPLA": "PHARMA",
-
-            "HINDUNILVR": "CONSUMER",
-            "ITC": "CONSUMER",
-            "NESTLEIND": "CONSUMER",
-            "BRITANNIA": "CONSUMER",
-
-            "TATASTEEL": "METALS",
-            "JSWSTEEL": "METALS",
-            "HINDALCO": "METALS",
-
-            "MARUTI": "AUTO",
-            "TATAMOTORS": "AUTO",
+            "RELIANCE": "Energy & Power",  "ONGC": "Energy & Power",
+            "BPCL": "Energy & Power",      "COALINDIA": "Energy & Power",
+            "NTPC": "Energy & Power",      "POWERGRID": "Energy & Power",
+            "ADANIENT": "Energy & Power",  "ADANIPORTS": "Infrastructure",
+            "LT": "Infrastructure",        "BHEL": "Capital Goods",
+            "HDFCBANK": "Banking & Finance","ICICIBANK": "Banking & Finance",
+            "SBIN": "Banking & Finance",   "KOTAKBANK": "Banking & Finance",
+            "AXISBANK": "Banking & Finance","BAJFINANCE": "Banking & Finance",
+            "BAJAJFINSV": "Banking & Finance",
+            "TCS": "IT & Technology",      "INFY": "IT & Technology",
+            "WIPRO": "IT & Technology",    "HCLTECH": "IT & Technology",
+            "TECHM": "IT & Technology",
+            "SUNPHARMA": "Pharma & Healthcare","DRREDDY": "Pharma & Healthcare",
+            "CIPLA": "Pharma & Healthcare",
+            "HINDUNILVR": "FMCG & Consumer","ITC": "FMCG & Consumer",
+            "NESTLEIND": "FMCG & Consumer","BRITANNIA": "FMCG & Consumer",
+            "TATASTEEL": "Metals & Mining","JSWSTEEL": "Metals & Mining",
+            "HINDALCO": "Metals & Mining",
+            "MARUTI": "Auto & Auto Ancillaries","TATAMOTORS": "Auto & Auto Ancillaries",
         }
 
 
@@ -3621,94 +3624,146 @@ with tab_portfolio:
         pos_sorted = sorted(valid_pos, key=lambda p: _exit_ord.get(
             exit_res[p["symbol"]].verdict if p["symbol"] in exit_res else EXIT_HOLD, 3))
 
-        for pos in pos_sorted:
-            sym      = pos["symbol"]
-            er       = exit_res.get(sym)
-            verdict  = er.verdict if er else EXIT_HOLD
-            ex_score = er.exit_score if er else 0
-            triggers = er.triggers if er else []
-            trail_sl = er.trailing_stop if er else None
-            entry_px = pos.get("entry_price", 0)
-            curr_px  = (er.current_price if (er and er.current_price) else entry_px)
-            qty      = pos.get("qty", 0)
-            mode_p   = pos.get("mode", "Swing")
-            day_pct  = er.day_pct if er else 0.0   # FIX-11
+        # ── Group positions by exit verdict (most urgent first) ───────────────
+        _VERDICT_ORDER = [EXIT_CONFIRM_LBL, EXIT_SIGNAL_LBL, EXIT_WATCH_LBL, EXIT_HOLD]
+        _VERDICT_META  = {
+            EXIT_CONFIRM_LBL: ("🔴 Exit Now",    "#cc4444"),
+            EXIT_SIGNAL_LBL:  ("🟠 Exit Signal", "#ff8800"),
+            EXIT_WATCH_LBL:   ("🟡 Exit Watch",  "#f59e0b"),
+            EXIT_HOLD:        ("🟢 Hold",         "#22aa55"),
+        }
 
-            pnl_pct  = (curr_px - entry_px) / entry_px * 100 if entry_px else 0
-            pnl_abs  = (curr_px - entry_px) * qty
-            pnl_col  = "#22c55e" if pnl_pct >= 0 else "#ef4444"
-            day_col  = "#22c55e" if day_pct >= 0 else "#ef4444"   # FIX-11
-            day_str  = f"+{day_pct:.2f}%" if day_pct >= 0 else f"{day_pct:.2f}%"  # FIX-11
-            vc       = EXIT_COLORS.get(verdict, "#22aa55")
-            bar      = min(int(ex_score), 100)
+        from collections import defaultdict as _dd
+        _verdict_groups: dict[str, list] = _dd(list)
+        for _p in valid_pos:
+            _v = exit_res[_p["symbol"]].verdict if _p["symbol"] in exit_res else EXIT_HOLD
+            _verdict_groups[_v].append(_p)
 
-            trig_html = "".join(
-                f'<span style="background:#1e1e40;border:1px solid #555;color:#ccc;'
-                f'padding:2px 8px;border-radius:4px;font-size:9px;margin:1px;">⚡ {t}</span>'
-                for t in triggers
-            ) or '<span style="color:#3a3a60;font-size:9px;">No exit triggers</span>'
+        for _group_verdict in _VERDICT_ORDER:
+            _group_pos = _verdict_groups.get(_group_verdict, [])
+            if not _group_pos:
+                continue
 
-            trail_bit = (
-                f'<div style="flex:0 0 auto;">'
-                f'<div style="color:#cbd5e1;font-size:9px;">TRAIL SL</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#f59e0b;font-size:13px;font-weight:600;">₹{trail_sl:,.2f}</div>'
-                f'</div>'
-            ) if trail_sl else ""
-
-            # FIX-12: render portfolio cards in a scanner-sized card (360px wide)
-            # wrapped in a flex container so they flow side-by-side like scanner cards.
+            _grp_label, _grp_col = _VERDICT_META[_group_verdict]
             st.markdown(
-                f'<div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:4px;">'
-                f'<div style="background:#111120;border:1.5px solid {vc};border-radius:12px;'
-                f'overflow:hidden;box-shadow:0 2px 12px {vc}22;'
-                f'width:360px;min-width:320px;max-width:380px;flex:1 1 360px;">'
-                # header
-                f'<div style="display:flex;justify-content:space-between;align-items:center;'
-                f'padding:12px 16px 10px;border-bottom:1px solid #1e1e40;">'
-                f'<div><span style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:16px;font-weight:700;">{sym}</span>'
-                f'<span style="color:#cbd5e1;font-size:11px;font-family:DM Sans,sans-serif;margin-left:8px;">'
-                f'{SECTOR_MAP.get(sym,"—")} · {mode_p}</span></div>'
-                f'<span style="background:{vc}22;border:1px solid {vc};color:{vc};'
-                f'padding:4px 12px;border-radius:6px;font-size:11px;font-weight:700;">{verdict}</span>'
-                f'</div>'
-                # metrics
-                f'<div style="display:flex;gap:16px;flex-wrap:wrap;padding:12px 16px;">'
-                f'<div><div style="color:#cbd5e1;font-size:9px;">ENTRY</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#aaa;font-size:13px;">₹{entry_px:,.2f}</div></div>'
-                f'<div><div style="color:#cbd5e1;font-size:9px;">CURRENT</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:13px;">₹{curr_px:,.2f}</div></div>'
-                f'<div><div style="color:#cbd5e1;font-size:9px;">DAY</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:{day_col};font-size:13px;font-weight:600;">{day_str}</div></div>'
-                f'<div><div style="color:#cbd5e1;font-size:9px;">QTY</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#aaa;font-size:13px;">{qty}</div></div>'
-                f'<div><div style="color:#cbd5e1;font-size:9px;">P&L</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:{pnl_col};font-size:13px;font-weight:700;">'
-                f'{"+"}' + f'{pnl_pct:.1f}% (₹{pnl_abs:+,.0f})</div></div>'
-                + trail_bit +
-                f'</div>'
-                # exit pressure bar
-                f'<div style="padding:4px 16px 8px;">'
-                f'<div style="display:flex;justify-content:space-between;margin-bottom:3px;">'
-                f'<span style="color:#cbd5e1;font-size:9px;">EXIT PRESSURE</span>'
-                f'<span style="color:{vc};font-size:9px;font-weight:700;">{bar}/100</span></div>'
-                f'<div style="background:#1e1e40;border-radius:2px;height:4px;">'
-                f'<div style="background:{vc};width:{bar}%;height:4px;border-radius:2px;"></div></div></div>'
-                # triggers
-                f'<div style="padding:4px 16px 10px;">{trig_html}</div>'
-                f'</div></div>',
+                f'<div style="display:flex;align-items:center;gap:10px;'
+                f'margin:20px 0 8px;padding-bottom:5px;border-bottom:1px solid {_grp_col}44;">'
+                f'<span style="font-family:Syne,sans-serif;font-size:13px;font-weight:700;'
+                f'color:{_grp_col};letter-spacing:0.06em;text-transform:uppercase;">{_grp_label}</span>'
+                f'<span style="background:{_grp_col}22;border:1px solid {_grp_col}55;color:{_grp_col};'
+                f'font-size:10px;padding:1px 8px;border-radius:10px;">{len(_group_pos)}</span>'
+                f'</div>',
                 unsafe_allow_html=True,
             )
 
-            ac1, ac2, ac3 = st.columns([3, 2, 1])
-            with ac1:
-                if verdict == EXIT_CONFIRM_LBL: st.error("⚠️ Consider full exit or tight trailing stop")
-                elif verdict == EXIT_SIGNAL_LBL: st.warning("🔶 Consider 50% exit to lock gains")
-                elif verdict == EXIT_WATCH_LBL: st.info("👁 Monitor closely — tighten stop")
-            with ac3:
-                if st.button("🗑 Remove", key=f"rm_{sym}_{pos.get('entry_date','')}"):
-                    st.session_state["open_positions"] = [
-                        p for p in st.session_state["open_positions"]
-                        if not (p.get("symbol") == sym and p.get("entry_date") == pos.get("entry_date"))
-                    ]
-                    _db_save("bs_positions", st.session_state["open_positions"])
-                    st.rerun()
+            for pos in _group_pos:
+                sym      = pos["symbol"]
+                er       = exit_res.get(sym)
+                verdict  = er.verdict if er else EXIT_HOLD
+                ex_score = er.exit_score if er else 0
+                triggers = er.triggers if er else []
+                trail_sl = er.trailing_stop if er else None
+                entry_px = pos.get("entry_price", 0)
+                curr_px  = (er.current_price if (er and er.current_price) else entry_px)
+                qty      = pos.get("qty", 0)
+                mode_p   = pos.get("mode", "Swing")
+                day_pct  = er.day_pct if er else 0.0
+
+                pnl_pct  = (curr_px - entry_px) / entry_px * 100 if entry_px else 0
+                pnl_abs  = (curr_px - entry_px) * qty
+                pnl_col  = "#22c55e" if pnl_pct >= 0 else "#ef4444"
+                day_col  = "#22c55e" if day_pct >= 0 else "#ef4444"
+                day_str  = f"+{day_pct:.2f}%" if day_pct >= 0 else f"{day_pct:.2f}%"
+                vc       = EXIT_COLORS.get(verdict, "#22aa55")
+                bar      = min(int(ex_score), 100)
+
+                trig_html = "".join(
+                    f'<span style="background:#1e1e40;border:1px solid #555;color:#ccc;'
+                    f'padding:2px 8px;border-radius:4px;font-size:9px;margin:1px;">⚡ {t}</span>'
+                    for t in triggers
+                ) or '<span style="color:#3a3a60;font-size:9px;">No exit triggers</span>'
+
+                trail_bit = (
+                    f'<div style="flex:0 0 auto;">'
+                    f'<div style="color:#cbd5e1;font-size:9px;">TRAIL SL</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;color:#f59e0b;font-size:13px;font-weight:600;">₹{trail_sl:,.2f}</div>'
+                    f'</div>'
+                ) if trail_sl else ""
+
+                # ── Caution strip embedded in card ──────────────────────────────
+                if verdict == EXIT_CONFIRM_LBL:
+                    _caution_html = (
+                        f'<div style="background:#cc444418;border-left:3px solid #cc4444;'
+                        f'padding:6px 14px;font-size:10px;color:#f87171;font-family:DM Sans,sans-serif;">'
+                        f'⚠️ Consider full exit or tight trailing stop</div>'
+                    )
+                elif verdict == EXIT_SIGNAL_LBL:
+                    _caution_html = (
+                        f'<div style="background:#ff880018;border-left:3px solid #ff8800;'
+                        f'padding:6px 14px;font-size:10px;color:#fdba74;font-family:DM Sans,sans-serif;">'
+                        f'🔶 Consider 50% exit to lock gains</div>'
+                    )
+                elif verdict == EXIT_WATCH_LBL:
+                    _caution_html = (
+                        f'<div style="background:#f59e0b18;border-left:3px solid #f59e0b;'
+                        f'padding:6px 14px;font-size:10px;color:#fcd34d;font-family:DM Sans,sans-serif;">'
+                        f'👁 Monitor closely — tighten stop</div>'
+                    )
+                else:
+                    _caution_html = ""
+
+                st.markdown(
+                    f'<div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:0px;">'
+                    f'<div style="background:#111120;border:1.5px solid {vc};border-radius:12px 12px 0 0;'
+                    f'overflow:hidden;box-shadow:0 2px 12px {vc}22;'
+                    f'width:360px;min-width:320px;max-width:380px;flex:1 1 360px;">'
+                    # header
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;'
+                    f'padding:12px 16px 10px;border-bottom:1px solid #1e1e40;">'
+                    f'<div><span style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:16px;font-weight:700;">{sym}</span>'
+                    f'<span style="color:#cbd5e1;font-size:11px;font-family:DM Sans,sans-serif;margin-left:8px;">'
+                    f'{SECTOR_MAP.get(sym,"—")} · {mode_p}</span></div>'
+                    f'<span style="background:{vc}22;border:1px solid {vc};color:{vc};'
+                    f'padding:4px 12px;border-radius:6px;font-size:11px;font-weight:700;">{verdict}</span>'
+                    f'</div>'
+                    # metrics
+                    f'<div style="display:flex;gap:16px;flex-wrap:wrap;padding:12px 16px;">'
+                    f'<div><div style="color:#cbd5e1;font-size:9px;">ENTRY</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;color:#aaa;font-size:13px;">₹{entry_px:,.2f}</div></div>'
+                    f'<div><div style="color:#cbd5e1;font-size:9px;">CURRENT</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:13px;">₹{curr_px:,.2f}</div></div>'
+                    f'<div><div style="color:#cbd5e1;font-size:9px;">DAY</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;color:{day_col};font-size:13px;font-weight:600;">{day_str}</div></div>'
+                    f'<div><div style="color:#cbd5e1;font-size:9px;">QTY</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;color:#aaa;font-size:13px;">{qty}</div></div>'
+                    f'<div><div style="color:#cbd5e1;font-size:9px;">P&L</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;color:{pnl_col};font-size:13px;font-weight:700;">'
+                    f'{"+"}' + f'{pnl_pct:.1f}% (₹{pnl_abs:+,.0f})</div></div>'
+                    + trail_bit +
+                    f'</div>'
+                    # exit pressure bar
+                    f'<div style="padding:4px 16px 8px;">'
+                    f'<div style="display:flex;justify-content:space-between;margin-bottom:3px;">'
+                    f'<span style="color:#cbd5e1;font-size:9px;">EXIT PRESSURE</span>'
+                    f'<span style="color:{vc};font-size:9px;font-weight:700;">{bar}/100</span></div>'
+                    f'<div style="background:#1e1e40;border-radius:2px;height:4px;">'
+                    f'<div style="background:{vc};width:{bar}%;height:4px;border-radius:2px;"></div></div></div>'
+                    # triggers
+                    f'<div style="padding:4px 16px 10px;">{trig_html}</div>'
+                    # caution strip (empty when HOLD)
+                    + _caution_html +
+                    f'</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+                # ── Remove button flush to card bottom ─────────────────────────
+                _, _rm_col = st.columns([5, 1])
+                with _rm_col:
+                    if st.button("🗑 Remove", key=f"rm_{sym}_{pos.get('entry_date','')}", use_container_width=True):
+                        st.session_state["open_positions"] = [
+                            p for p in st.session_state["open_positions"]
+                            if not (p.get("symbol") == sym and p.get("entry_date") == pos.get("entry_date"))
+                        ]
+                        _db_save("bs_positions", st.session_state["open_positions"])
+                        st.rerun()
+                st.markdown('<div style="margin-bottom:14px;"></div>', unsafe_allow_html=True)
