@@ -3528,7 +3528,6 @@ with tab_analytics:
 # ═══════════════════════════════════════════════════════════════════════════════
 # 💼 PORTFOLIO TAB  (open positions with exit signals)
 # ═══════════════════════════════════════════════════════════════════════════════
-
 with tab_portfolio:
 
     st.markdown(
@@ -3536,7 +3535,6 @@ with tab_portfolio:
         'color:#e8e8f4;margin-bottom:12px;">💼 Open Positions & Exit Signals</div>',
         unsafe_allow_html=True,
     )
-
     # ── Add position ───────────────────────────────────────────
     with st.expander("➕ Add Position", expanded=False):
         pf1, pf2, pf3, pf4 = st.columns([2, 2, 1, 1])
@@ -3632,40 +3630,41 @@ with tab_portfolio:
                 caution = "👁 Watch"
 
             st.markdown(f"""
-            <div style="background:#111120;border:1.5px solid {vc};
-            border-radius:12px;padding:10px;margin-bottom:10px;
-            box-shadow:0 3px 12px {vc}33;">
-
-                <div style="display:flex;justify-content:space-between;">
-                    <div>
-                        <div style="font-weight:700;color:#e8e8f4;">{sym}</div>
-                        <div style="font-size:10px;color:#94a3b8;">{mode_p}</div>
-                    </div>
-                    <div style="color:{vc};font-weight:700;">{verdict}</div>
-                </div>
-
-                <div style="font-size:20px;">₹{curr_px:,.2f}</div>
-                <div style="color:{day_col};font-size:12px;">{day_pct:+.2f}%</div>
-
-                <div style="font-size:11px;margin-top:6px;">
-                    Entry ₹{entry_px} | Qty {qty} |
-                    <span style="color:{pnl_col};">{pnl_pct:+.1f}%</span>
-                </div>
-
-                <div style="margin-top:6px;font-size:10px;">EXIT {score}/100</div>
-                <div style="background:#1e1e40;height:4px;">
-                    <div style="background:{vc};width:{score}%;height:4px;"></div>
-                </div>
-
-                <div style="margin-top:6px;color:#f59e0b;font-size:11px;">
-                    {caution}
-                </div>
-
-            </div>
-            """, unsafe_allow_html=True)
-
-            col1, col2, col3 = st.columns([2,2,1])
-
+              <div style="background:#111120;border:1.5px solid {vc};
+              border-radius:12px;padding:10px;margin-bottom:10px;
+              box-shadow:0 3px 12px {vc}33;">
+              
+                  <div style="display:flex;justify-content:space-between;">
+                      <div>
+                          <div style="font-weight:700;color:#e8e8f4;">{sym}</div>
+                          <div style="font-size:10px;color:#94a3b8;">{mode_p}</div>
+                      </div>
+                      <div style="color:{vc};font-weight:700;">{verdict}</div>
+                  </div>
+              
+                  <div style="font-size:20px;">₹{curr_px:,.2f}</div>
+                  <div style="color:{day_col};font-size:12px;">{day_pct:+.2f}%</div>
+              
+                  <div style="font-size:11px;margin-top:6px;">
+                      Entry ₹{entry_px} | Qty {qty} |
+                      <span style="color:{pnl_col};">{pnl_pct:+.1f}%</span>
+                  </div>
+              
+                  <div style="margin-top:6px;font-size:10px;">
+                      EXIT {score}/100
+                  </div>
+              
+                  <div style="background:#1e1e40;height:4px;">
+                      <div style="background:{vc};width:{score}%;height:4px;"></div>
+                  </div>
+              
+                  <div style="margin-top:6px;color:#f59e0b;font-size:11px;">
+                      {caution}
+                  </div>
+              
+              </div>
+              """, unsafe_allow_html=True)
+              ``
             with col1:
                 if verdict == EXIT_SIGNAL_LBL:
                     if st.button("➖ Reduce", key=f"reduce_{sym}"):
