@@ -196,40 +196,77 @@ NIFTY50 = (
 # If sectors.py is available, invert the SECTORS dict so every symbol maps to
 # its primary sector (first matching sector wins).  Falls back to the compact
 # hardcoded map when sectors.py is missing.
-if _SECTORS:
-    SECTOR_MAP: dict[str, str] = {}
-    for _sector_name, _syms in _SECTORS.items():
-        if _syms is None:   # "Nifty 500" → None = use nse500 list, skip for map
-            continue
-        for _sym in _syms:
-            if _sym not in SECTOR_MAP:       # first sector listed wins
-                SECTOR_MAP[_sym] = _sector_name
-else:
-    SECTOR_MAP = {
-        "RELIANCE":"Energy & Power","ONGC":"Energy & Power","BPCL":"Energy & Power",
-        "COALINDIA":"Energy & Power","NTPC":"Energy & Power","POWERGRID":"Energy & Power",
-        "ADANIENT":"Energy & Power",
-        "ADANIPORTS":"Infrastructure & Construction","LT":"Infrastructure & Construction",
-        "BHEL":"Capital Goods & Engineering",
-        "HDFCBANK":"Banking & Finance","ICICIBANK":"Banking & Finance","SBIN":"Banking & Finance",
-        "KOTAKBANK":"Banking & Finance","AXISBANK":"Banking & Finance","BAJFINANCE":"Banking & Finance",
-        "BAJAJFINSV":"Banking & Finance","SBILIFE":"Banking & Finance","HDFCLIFE":"Banking & Finance",
-        "ICICIPRULI":"Banking & Finance","INDUSINDBK":"Banking & Finance",
-        "TCS":"IT & Technology","INFY":"IT & Technology","WIPRO":"IT & Technology",
-        "HCLTECH":"IT & Technology","TECHM":"IT & Technology",
-        "SUNPHARMA":"Pharma & Healthcare","DRREDDY":"Pharma & Healthcare",
-        "CIPLA":"Pharma & Healthcare","DIVISLAB":"Pharma & Healthcare","APOLLOHOSP":"Pharma & Healthcare",
-        "HINDUNILVR":"FMCG & Consumer","ITC":"FMCG & Consumer","NESTLEIND":"FMCG & Consumer",
-        "BRITANNIA":"FMCG & Consumer","TATACONSUM":"FMCG & Consumer",
-        "ASIANPAINT":"Paints & Chemicals","ULTRACEMCO":"Infrastructure & Construction",
-        "GRASIM":"Infrastructure & Construction",
-        "TATASTEEL":"Metals & Mining","JSWSTEEL":"Metals & Mining","HINDALCO":"Metals & Mining",
-        "VEDL":"Metals & Mining","NMDC":"Metals & Mining",
-        "MARUTI":"Auto & Auto Ancillaries","TATAMOTORS":"Auto & Auto Ancillaries",
-        "M&M":"Auto & Auto Ancillaries","EICHERMOT":"Auto & Auto Ancillaries",
-        "HEROMOTOCO":"Auto & Auto Ancillaries","BAJAJ-AUTO":"Auto & Auto Ancillaries",
-        "TITAN":"FMCG & Consumer","BHARTIARTL":"Telecom & Media",
-    }
+SECTOR_MAP: dict[str, str] = {}
+
+# ✅ 1. Try loading from CSV (preferred)
+try:
+    df = pd.read_csv("nse500_clean_sample.csv")  # or your GitHub raw URL
+
+    # clean symbols (important)
+    df["Symbol"] = df["Symbol"].astype(str).str.replace(".NS", "", regex=False).str.strip()
+
+    # optional: normalize sector names
+    df["Sector"] = df["Sector"].astype(str).str.upper().str.strip()
+
+    SECTOR_MAP = dict(zip(df["Symbol"], df["Sector"]))
+
+# ✅ 2. If CSV fails → fall back to SECTORS dict
+except Exception:
+
+    if _SECTORS:
+        for _sector_name, _syms in _SECTORS.items():
+            if _syms is None:
+                continue
+            for _sym in _syms:
+                if _sym not in SECTOR_MAP:   # first sector wins
+                    SECTOR_MAP[_sym] = _sector_name
+
+    else:
+        # ✅ 3. Final hard fallback
+        SECTOR_MAP = {
+            "RELIANCE": "ENERGY & POWER",
+            "ONGC": "ENERGY & POWER",
+            "BPCL": "ENERGY & POWER",
+            "COALINDIA": "ENERGY & POWER",
+            "NTPC": "ENERGY & POWER",
+            "POWERGRID": "ENERGY & POWER",
+            "ADANIENT": "ENERGY & POWER",
+
+            "ADANIPORTS": "INFRASTRUCTURE",
+            "LT": "INFRASTRUCTURE",
+            "BHEL": "CAPITAL GOODS",
+
+            "HDFCBANK": "FINANCIALS",
+            "ICICIBANK": "FINANCIALS",
+            "SBIN": "FINANCIALS",
+            "KOTAKBANK": "FINANCIALS",
+            "AXISBANK": "FINANCIALS",
+            "BAJFINANCE": "FINANCIALS",
+            "BAJAJFINSV": "FINANCIALS",
+
+            "TCS": "IT",
+            "INFY": "IT",
+            "WIPRO": "IT",
+            "HCLTECH": "IT",
+            "TECHM": "IT",
+
+            "SUNPHARMA": "PHARMA",
+            "DRREDDY": "PHARMA",
+            "CIPLA": "PHARMA",
+
+            "HINDUNILVR": "CONSUMER",
+            "ITC": "CONSUMER",
+            "NESTLEIND": "CONSUMER",
+            "BRITANNIA": "CONSUMER",
+
+            "TATASTEEL": "METALS",
+            "JSWSTEEL": "METALS",
+            "HINDALCO": "METALS",
+
+            "MARUTI": "AUTO",
+            "TATAMOTORS": "AUTO",
+        }
+
 
 MODE_CFG = {
     "Intraday":   dict(period="5d",  interval="5m",  ema_fast=9,  ema_slow=21,
