@@ -270,30 +270,83 @@ _phase_lock = threading.Lock()
 def _cache_path(sym: str, interval: str) -> Path:
     return _CACHE_DIR / f"{sym.replace('.NS','').upper()}_{interval}.parquet"
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Key change: call _normalize_index so the returned DataFrame always has a
+# tz-aware DatetimeIndex regardless of how pyarrow or Polars reconstructed it.
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _load_cached(sym: str, interval: str) -> Optional[pd.DataFrame]:
-    """Load cached historical bars from parquet."""
+    """Load cached historical bars; always returns a tz-aware DatetimeIndex."""
     p = _cache_path(sym, interval)
     if not p.exists():
         return None
     try:
         if _POLARS_OK:
-            return pl.read_parquet(p).to_pandas()
-        return pd.read_parquet(p)
+            # Polars may strip tz info on round-trip; _normalize_index fixes it
+            df = pl.read_parquet(p).to_pandas()
+        else:
+            df = pd.read_parquet(p)
+        return _normalize_index(df)
     except Exception:
         return None
 
+# ══════════════════════════════════════════════════════════════════════════════
+# NEW HELPER — insert once, just above _save_cached
+# ══════════════════════════════════════════════════════════════════════════════
+_IST = "Asia/Kolkata"
+
+def _normalize_index(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Guarantee that df has a tz-aware DatetimeIndex in Asia/Kolkata.
+
+    Handles three situations that arise at the cache/fetch boundary:
+      1. Index is already a tz-aware DatetimeIndex (live fetch path) → convert tz.
+      2. Index is a tz-naive DatetimeIndex (Polars round-trip strips tz) → localize.
+      3. Index is RangeIndex and a datetime column exists (save/load mismatch) → promote.
+    """
+    if df is None or df.empty:
+        return df
+
+    # ── Case 3: index column was saved as a data column ──────────────────────
+    if not isinstance(df.index, pd.DatetimeIndex):
+        for col in ("ts", "Datetime", "datetime", "index", "Date", "date"):
+            if col in df.columns:
+                df = df.copy()
+                series = pd.to_datetime(df[col], errors="coerce")
+                if series.dt.tz is None:
+                    series = series.dt.tz_localize("UTC").dt.tz_convert(_IST)
+                else:
+                    series = series.dt.tz_convert(_IST)
+                df.index = series
+                df = df.drop(columns=[col])
+                break
+
+    # ── Cases 1 & 2: fix timezone on existing DatetimeIndex ──────────────────
+    if isinstance(df.index, pd.DatetimeIndex):
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC").tz_convert(_IST)
+        elif str(df.index.tz) != _IST:
+            df.index = df.index.tz_convert(_IST)
+
+    return df
+# ══════════════════════════════════════════════════════════════════════════════
+# Key change: save the timestamp column as "ts" (predictable name) instead of
+# relying on the default "index" name that reset_index() produces.
+# ══════════════════════════════════════════════════════════════════════════════
 def _save_cached(sym: str, interval: str, df: pd.DataFrame):
-    """Save historical bars to parquet (silently skip if pyarrow missing)."""
+    """Save historical bars to parquet with a reliable 'ts' timestamp column."""
     if not _PARQUET_OK:
         return
     try:
-        p = _cache_path(sym, interval)
+        p       = _cache_path(sym, interval)
         df_save = df.copy()
         if isinstance(df_save.index, pd.DatetimeIndex):
+            df_save.index.name = "ts"          # always 'ts', never unnamed "index"
             df_save = df_save.reset_index()
         df_save.to_parquet(p, index=False, compression="snappy")
     except Exception:
         pass
+
 
 def _cache_is_fresh(sym: str, interval: str, max_age_hours: float) -> bool:
     p = _cache_path(sym, interval)
@@ -493,9 +546,10 @@ def _incremental_fetch(sym: str, mode: str,
                                     interval, concurrency=1)
             tail_df   = tail_map.get(sym, pd.DataFrame())
             if not tail_df.empty:
+                cached  = _normalize_index(cached)
+                tail_df = _normalize_index(tail_df)
                 df = pd.concat([cached, tail_df])
-                # deduplicate by index
-                df = df[~df.index.duplicated(keep="last")].sort_index()
+                df = df[~df.index.duplicated(keep="last")].sort_index()df = pd.concat([cached, tail_df])
                 _save_cached(sym, interval, df)
                 return df
         # market closed → use cache as-is
@@ -508,18 +562,56 @@ def _incremental_fetch(sym: str, mode: str,
         _save_cached(sym, interval, df)
     return df
 
-def batch_incremental_fetch(symbols: list, mode: str,
-                             force_full: bool = False,
-                             progress_cb=None) -> dict[str, pd.DataFrame]:
+def _incremental_fetch_FIXED(sym: str, mode: str, force_full: bool = False) -> pd.DataFrame:
     """
-    Batch incremental fetch with two paths:
-    a) cold start (morning) → full async fetch for all, save to parquet.
-    b) warm start → split symbols into "needs-full" vs "can-append".
+    FIXED version of _incremental_fetch.
+    Only the merge block (was lines 495-499) is changed.
     """
-    cfg       = MODE_CFG[mode]
-    interval  = cfg["interval"]
-    period    = cfg["yf_period"]
-    min_bars  = cfg["hist_min_bars"]
+    cfg      = MODE_CFG[mode]
+    interval = cfg["interval"]
+    period   = cfg["yf_period"]
+
+    _STALE_H = {"Intraday": 0.25, "Swing": 12, "Positional": 24}
+    stale_h  = _STALE_H[mode]
+
+    cached = _load_cached(sym, interval) if not force_full else None
+
+    if cached is not None and len(cached) >= cfg["hist_min_bars"]:
+        if _is_market_open():
+            tail_map = fetch_async([sym], "1d" if interval not in ("1d",) else "5d",
+                                   interval, concurrency=1)
+            tail_df  = tail_map.get(sym, pd.DataFrame())
+            if not tail_df.empty:
+                # FIX: normalize both sides before concat
+                cached  = _normalize_index(cached)
+                tail_df = _normalize_index(tail_df)
+                df = pd.concat([cached, tail_df])
+                df = df[~df.index.duplicated(keep="last")].sort_index()
+                _save_cached(sym, interval, df)
+                return df
+        return cached
+
+    raw = fetch_async([sym], period, interval, concurrency=1)
+    df  = raw.get(sym, pd.DataFrame())
+    if not df.empty:
+        _save_cached(sym, interval, df)
+    return df
+
+
+def batch_incremental_fetch_FIXED(
+    symbols: list,
+    mode: str,
+    force_full: bool = False,
+    progress_cb=None,
+) -> dict:
+    """
+    FIXED version of batch_incremental_fetch.
+    Only the merge block (was lines 557-561) is changed.
+    """
+    cfg      = MODE_CFG[mode]
+    interval = cfg["interval"]
+    period   = cfg["yf_period"]
+    min_bars = cfg["hist_min_bars"]
 
     need_full  = []
     can_append = []
@@ -534,7 +626,6 @@ def batch_incremental_fetch(symbols: list, mode: str,
 
     total = len(symbols)
 
-    # ── Full fetch batch (async) ───────────────────────────────────────────
     if need_full:
         fresh = fetch_async(need_full, period, interval, concurrency=64)
         for sym, df in fresh.items():
@@ -546,15 +637,17 @@ def batch_incremental_fetch(symbols: list, mode: str,
         if progress_cb:
             progress_cb(len(need_full) / total)
 
-    # ── Append-only for warm symbols ───────────────────────────────────────
     if can_append and _is_market_open():
         live_int = cfg.get("live_interval", interval)
         tails    = fetch_async(can_append, "1d", live_int, concurrency=64)
-        done = len(need_full)
+        done     = len(need_full)
         for sym in can_append:
             cached = _load_cached(sym, interval)
             tail   = tails.get(sym, pd.DataFrame())
             if cached is not None and not tail.empty:
+                # FIX: normalize both sides before concat
+                cached = _normalize_index(cached)
+                tail   = _normalize_index(tail)
                 merged = pd.concat([cached, tail])
                 merged = merged[~merged.index.duplicated(keep="last")].sort_index()
                 _save_cached(sym, interval, merged)
@@ -567,7 +660,6 @@ def batch_incremental_fetch(symbols: list, mode: str,
             if progress_cb:
                 progress_cb(done / total)
     else:
-        # Market closed → use cache directly
         for sym in can_append:
             cached = _load_cached(sym, interval)
             results[sym] = cached if cached is not None else pd.DataFrame()
