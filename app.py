@@ -1,4 +1,4 @@
-"""BULL SUTRA Pro — v15.0
+"""BULL SUTRA Pro — v15.2
 ═══════════════════════════════════════════════════════════════════
 BASE: v14.3 — all prior fixes 100% preserved.
 
@@ -222,7 +222,7 @@ MODE_CFG = {
                        live_interval="1d", hist_min_bars=50),
 }
 
-BULL_MAX        = 120
+BULL_MAX        = 140
 ACTION_THRESHOLDS = dict(strong_buy=75, buy=58, watch=42)
 
 PHASE_IDLE  = "IDLE";  PHASE_SETUP = "SETUP"; PHASE_ENTRY = "ENTRY"
@@ -1448,6 +1448,463 @@ def _compute_vol_contraction(df: pd.DataFrame) -> float:
     return atr5/(atr20+1e-10)
 
 # ══════════════════════════════════════════════════════════════════════════════
+# v15.1 + v15.2  PATTERN ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── FIX-A  Closed-candle helper ───────────────────────────────────────────────
+def _closed_candle_df(df: pd.DataFrame, mode: str, market_open: bool) -> pd.DataFrame:
+    if mode == "Intraday" and market_open and len(df) > 1:
+        return df.iloc[:-1]
+    return df
+
+# ── FIX-D  Pivot tolerance ────────────────────────────────────────────────────
+_PIVOT_TOL = {"Intraday": 0.25, "Swing": 0.15, "Positional": 0.10}
+
+def _tol(atr_val: float, mode: str) -> float:
+    return atr_val * _PIVOT_TOL.get(mode, 0.15)
+
+# ── PAT-1  VCP (v15.2 tolerance-aware) ───────────────────────────────────────
+def detect_vcp(df: pd.DataFrame, atr_val: float = 0.0, mode: str = "Swing",
+               min_contractions: int = 2, lookback: int = 60) -> dict:
+    result = dict(detected=False, n_contractions=0, tightest_pct=0.0, vcp_grade="NONE")
+    if len(df) < max(lookback, 20):
+        return result
+    sl   = df.iloc[-lookback:]
+    hi   = sl["High"].values.astype(np.float64)
+    lo   = sl["Low"].values.astype(np.float64)
+    vol  = sl["Volume"].values.astype(np.float64)
+    n    = len(sl)
+    tol_price = _tol(atr_val, mode) if atr_val > 0 else 0.0
+    wing = 3
+    pivot_hi_idx, pivot_lo_idx = [], []
+    for i in range(wing, n - wing):
+        if hi[i] >= np.max(hi[i-wing:i+wing+1]) - tol_price:
+            pivot_hi_idx.append(i)
+        if lo[i] <= np.min(lo[i-wing:i+wing+1]) + tol_price:
+            pivot_lo_idx.append(i)
+    if len(pivot_hi_idx) < 2 or len(pivot_lo_idx) < 2:
+        return result
+    segments = []
+    for ph in pivot_hi_idx:
+        subsequent_los = [pl for pl in pivot_lo_idx if pl > ph]
+        if not subsequent_los:
+            continue
+        pl        = subsequent_los[0]
+        depth_abs = hi[ph] - lo[pl]
+        depth_pct = depth_abs / hi[ph] * 100
+        seg_vol   = float(np.mean(vol[ph:pl+1])) if pl > ph else float(vol[ph])
+        segments.append((ph, pl, depth_pct, seg_vol, depth_abs))
+    if len(segments) < 2:
+        return result
+    n_cont = 0
+    for i in range(len(segments) - 1, 0, -1):
+        cur  = segments[i]; prev = segments[i - 1]
+        if (cur[2] < prev[2] * 0.95 and cur[3] < prev[3] * 0.95
+                and (prev[4] - cur[4]) > tol_price):
+            n_cont += 1
+        else:
+            break
+    detected     = n_cont >= min_contractions
+    tightest_pct = float(segments[-1][2]) if segments else 0.0
+    if n_cont >= 4:    grade = "PERFECT"
+    elif n_cont >= 3:  grade = "GOOD"
+    elif n_cont >= 2:  grade = "FORMING"
+    else:              grade = "NONE"
+    result.update(detected=detected, n_contractions=n_cont,
+                  tightest_pct=round(tightest_pct, 2), vcp_grade=grade)
+    return result
+
+# ── PAT-2  Anchored VWAP (v15.2 tolerance-aware) ─────────────────────────────
+def compute_anchored_vwap(df: pd.DataFrame, atr_val: float = 0.0,
+                           mode: str = "Swing", lookback: int = 60) -> dict:
+    result = dict(avwap=None, anchor_idx=None, pct_above=0.0,
+                  price_above=False, near_support=False)
+    if not {"High","Low","Close","Volume"}.issubset(df.columns) or len(df) < 10:
+        return result
+    sl      = df.iloc[-lookback:]
+    closes  = sl["Close"].values.astype(np.float64)
+    highs   = sl["High"].values.astype(np.float64)
+    lows    = sl["Low"].values.astype(np.float64)
+    volumes = sl["Volume"].values.astype(np.float64)
+    n       = len(sl)
+    avg_vol  = float(np.mean(volumes)) or 1.0
+    best_idx = None; best_cl = float("inf")
+    for i in range(n - 1):
+        if closes[i] < best_cl and volumes[i] >= avg_vol * 0.8:
+            best_cl = closes[i]; best_idx = i
+    if best_idx is None:
+        best_idx = int(np.argmin(closes[:-1]))
+    typical    = (highs[best_idx:] + lows[best_idx:] + closes[best_idx:]) / 3.0
+    vols_sl    = volumes[best_idx:]
+    avwap      = float(np.cumsum(typical * vols_sl)[-1] / (np.cumsum(vols_sl)[-1] + 1e-10))
+    current    = float(closes[-1])
+    tol_abs    = _tol(atr_val, mode) if atr_val > 0 else avwap * 0.01
+    pct_above  = (current - avwap) / avwap * 100 if avwap > 0 else 0.0
+    price_above  = current > avwap - tol_abs
+    near_support = price_above and (current - avwap) < tol_abs
+    result.update(avwap=round(avwap, 2), anchor_idx=n - 1 - best_idx,
+                  pct_above=round(pct_above, 2),
+                  price_above=price_above, near_support=near_support)
+    return result
+
+# ── PAT-3  Fib Pullback Quality (v15.2 tolerance-aware) ──────────────────────
+def score_fib_pullback(df: pd.DataFrame, atr_val: float,
+                        mode: str = "Swing", lookback: int = 60) -> dict:
+    result = dict(quality=0, grade="POOR", depth_ok=False, vol_ok=False,
+                  recovery_ok=False, fib_level="—")
+    if len(df) < 20 or atr_val <= 0:
+        return result
+    sl     = df.iloc[-lookback:]
+    hi_arr = sl["High"].values.astype(np.float64)
+    lo_arr = sl["Low"].values.astype(np.float64)
+    cl_arr = sl["Close"].values.astype(np.float64)
+    vo_arr = sl["Volume"].values.astype(np.float64)
+    n      = len(sl)
+    tol_abs = _tol(atr_val, mode)
+    wing    = 3
+    phi = [i for i in range(wing, n-wing) if hi_arr[i] >= np.max(hi_arr[i-wing:i+wing+1]) - tol_abs]
+    plo = [i for i in range(wing, n-wing) if lo_arr[i] <= np.min(lo_arr[i-wing:i+wing+1]) + tol_abs]
+    if not phi or not plo:
+        return result
+    sw_hi_i  = phi[-1]
+    prior_lo = [i for i in plo if i < sw_hi_i]
+    if not prior_lo:
+        return result
+    sw_lo_i = prior_lo[-1]
+    sw_hi = float(hi_arr[sw_hi_i]); sw_lo = float(lo_arr[sw_lo_i])
+    rng   = sw_hi - sw_lo
+    if rng < atr_val * 0.5:
+        return result
+    f500    = sw_hi - rng * 0.500
+    f618    = sw_hi - rng * 0.618
+    post_lo = float(np.min(lo_arr[sw_hi_i:])); post_cl = float(cl_arr[-1])
+    depth_pct = (sw_hi - post_lo) / rng * 100
+    tol_pct   = tol_abs / rng * 100
+    def _in_zone(lo_p, hi_p):
+        return (lo_p - tol_pct) <= depth_pct <= (hi_p + tol_pct)
+    if _in_zone(38.2, 50.0):
+        depth_score = 40; depth_ok = True; fib_level = "38.2–50"
+    elif _in_zone(50.0, 61.8):
+        depth_score = 30; depth_ok = True; fib_level = "50–61.8"
+    elif _in_zone(23.6, 38.2):
+        depth_score = 15; depth_ok = False; fib_level = "23.6–38.2"
+    elif _in_zone(61.8, 78.6):
+        depth_score = 10; depth_ok = False; fib_level = "61.8–78.6"
+    else:
+        depth_score = 0;  depth_ok = False; fib_level = "Outside"
+    adv_vol = vo_arr[sw_lo_i:sw_hi_i+1]; pb_vol = vo_arr[sw_hi_i:]
+    vol_ratio = (float(np.mean(pb_vol)) if len(pb_vol) else 1.0) / \
+                (float(np.mean(adv_vol)) if len(adv_vol) else 1.0 + 1e-10)
+    if vol_ratio <= 0.60:   vol_score = 30; vol_ok = True
+    elif vol_ratio <= 0.75: vol_score = 20; vol_ok = True
+    elif vol_ratio <= 0.90: vol_score = 10; vol_ok = False
+    else:                   vol_score = 0;  vol_ok = False
+    overshoot = max(0.0, f500 - post_lo)
+    if post_cl > f500 - tol_abs and overshoot <= tol_abs * 2:
+        recovery_score = 30; recovery_ok = True
+    elif post_cl > f618 - tol_abs:
+        recovery_score = 15; recovery_ok = False
+    else:
+        recovery_score = 0;  recovery_ok = False
+    quality = depth_score + vol_score + recovery_score
+    if quality >= 80:   grade = "EXCELLENT"
+    elif quality >= 60: grade = "GOOD"
+    elif quality >= 40: grade = "FAIR"
+    else:               grade = "POOR"
+    result.update(quality=quality, grade=grade, depth_ok=depth_ok,
+                  vol_ok=vol_ok, recovery_ok=recovery_ok, fib_level=fib_level)
+    return result
+
+# ── PAT-4  Volume Dry-up (v15.2) ─────────────────────────────────────────────
+def detect_volume_dryup(df: pd.DataFrame, atr_val: float,
+                         mode: str = "Swing", window: int = 5) -> dict:
+    result = dict(dry_up=False, intensity=0, bars=0, vol_pct=100.0)
+    if len(df) < max(window + 5, 25) or atr_val <= 0:
+        return result
+    vols  = df["Volume"].values.astype(np.float64)
+    highs = df["High"].values.astype(np.float64)
+    lows  = df["Low"].values.astype(np.float64)
+    n     = len(vols)
+    avg_vol_20 = float(np.mean(vols[-21:-1])) if n >= 22 else float(np.mean(vols[:-1]))
+    if avg_vol_20 <= 0:
+        return result
+    consec = 0
+    for i in range(1, min(window + 1, n)):
+        if vols[-i] < vols[-(i+1)]: consec += 1
+        else: break
+    tight = False
+    if consec >= 2:
+        hi_r = float(np.max(highs[-consec:])); lo_r = float(np.min(lows[-consec:]))
+        tight = (hi_r - lo_r) < atr_val * 1.2
+    latest_vol_pct = float(vols[-1]) / avg_vol_20 * 100
+    dry_up = consec >= 2 and tight and latest_vol_pct < 80.0
+    if dry_up:
+        if latest_vol_pct < 40 and consec >= 4:   intensity = 3
+        elif latest_vol_pct < 60 and consec >= 3: intensity = 2
+        else:                                       intensity = 1
+    else:
+        intensity = 0
+    result.update(dry_up=dry_up, intensity=intensity,
+                  bars=consec, vol_pct=round(latest_vol_pct, 1))
+    return result
+
+# ── PAT-5  Relative Volume (v15.2) ───────────────────────────────────────────
+def compute_relative_volume(df: pd.DataFrame, lookback: int = 60) -> dict:
+    result = dict(rel_vol_pct=50.0, label="NORMAL", ratio=1.0)
+    if len(df) < 10:
+        return result
+    vols    = df["Volume"].values.astype(np.float64)
+    window  = vols[-lookback-1:-1] if len(vols) > lookback+1 else vols[:-1]
+    cur_vol = float(vols[-1])
+    if len(window) == 0 or float(np.max(window)) == 0:
+        return result
+    pct_rank = float(np.sum(window < cur_vol)) / len(window) * 100
+    avg_vol  = float(np.mean(window))
+    ratio    = cur_vol / (avg_vol + 1e-10)
+    if pct_rank >= 85:   label = "SURGE"
+    elif pct_rank >= 65: label = "HIGH"
+    elif pct_rank >= 30: label = "NORMAL"
+    else:                label = "DRY"
+    result.update(rel_vol_pct=round(pct_rank, 1), label=label, ratio=round(ratio, 2))
+    return result
+
+# ── PAT-6  Darvas Box (v15.2 tolerance-aware) ────────────────────────────────
+def detect_darvas_box(df: pd.DataFrame, atr_val: float,
+                       mode: str = "Swing", lookback: int = 60) -> dict:
+    result = dict(in_box=False, breakout=False, box_top=0.0, box_bottom=0.0,
+                  box_width_pct=0.0, bars_in_box=0)
+    if len(df) < 20 or atr_val <= 0:
+        return result
+    sl     = df.iloc[-lookback:]
+    hi_arr = sl["High"].values.astype(np.float64)
+    lo_arr = sl["Low"].values.astype(np.float64)
+    cl_arr = sl["Close"].values.astype(np.float64)
+    n      = len(sl)
+    tol    = _tol(atr_val, mode)
+    peak_i   = int(np.argmax(hi_arr)); box_top = float(hi_arr[peak_i])
+    if peak_i >= n - 3: peak_i = max(0, peak_i - 3)
+    top_confirmed = False; top_i = peak_i; consec_below = 0
+    for i in range(peak_i + 1, min(peak_i + 10, n)):
+        if hi_arr[i] < box_top + tol:
+            consec_below += 1
+            if consec_below >= 3: top_confirmed = True; top_i = i; break
+        else:
+            box_top = float(hi_arr[i]); consec_below = 0
+    if not top_confirmed:
+        return result
+    sub_lo = lo_arr[top_i:]
+    if len(sub_lo) < 4:
+        return result
+    trough_i   = int(np.argmin(sub_lo)) + top_i
+    box_bottom = float(lo_arr[trough_i])
+    btm_confirmed = False; consec_above = 0
+    for i in range(trough_i + 1, min(trough_i + 10, n)):
+        if lo_arr[i] > box_bottom - tol:
+            consec_above += 1
+            if consec_above >= 3: btm_confirmed = True; break
+        else:
+            box_bottom = float(lo_arr[i]); consec_above = 0
+    if not btm_confirmed:
+        return result
+    cur      = float(cl_arr[-1])
+    in_box   = (box_bottom - tol) <= cur <= (box_top + tol)
+    breakout = cur > box_top + tol
+    box_width_pct = (box_top - box_bottom) / box_bottom * 100 if box_bottom > 0 else 0.0
+    result.update(in_box=in_box, breakout=breakout,
+                  box_top=round(box_top, 2), box_bottom=round(box_bottom, 2),
+                  box_width_pct=round(box_width_pct, 2), bars_in_box=n - trough_i)
+    return result
+
+# ── score_all_patterns (FIX-A closed-candle aware) ───────────────────────────
+def score_all_patterns(df: pd.DataFrame, atr_val: float,
+                        mode: str = "Swing", market_open: bool = False) -> tuple:
+    closed = _closed_candle_df(df, mode, market_open)
+    if len(closed) < 20:
+        return 0, {}
+    vcp    = detect_vcp(closed,            atr_val=atr_val, mode=mode)
+    avwap  = compute_anchored_vwap(closed, atr_val=atr_val, mode=mode)
+    fibq   = score_fib_pullback(closed,    atr_val=atr_val, mode=mode)
+    vdu    = detect_volume_dryup(closed,   atr_val=atr_val, mode=mode)
+    rvol   = compute_relative_volume(closed)
+    darvas = detect_darvas_box(closed,     atr_val=atr_val, mode=mode)
+    points = 0
+    if vcp["n_contractions"] >= 3:    points += 14
+    elif vcp["n_contractions"] >= 2:  points += 7
+    if avwap["price_above"]:          points += 8
+    if avwap["near_support"]:         points += 4
+    fq = fibq["quality"]
+    if fq >= 75:                      points += 10
+    elif fq >= 50:                    points += 5
+    if vdu["intensity"] >= 2:         points += 8
+    elif vdu["intensity"] == 1:       points += 4
+    rvp = rvol["rel_vol_pct"]
+    if rvp >= 85:                     points += 10
+    elif rvp >= 65:                   points += 5
+    if darvas["breakout"]:            points += 12
+    elif darvas["in_box"]:            points += 6
+    patterns = dict(vcp=vcp, avwap=avwap, fib_quality=fibq,
+                    vol_dryup=vdu, rel_vol=rvol, darvas=darvas,
+                    total_pattern_pts=points)
+    return points, patterns
+
+# ── FIX-B  Gated pattern enrichment pass (called after Stage-B in run_scan) ──
+PATTERN_ENRICH_SCORE_MIN = 45
+PATTERN_ENRICH_PHASES    = {"ENTRY", "CONT", "BREAKOUT", "SETUP"}
+
+_EMPTY_PAT = dict(
+    vcp=dict(detected=False, n_contractions=0, tightest_pct=0.0, vcp_grade="NONE"),
+    avwap=dict(avwap=None, price_above=False, near_support=False, pct_above=0.0),
+    fib_quality=dict(quality=0, grade="POOR", depth_ok=False, vol_ok=False,
+                     recovery_ok=False, fib_level="—"),
+    vol_dryup=dict(dry_up=False, intensity=0, bars=0, vol_pct=100.0),
+    rel_vol=dict(rel_vol_pct=50.0, label="NORMAL", ratio=1.0),
+    darvas=dict(in_box=False, breakout=False, box_top=0.0, box_bottom=0.0,
+                box_width_pct=0.0, bars_in_box=0),
+    total_pattern_pts=0,
+)
+
+def _apply_empty_pat(r: dict) -> dict:
+    r["Patterns"]     = dict(_EMPTY_PAT)
+    r["VCP"]          = False; r["VCPGrade"]     = "NONE"
+    r["AVWAP"]        = None;  r["AVWAPAbove"]   = False
+    r["FibQuality"]   = 0;     r["FibGrade"]     = "POOR"
+    r["VolDryup"]     = False; r["VDUIntensity"] = 0
+    r["RVolPct"]      = 50.0;  r["RVolLabel"]    = "NORMAL"
+    r["DarvasIn"]     = False; r["DarvasBrk"]    = False; r["DarvasTop"] = 0.0
+    return r
+
+def enrich_with_patterns(results: list, data: dict,
+                          mode: str, market_open: bool) -> list:
+    to_enrich   = []
+    passthrough = []
+    for r in results:
+        sym   = r.get("Symbol", "")
+        phase = r.get("Phase", "")
+        score = r.get("Score", 0)
+        if (score >= PATTERN_ENRICH_SCORE_MIN
+                and phase in PATTERN_ENRICH_PHASES
+                and sym in data
+                and data[sym] is not None
+                and not data[sym].empty):
+            to_enrich.append(r)
+        else:
+            passthrough.append(r)
+    for r in passthrough:
+        _apply_empty_pat(r)
+
+    def _enrich_one(r):
+        sym     = r["Symbol"]
+        df      = data[sym]
+        atr_val = r.get("ATR", 0.0)
+        try:
+            pts, patterns = score_all_patterns(df, atr_val=atr_val,
+                                               mode=mode, market_open=market_open)
+        except Exception:
+            pts, patterns = 0, {}
+        r["Patterns"]     = patterns
+        r["VCP"]          = patterns.get("vcp", {}).get("detected", False)
+        r["VCPGrade"]     = patterns.get("vcp", {}).get("vcp_grade", "NONE")
+        r["AVWAP"]        = patterns.get("avwap", {}).get("avwap")
+        r["AVWAPAbove"]   = patterns.get("avwap", {}).get("price_above", False)
+        r["FibQuality"]   = patterns.get("fib_quality", {}).get("quality", 0)
+        r["FibGrade"]     = patterns.get("fib_quality", {}).get("grade", "POOR")
+        r["VolDryup"]     = patterns.get("vol_dryup", {}).get("dry_up", False)
+        r["VDUIntensity"] = patterns.get("vol_dryup", {}).get("intensity", 0)
+        r["RVolPct"]      = patterns.get("rel_vol", {}).get("rel_vol_pct", 50.0)
+        r["RVolLabel"]    = patterns.get("rel_vol", {}).get("label", "NORMAL")
+        r["DarvasIn"]     = patterns.get("darvas", {}).get("in_box", False)
+        r["DarvasBrk"]    = patterns.get("darvas", {}).get("breakout", False)
+        r["DarvasTop"]    = patterns.get("darvas", {}).get("box_top", 0.0)
+        if pts > 0:
+            old_score  = r.get("Score", 0)
+            r["Score"] = round(min(100.0, old_score + pts * 0.5), 1)
+            ns = r["Score"]
+            if ns >= 75:   r["Action"] = "STRONG BUY"
+            elif ns >= 58: r["Action"] = "BUY"
+            elif ns >= 42: r["Action"] = "WATCH"
+        return r
+
+    n_enrich = len(to_enrich)
+    if n_enrich:
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(16, n_enrich)) as pool:
+            enriched = list(pool.map(_enrich_one, to_enrich))
+    else:
+        enriched = []
+
+    all_out = enriched + passthrough
+    all_out.sort(key=lambda x: x.get("Score", 0), reverse=True)
+    return all_out
+
+# ── FIX-C  Category-based weighted scoring ────────────────────────────────────
+_CAT_W = dict(TREND=30, MOMENTUM=20, STRUCTURE=20, VOLUME=15, QUALITY=15)
+
+def category_score(*,
+                   trend_up, ema_stack, fresh_cross, htf_up, market_bullish, e_fast_gt_slow,
+                   rsi, mom1, mom3, mom6, mom1_th, mom3_th, mom6_th,
+                   phase, in_golden, near_e127, near_e161, norm_bull_raw, rs_rank,
+                   c_gt_hh, c_near_hh, vol_ratio, vol_avg_gt_zero, adx_val,
+                   squeeze, vc_ratio, ext_penalty, regime_bearish) -> dict:
+    # TREND
+    t = 0.0
+    t += 40 if trend_up  else 0
+    t += 20 if ema_stack else (10 if e_fast_gt_slow else 0)
+    t += 15 if htf_up    else 0
+    t += 15 if market_bullish else 0
+    t += 10 if fresh_cross else 0
+    cat_T = round(min(_CAT_W["TREND"],   t / 100 * _CAT_W["TREND"]),   2)
+    # MOMENTUM
+    m = 0.0
+    if rsi >= 65:    m += 35
+    elif rsi >= 60:  m += 25
+    elif rsi >= 50:  m += 10
+    elif rsi < 40:   m -= 10
+    if mom1 > mom1_th:   m += 25
+    elif mom1 > 0:       m += 10
+    else:                m -= 10
+    if mom3 > mom3_th:   m += 25
+    elif mom3 > 0:       m += 10
+    if mom6 > mom6_th:   m += 15
+    cat_M = round(min(_CAT_W["MOMENTUM"], max(0, m) / 100 * _CAT_W["MOMENTUM"]), 2)
+    # STRUCTURE
+    PHASE_RAW = {"BREAKOUT":100,"CONT":85,"ENTRY":65,"SETUP":40,"IDLE":10,"EXIT":0}
+    s = float(PHASE_RAW.get(phase, 10))
+    if c_gt_hh:         s += 20
+    elif c_near_hh:     s += 10
+    if in_golden:       s += 20
+    if near_e127:       s -= 25
+    if near_e161:       s -= 35
+    if rs_rank >= 80:   s += 15
+    elif rs_rank >= 60: s += 5
+    elif rs_rank < 30:  s -= 10
+    cat_S = round(min(_CAT_W["STRUCTURE"], max(0, s) / 200 * _CAT_W["STRUCTURE"]), 2)
+    # VOLUME
+    v = 0.0
+    if vol_avg_gt_zero:
+        if vol_ratio >= 1.5:   v += 50
+        elif vol_ratio >= 1.2: v += 30
+        elif vol_ratio >= 1.0: v += 15
+        else:                  v -= 10
+    if adx_val >= 30:   v += 35
+    elif adx_val >= 20: v += 15
+    else:               v -= 20
+    cat_V = round(min(_CAT_W["VOLUME"], max(0, v) / 100 * _CAT_W["VOLUME"]), 2)
+    # QUALITY
+    q = 0.0
+    if squeeze:           q += 30
+    if vc_ratio < 0.75:   q += 30
+    elif vc_ratio < 0.90: q += 15
+    q += min(40, max(0, -ext_penalty))
+    cat_Q = round(min(_CAT_W["QUALITY"], q / 100 * _CAT_W["QUALITY"]), 2)
+    # Combine
+    raw_total = cat_T + cat_M + cat_S + cat_V + cat_Q
+    if regime_bearish:
+        raw_total *= 0.85
+    norm_bull = round(min(100.0, max(0.0, raw_total)), 1)
+    return dict(norm_bull=norm_bull, cat_T=cat_T, cat_M=cat_M,
+                cat_S=cat_S, cat_V=cat_V, cat_Q=cat_Q)
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CORE SCORING — v14 logic + SPEED-10 new indicators
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1565,32 +2022,41 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         vc_bonus = 6 if vol_ratio < 0.75 else (3 if vol_ratio < 0.90 else 0)
         # ─────────────────────────────────────────────────────────────────
 
-        bull  = 0
-        bull += 25 if trend_up else 0
-        bull += ema_cross_bonus
-        bull += (15 if r >= 65 else 10) if r >= 60 else (5 if r > 50 else 0)
-        bull += 10 if v > vol_avg*1.2 else (5 if v > vol_avg else 0)
-        bull += 15 if c > hh else (9 if c > hh*0.98 else 0)
-        if n >= 3 and c > float(close.iloc[-3]): bull += 8
-        bull += 7 if rs_rank>=80 else (3 if rs_rank>=60 else (0 if rs_rank>=40 else -3))
-        if mode == "Positional":
-            bull += 15 if qualified else -15
-        else:
-            bull += 15 if strong_htf else -10
-        bull += 10 if in_golden else 0
-        if near_e127:   bull -= 20
-        elif near_e161: bull -= 30
-        bull += ext_penalty
-        # v15 new indicator contributions
-        bull += adx_bonus + squeeze_bonus + vc_bonus
-
-        BEARISH_HAIRCUT=0.85
         regime_bearish = not market_bullish
-        if regime_bearish: bull = int(bull*BEARISH_HAIRCUT)
 
-        raw_score = max(0, bull)
-        BULL_MAX_V15 = 120   # slightly higher ceiling due to new indicators
-        norm_bull  = min(100.0, max(0.0, bull*100.0/BULL_MAX_V15))
+        # ── FIX-C: Category-based weighted scoring ─────────────────────────
+        # Phase placeholder for initial call — overwritten by detect_phase below
+        _phase_placeholder = PHASE_IDLE
+        cat = category_score(
+            trend_up       = trend_up,
+            ema_stack      = ema_stack,
+            fresh_cross    = fresh_cross,
+            htf_up         = htf_up,
+            market_bullish = market_bullish,
+            e_fast_gt_slow = (e_fast > e_slow),
+            rsi            = r,
+            mom1           = mom1, mom3=mom3, mom6=mom6,
+            mom1_th        = cfg["mom1_th"],
+            mom3_th        = cfg["mom3_th"],
+            mom6_th        = cfg["mom6_th"],
+            phase          = _phase_placeholder,
+            in_golden      = in_golden,
+            near_e127      = near_e127,
+            near_e161      = near_e161,
+            norm_bull_raw  = 50.0,
+            rs_rank        = rs_rank,
+            c_gt_hh        = (c > hh),
+            c_near_hh      = (c > hh * 0.98),
+            vol_ratio      = (v / vol_avg) if vol_avg > 0 else 1.0,
+            vol_avg_gt_zero= vol_avg > 0,
+            adx_val        = adx_val,
+            squeeze        = squeeze,
+            vc_ratio       = vol_ratio,
+            ext_penalty    = ext_penalty,
+            regime_bearish = regime_bearish,
+        )
+        norm_bull  = cat["norm_bull"]
+        raw_score  = int(norm_bull)
         score_th   = float(cfg["score_th"])
 
         act           = action_label(norm_bull)
@@ -1676,6 +2142,17 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
             # v15 extras
             "ADX":         round(adx_val,1), "Squeeze":squeeze,
             "VolRatio":    round(vol_ratio,2),
+            # v15.1 pattern keys (populated by enrich_with_patterns in run_scan)
+            "VCP": False, "VCPGrade": "NONE",
+            "AVWAP": None, "AVWAPAbove": False,
+            "FibQuality": 0, "FibGrade": "POOR",
+            "VolDryup": False, "VDUIntensity": 0,
+            "RVolPct": 50.0, "RVolLabel": "NORMAL",
+            "DarvasIn": False, "DarvasBrk": False, "DarvasTop": 0.0,
+            "Patterns": {},
+            # v15.2 FIX-C category sub-scores
+            "CatT": cat["cat_T"], "CatM": cat["cat_M"], "CatS": cat["cat_S"],
+            "CatV": cat["cat_V"], "CatQ": cat["cat_Q"],
             "_detected_phase": phase,
         }
     except Exception:
@@ -1878,6 +2355,15 @@ def run_scan(symbols, mode, progress_bar, status_text,
         phase = res["_detected_phase"]
         record_phase_transition(sym, phase)
         res["PhaseBonus"] = phase_transition_conf_bonus(sym)
+
+    # ── FIX-B: Pattern enrichment (shortlisted stocks only) ───────────────
+    status_text.text("🔬 Pattern enrichment on shortlisted stocks…")
+    results = enrich_with_patterns(
+        results,
+        data        = valid_data,
+        mode        = mode,
+        market_open = _is_market_open(),
+    )
 
     breadth_pulse = compute_breadth(results)
     pct_ema50_now = breadth_pulse.get("pct_above_ema50", 100)
@@ -2722,6 +3208,54 @@ with tab_scanner:
                 'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">VC</span>'
                 if vol_ratio<0.75 else ""
             )
+            # v15.1 pattern badges
+            vcp_grade   = r.get("VCPGrade",  "NONE")
+            avwap_above = r.get("AVWAPAbove", False)
+            fib_grade   = r.get("FibGrade",  "POOR")
+            vdu_int     = r.get("VDUIntensity", 0)
+            rvol_label  = r.get("RVolLabel",  "NORMAL")
+            darvas_brk  = r.get("DarvasBrk",  False)
+            darvas_in   = r.get("DarvasIn",   False)
+            vcp_badge = (
+                '<span style="background:#7c3aed22;border:1px solid #7c3aed88;color:#a78bfa;'
+                'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
+                f'VCP·{vcp_grade}</span>'
+            ) if vcp_grade not in ("NONE", "") else ""
+            avwap_badge = (
+                '<span style="background:#0369a122;border:1px solid #0369a155;color:#38bdf8;'
+                'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">AVWAP↑</span>'
+            ) if avwap_above else ""
+            fib_q_badge = (
+                '<span style="background:#d9770622;border:1px solid #d9770688;color:#fb923c;'
+                'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
+                f'FIB·{fib_grade}</span>'
+            ) if fib_grade in ("EXCELLENT", "GOOD") else ""
+            vdu_badge = (
+                f'<span style="background:#16213022;border:1px solid #0ea5e955;color:#67e8f9;'
+                f'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
+                f'VDU{"×" * int(vdu_int)}</span>'
+            ) if vdu_int >= 1 else ""
+            _rvol_colors = {
+                "SURGE": ("#22c55e","#22c55e22"),
+                "HIGH":  ("#84cc16","#84cc1622"),
+                "DRY":   ("#64748b","#64748b22"),
+            }
+            rvol_badge = ""
+            if rvol_label in _rvol_colors:
+                rc, rb = _rvol_colors[rvol_label]
+                rvol_badge = (
+                    f'<span style="background:{rb};border:1px solid {rc}55;color:{rc};'
+                    f'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
+                    f'RVOL·{rvol_label}</span>'
+                )
+            darvas_badge = (
+                '<span style="background:#a3284322;border:1px solid #f4386988;color:#f87171;'
+                'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">DARVAS↑</span>'
+                if darvas_brk else
+                '<span style="background:#78350f22;border:1px solid #f59e0b55;color:#fbbf24;'
+                'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">DARVAS□</span>'
+                if darvas_in else ""
+            )
             metrics=[
                 ("Trend",f'<span style="color:{trend_col};font-weight:600;">{"+ Bullish" if htf_up else "− Bearish"}</span>'),
                 ("RSI",  f'<span style="color:#e8e8f4;">{rsi_val}</span>'),
@@ -2775,7 +3309,7 @@ with tab_scanner:
                 f'<div style="display:flex;align-items:center;gap:5px;flex-wrap:nowrap;">'
                 f'<span style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:15px;font-weight:700;letter-spacing:-.02em;white-space:nowrap;">{sym}</span>'
                 f'{golden_badge}{breadth_badge}</div>'
-                f'<div style="margin-top:3px;display:flex;flex-wrap:wrap;gap:2px;">{phase_chip_html}{adx_badge}{squeeze_badge}{vc_badge}</div>'
+                f'<div style="margin-top:3px;display:flex;flex-wrap:wrap;gap:2px;">{phase_chip_html}{adx_badge}{squeeze_badge}{vc_badge}{vcp_badge}{avwap_badge}{fib_q_badge}{vdu_badge}{rvol_badge}{darvas_badge}</div>'
                 f'</div>'
                 f'<span style="background:{act_bg};border:1px solid {act_brd};color:{act_txt};'
                 f'padding:3px 8px;border-radius:5px;font-size:10px;font-weight:700;font-family:DM Sans,sans-serif;flex-shrink:0;">{act}</span>'
@@ -2933,6 +3467,12 @@ with tab_scanner:
                     "%Chg":f"+{chg}%" if chg>=0 else f"{chg}%",
                     "RSI":r.get("RSI","—"),"RS_Rank":r.get("RS_Rank",50),
                     "ADX":r.get("ADX","—"),"SQZ":"◆" if r.get("Squeeze") else "",
+                    "VCP":r.get("VCPGrade","—"),
+                    "AVWAP":"↑" if r.get("AVWAPAbove") else "↓",
+                    "FibQ":r.get("FibGrade","—"),
+                    "VDU":"×"*int(r.get("VDUIntensity",0)) or "—",
+                    "RVol":r.get("RVolLabel","—"),
+                    "Darvas":("BRK" if r.get("DarvasBrk") else ("□" if r.get("DarvasIn") else "—")),
                     "LTP":fmt(r["LTP"]),"Entry":fmt(r["Entry"])+(" ⚡" if r["Entry"]!=r["LTP"] else ""),
                     "SL":fmt(r["SL"]),"T1":fmt(r["T1"]),"T2":fmt(r["T2"]),"T3":fmt(r["T3"]),
                     "Liq₹Cr":r.get("AvgTradedCr","—"),"HTF":"↑" if r.get("HTFUp",True) else "↓",
@@ -2960,7 +3500,9 @@ with tab_scanner:
             st.markdown(
                 '<div style="font-size:10px;color:#3a3a60;font-family:JetBrains Mono,monospace;margin-top:4px;">'
                 'Score 0-100 · Conf% = confidence · ADX = trend strength (≥30=strong) · SQZ = Keltner/BB squeeze · '
-                'RS_Rank = 52w percentile · HTF ↑/↓ = weekly · ExtN 0=clean 3+=skip</div>',
+                'RS_Rank = 52w percentile · HTF ↑/↓ = weekly · ExtN 0=clean 3+=skip · '
+                'VCP = Volatility Contraction · AVWAP ↑/↓ = price vs anchored VWAP · '
+                'FibQ = fib pullback grade · VDU = vol dry-up · RVol = relative vol · Darvas BRK/□ = breakout/in-box</div>',
                 unsafe_allow_html=True,
             )
             buy_rows=[r for r in results if r["Action"] in ("BUY","STRONG BUY")]
@@ -3090,6 +3632,41 @@ with tab_detail:
             vc_c.metric("Vol Contraction",f'{r.get("VolRatio","—")}',
                         delta="Compressed" if (r.get("VolRatio") or 1)<0.75 else "Normal",
                         delta_color="normal" if (r.get("VolRatio") or 1)<0.75 else "off")
+            # v15.1 Pattern Signals row
+            st.markdown("**Pattern Signals**")
+            pat      = r.get("Patterns", {})
+            vcp_d    = pat.get("vcp",          {})
+            avwap_d  = pat.get("avwap",         {})
+            fibq_d   = pat.get("fib_quality",   {})
+            vdu_d    = pat.get("vol_dryup",      {})
+            rvol_d   = pat.get("rel_vol",        {})
+            darvas_d = pat.get("darvas",         {})
+            pc1,pc2,pc3,pc4,pc5,pc6 = st.columns(6)
+            pc1.metric("VCP",
+                       f'{vcp_d.get("vcp_grade","—")} ({vcp_d.get("n_contractions",0)}× cont.)',
+                       delta="Confirmed" if vcp_d.get("detected") else None,
+                       delta_color="normal" if vcp_d.get("detected") else "off")
+            pc2.metric("Anch. VWAP",
+                       f'₹{avwap_d.get("avwap","—")}',
+                       delta=f'{avwap_d.get("pct_above",0):+.1f}% vs AVWAP',
+                       delta_color="normal" if avwap_d.get("price_above") else "inverse")
+            pc3.metric("Fib Pullback",
+                       fibq_d.get("grade","—"),
+                       delta=f'Q:{fibq_d.get("quality",0)}',
+                       delta_color="normal" if fibq_d.get("quality",0)>=60 else "off")
+            pc4.metric("Vol Dry-up",
+                       f'{"×"*int(vdu_d.get("intensity",0)) or "—"} ({vdu_d.get("bars",0)}b)',
+                       delta="Active" if vdu_d.get("dry_up") else None,
+                       delta_color="normal" if vdu_d.get("dry_up") else "off")
+            pc5.metric("Rel.Volume",
+                       rvol_d.get("label","—"),
+                       delta=f'{rvol_d.get("rel_vol_pct",50):.0f}th pct · {rvol_d.get("ratio",1):.1f}×',
+                       delta_color="normal" if rvol_d.get("rel_vol_pct",50)>=65 else "off")
+            pc6.metric("Darvas Box",
+                       "BREAKOUT" if darvas_d.get("breakout") else ("IN BOX" if darvas_d.get("in_box") else "—"),
+                       delta=f'Box: ₹{darvas_d.get("box_bottom",0):,.0f}–₹{darvas_d.get("box_top",0):,.0f}'
+                              if darvas_d.get("box_top") else None,
+                       delta_color="normal" if darvas_d.get("breakout") else "off")
             st.markdown("---")
             with st.expander("Position Sizing",expanded=True):
                 _acct_size=st.session_state.get("account_size",500000)
