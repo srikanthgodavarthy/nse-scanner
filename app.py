@@ -549,7 +549,7 @@ def _incremental_fetch(sym: str, mode: str,
                 cached  = _normalize_index(cached)
                 tail_df = _normalize_index(tail_df)
                 df = pd.concat([cached, tail_df])
-                df = df[~df.index.duplicated(keep="last")].sort_index()df = pd.concat([cached, tail_df])
+                df = df[~df.index.duplicated(keep="last")].sort_index()
                 _save_cached(sym, interval, df)
                 return df
         # market closed → use cache as-is
