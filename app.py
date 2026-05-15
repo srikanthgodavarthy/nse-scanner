@@ -598,16 +598,12 @@ def _incremental_fetch_FIXED(sym: str, mode: str, force_full: bool = False) -> p
     return df
 
 
-def batch_incremental_fetch_FIXED(
+def batch_incremental_fetch(
     symbols: list,
     mode: str,
     force_full: bool = False,
     progress_cb=None,
 ) -> dict:
-    """
-    FIXED version of batch_incremental_fetch.
-    Only the merge block (was lines 557-561) is changed.
-    """
     cfg      = MODE_CFG[mode]
     interval = cfg["interval"]
     period   = cfg["yf_period"]
