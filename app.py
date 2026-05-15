@@ -1719,39 +1719,47 @@ def fetch_indices(mode="Swing"):
 def _run_scan_pass1(symbols, mode, cfg, min_bars, progress_bar, status_text):
     """
     Pass 1 for run_scan: batch-fetch all OHLCV (and daily context for Intraday).
+    For Intraday, primary 5m fetch and daily context fetch run concurrently.
     Returns (data dict, daily_closes dict, rejected count).
     """
     data:         dict = {}
     daily_closes: dict = {}
     rejected:     int  = 0
 
-    status_text.text("Pass 1/3: Batch-fetching OHLCV…")
-    primary = _batch_fetch_ohlcv(
-        symbols, cfg["period"], cfg["interval"], min_bars, batch_size=50,
-    )
-    for sym, df in primary.items():
-        if df is not None:
-            data[sym] = df
-        else:
-            rejected += 1
-
-    progress_bar.progress(0.25)
-
-    if mode == "Intraday" and data:
-        status_text.text("Pass 1b/3: Fetching daily context (batch)…")
+    if mode == "Intraday":
+        # Fire both batch fetches simultaneously
+        status_text.text("Pass 1/3: Batch-fetching intraday + daily context (parallel)…")
         daily_cfg = MODE_CFG["Swing"]
-        # BUG-3: store full Series (not just iloc[-1]) —
-        # score_stock uses daily_close.iloc[-21/-63/-126] for momentum.
-        daily = _batch_fetch_ohlcv(
-            list(data.keys()),
-            daily_cfg["period"],
-            daily_cfg["interval"],
-            50,
-            batch_size=50,
-        )
-        for sym, df in daily.items():
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            f_primary = pool.submit(
+                _batch_fetch_ohlcv, symbols, cfg["period"], cfg["interval"], min_bars, 50
+            )
+            f_daily = pool.submit(
+                _batch_fetch_ohlcv, symbols, daily_cfg["period"], daily_cfg["interval"], 50, 50
+            )
+            primary = f_primary.result()
+            daily   = f_daily.result()
+
+        for sym, df in primary.items():
             if df is not None:
-                daily_closes[sym] = df["Close"]  # full Series — needed for momentum
+                data[sym] = df
+            else:
+                rejected += 1
+
+        # BUG-3: store full Series — score_stock uses .iloc[-21/-63/-126]
+        for sym, df in daily.items():
+            if df is not None and sym in data:
+                daily_closes[sym] = df["Close"]
+    else:
+        status_text.text("Pass 1/3: Batch-fetching OHLCV…")
+        primary = _batch_fetch_ohlcv(
+            symbols, cfg["period"], cfg["interval"], min_bars, batch_size=50,
+        )
+        for sym, df in primary.items():
+            if df is not None:
+                data[sym] = df
+            else:
+                rejected += 1
 
     progress_bar.progress(0.40)
     return data, daily_closes, rejected
@@ -2317,8 +2325,8 @@ def add_position(sym: str, entry_price: float, qty: int, mode: str, entry_date: 
 # ═══════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="BULL SUTRA Pro v14",
-    page_icon="📈",
+    page_title="🐂 BULL SUTRA Pro v14",
+    page_icon="🐂",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -2373,7 +2381,7 @@ _prewarm()
 st.markdown(
     '''<div style="font-family:Syne,sans-serif;font-size:28px;font-weight:700;
     letter-spacing:-1px;color:#e8e8f4;padding:8px 0 4px;">
-    BULL SUTRA <span style="color:#f59e0b;">''</span>
+    <span style="color:#f59e0b;">&#x1F402;</span> BULL SUTRA
     <span style="font-size:13px;color:#cbd5e1;font-family:JetBrains Mono,monospace;
     font-weight:400;">PRO · v14</span></div>''',
     unsafe_allow_html=True,
@@ -2716,23 +2724,30 @@ with tab_scanner:
             vol_label   = "High" if vol_conf else "Avg"
 
             phase_icon  = {
-                "BREAKOUT": "📈", "CONT": "🔄", "ENTRY": "⚡",
-                "SETUP": "🔍",   "IDLE": "💤",  "EXIT":  "🚪",
+                "BREAKOUT": "🚀", "CONT": "↗", "ENTRY": "⚡",
+                "SETUP": "◎",    "IDLE": "–",  "EXIT":  "↘",
             }.get(phase, "")
             ph_arrow    = get_phase_arrow(sym)
-            phase_txt   = f"{phase_icon} {phase}" + (f" {ph_arrow}" if ph_arrow else "")
+            phase_short = phase  # keep full label for header chip
+
+            # confidence indicator symbol (replaces body badge)
             conf_lbl, _ = confidence_label(conf)
+            conf_sym = (
+                "◆◆◆" if conf >= 75 else
+                "◆◆◇" if conf >= 50 else
+                "◆◇◇" if conf >= 25 else
+                "◇◇◇"
+            )
 
             num_bg  = "#22c55e" if act in ("BUY","STRONG BUY") else "#d97706" if act=="WATCH" else "#3a3a60"
             num_txt = "#064e3b" if act in ("BUY","STRONG BUY") else "#431407" if act=="WATCH" else "#c4c6d0"
 
-            # ── CHANGE 2: whole-rupee formatter (no decimals) ─────────────
+            # ── whole-rupee formatter (no decimals) ───────────────────────
             def _fmt_int(v):
                 if v is None: return "—"
                 try: return f"₹{int(round(v)):,}"
                 except (TypeError, ValueError): return "—"
 
-            # Entry keeps 2dp since it's a trigger price (precision matters)
             def _fmt_entry(v):
                 if v is None: return "—"
                 try: return f"₹{v:,.0f}"
@@ -2756,21 +2771,33 @@ with tab_scanner:
                 if is_stale else ""
             )
 
-            # ── CHANGE 3: compact 2-col metric grid ──────────────────────
+            # phase chip for header (compact, next to stock name)
+            phase_chip_html = (
+                f'<span style="background:{phase_col}22;border:1px solid {phase_col}66;'
+                f'color:{phase_col};padding:2px 6px;border-radius:4px;'
+                f'font-size:9px;font-weight:700;font-family:DM Sans,sans-serif;'
+                f'letter-spacing:.04em;white-space:nowrap;">'
+                f'{phase_icon} {phase_short}'
+                + (f' {ph_arrow}' if ph_arrow else '') +
+                f'</span>'
+            )
+
+            # ── compact 2-col metric grid (Score removed — in header badge) ─
             metrics = [
-                ("Score",  f'<span style="color:#e8e8f4;font-weight:700;">{score}</span>'),
                 ("Trend",  f'<span style="color:{trend_col};font-weight:600;">{trend_label}</span>'),
                 ("RSI",    f'<span style="color:#e8e8f4;">{rsi_val}</span>'),
                 ("RS",     f'<span style="color:{rs_col};font-weight:600;">RS {rs_rank}</span>'),
-                ("HTF",    f'<span style="color:{trend_col};font-weight:700;">{"↑" if htf_up else "↓"}</span>'),
+                ("HTF",    f'<span style="color:{trend_col};font-weight:700;">{"↑ Bull" if htf_up else "↓ Bear"}</span>'),
                 ("Vol",    f'<span style="color:#e8e8f4;">{vol_label}</span>'),
+                ("Conf",   f'<span style="color:{conf_col};font-family:JetBrains Mono,monospace;'
+                           f'letter-spacing:.1em;">{conf_sym}</span>'),
             ]
             metric_grid_html = (
                 '<div style="display:grid;grid-template-columns:1fr 1fr;gap:0;'
-                'margin-top:10px;border:1px solid #1e1e40;border-radius:6px;overflow:hidden;">'
+                'margin-top:8px;border:1px solid #1e1e40;border-radius:6px;overflow:hidden;">'
                 + "".join(
                     f'<div style="display:flex;justify-content:space-between;align-items:center;'
-                    f'padding:4px 8px;border-bottom:1px solid #15152a;'
+                    f'padding:3px 8px;border-bottom:1px solid #15152a;'
                     f'{"border-right:1px solid #15152a;" if idx % 2 == 0 else ""}">'
                     f'<span style="color:#475569;font-size:9px;letter-spacing:.06em;'
                     f'text-transform:uppercase;">{label}</span>'
@@ -2800,7 +2827,7 @@ with tab_scanner:
                     + "".join(pills) + '</div>'
                 )
 
-            # ── CHANGE 4: sector row — always shown, above ext pills ──────
+            # ── sector row — always shown, above ext pills ────────────────
             sector_row_html = (
                 f'<div style="padding:4px 14px 5px;border-top:1px solid #1e1e40;'
                 f'background:#0d0d1a;display:flex;align-items:center;'
@@ -2812,7 +2839,7 @@ with tab_scanner:
                 f'</div>'
             )
 
-            # ── footer target cells (no sector here anymore) ─────────────
+            # ── footer target cells ───────────────────────────────────────
             footer_items = [
                 ("ENTRY", entry_str),
                 ("T1",    _fmt_int(t1)),
@@ -2831,58 +2858,54 @@ with tab_scanner:
                 f'<div style="background:#111120;border:1px solid {border_color};border-radius:12px;'
                 f'overflow:hidden;width:360px;min-width:320px;max-width:380px;flex:1 1 360px;">'
 
-                # ── Header ──────────────────────────────────────────────
-                f'<div style="display:flex;align-items:center;padding:10px 14px 8px;'
-                f'border-bottom:1px solid #1e1e40;gap:8px;background:#0e0e1c;">'
+                # ── Header: number | name + phase chip | action | conf% ───
+                f'<div style="display:flex;align-items:center;padding:8px 12px 7px;'
+                f'border-bottom:1px solid #1e1e40;gap:7px;background:#0e0e1c;flex-wrap:nowrap;">'
                 f'<div style="background:{num_bg};color:{num_txt};font-family:JetBrains Mono,monospace;'
                 f'font-size:12px;font-weight:700;padding:3px 7px;border-radius:5px;'
-                f'min-width:28px;text-align:center;">{i+1:02d}</div>'
-                f'<div style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:15px;'
-                f'font-weight:700;letter-spacing:-.02em;flex:1;">{sym}{golden_badge}{breadth_badge}</div>'
+                f'min-width:28px;text-align:center;flex-shrink:0;">{i+1:02d}</div>'
+                # name + phase chip in a flex column or row
+                f'<div style="flex:1;min-width:0;">'
+                f'<div style="display:flex;align-items:center;gap:5px;flex-wrap:nowrap;">'
+                f'<span style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:15px;'
+                f'font-weight:700;letter-spacing:-.02em;white-space:nowrap;">{sym}</span>'
+                f'{golden_badge}{breadth_badge}'
+                f'</div>'
+                f'<div style="margin-top:3px;">{phase_chip_html}</div>'
+                f'</div>'
+                # action badge
                 f'<span style="background:{act_bg};border:1px solid {act_brd};color:{act_txt};'
-                f'padding:3px 9px;border-radius:5px;font-size:10px;font-weight:700;'
-                f'font-family:DM Sans,sans-serif;">{act}</span>'
-                # CHANGE 1: confidence badge replaces score badge
+                f'padding:3px 8px;border-radius:5px;font-size:10px;font-weight:700;'
+                f'font-family:DM Sans,sans-serif;flex-shrink:0;">{act}</span>'
+                # confidence score badge (top-right)
                 f'<span style="background:{conf_col}22;border:1px solid {conf_col}55;color:{conf_col};'
                 f'font-family:JetBrains Mono,monospace;font-size:11px;'
-                f'padding:3px 7px;border-radius:5px;">{conf}%</span>'
+                f'padding:3px 7px;border-radius:5px;flex-shrink:0;">{conf}%</span>'
                 + stale_html +
                 f'</div>'
 
-                # ── Body: full-width single column ───────────────────────
-                f'<div style="padding:12px 14px 10px;">'
+                # ── Body: price + metrics only (phase/conf badges removed) ─
+                f'<div style="padding:10px 14px 8px;">'
 
                 # Price + day change
                 f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:24px;'
                 f'font-weight:600;line-height:1;">&#8377;{ltp:,.2f}</div>'
                 f'<div style="font-family:JetBrains Mono,monospace;color:{chg_col};font-size:12px;'
-                f'margin-top:3px;font-weight:500;">{chg_str} {chg_arr}</div>'
+                f'margin-top:2px;font-weight:500;">{chg_str} {chg_arr}</div>'
 
-                # Phase + conf badges
-                f'<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:5px;align-items:center;">'
-                f'<span style="background:{phase_col};color:#0d0d1a;padding:4px 9px;'
-                f'border-radius:5px;font-size:10px;font-weight:700;'
-                f'font-family:DM Sans,sans-serif;">{phase_txt}</span>'
-                f'<span style="background:#1e1e40;border:1px solid {conf_col}55;padding:4px 9px;'
-                f'border-radius:5px;font-size:10px;font-weight:600;'
-                f'font-family:DM Sans,sans-serif;">'
-                f'<span style="color:#cbd5e1;font-size:8px;display:block;">{conf_lbl}</span>'
-                f'<span style="color:{conf_col};">{conf}%</span></span>'
-                f'</div>'
-
-                # CHANGE 3: metric 2-col grid
+                # Metric grid (no Score row, Conf uses symbol ◆◆◆)
                 + metric_grid_html +
 
                 f'</div>'  # /body
 
-                # ── Footer: targets row (no sector here) ─────────────────
+                # ── Footer: targets row ───────────────────────────────────
                 f'<div style="display:flex;justify-content:space-between;align-items:flex-end;'
-                f'padding:7px 14px 6px;border-top:1px solid #1e1e40;background:#0d0d1a;'
+                f'padding:6px 14px 5px;border-top:1px solid #1e1e40;background:#0d0d1a;'
                 f'flex-wrap:wrap;gap:6px;">'
                 + footer_cells +
                 f'</div>'
 
-                # CHANGE 4: sector row above extension pills
+                # sector row above extension pills
                 + sector_row_html
 
                 # Extension warning pills (only when ext_n > 0)
@@ -3714,10 +3737,47 @@ with tab_portfolio:
                     bar      = min(int(ex_score), 100)
                     sector   = SECTOR_MAP.get(sym, "—")
 
+                    # map trigger text → distinctive icon
+                    _TRIG_ICONS = [
+                        ("death cross",  "☠"),
+                        ("golden cross", "✨"),
+                        ("ema",          "〰"),
+                        ("cross",        "✕"),
+                        ("overbought",   "🔥"),
+                        ("oversold",     "🧊"),
+                        ("rsi",          "📊"),
+                        ("breakout",     "🚀"),
+                        ("breakdown",    "💥"),
+                        ("volume",       "📦"),
+                        ("vol",          "📦"),
+                        ("atr",          "📐"),
+                        ("fib",          "🔢"),
+                        ("htf",          "🗂"),
+                        ("exhaust",      "🫁"),
+                        ("ext",          "🫁"),
+                        ("momentum",     "⚡"),
+                        ("mom",          "⚡"),
+                        ("gap",          "↔"),
+                        ("support",      "🛡"),
+                        ("resist",       "🚧"),
+                        ("trail",        "🎯"),
+                        ("stop",         "🛑"),
+                        ("vix",          "⛈"),
+                        ("breadth",      "🌊"),
+                        ("sector",       "🏭"),
+                        ("pattern",      "🔀"),
+                    ]
+                    def _trig_icon(text: str) -> str:
+                        tl = text.lower()
+                        for kw, ico in _TRIG_ICONS:
+                            if kw in tl:
+                                return ico
+                        return "▸"
+
                     trig_rows = "".join(
                         f'<div style="display:flex;align-items:center;gap:6px;'
                         f'padding:4px 0;border-bottom:1px solid #15152a;">'
-                        f'<span style="color:{vc};font-size:11px;flex-shrink:0;">⚡</span>'
+                        f'<span style="font-size:11px;flex-shrink:0;">{_trig_icon(t)}</span>'
                         f'<span style="color:#c8d0e0;font-size:9.5px;font-family:DM Sans,sans-serif;'
                         f'line-height:1.2;">{t}</span></div>'
                         for t in triggers
@@ -3728,7 +3788,7 @@ with tab_portfolio:
                     trail_row = (
                         f'<div style="display:flex;justify-content:space-between;'
                         f'align-items:center;padding:2px 0;">'
-                        f'<span style="color:#cbd5e1;font-size:9px;letter-spacing:.04em;">TRAIL SL</span>'
+                        f'<span style="color:#cbd5e1;font-size:9px;letter-spacing:.04em;">🎯 TRAIL SL</span>'
                         f'<span style="font-family:JetBrains Mono,monospace;color:#f59e0b;'
                         f'font-size:12px;font-weight:600;">₹{trail_sl:,.2f}</span></div>'
                     ) if trail_sl else ""
@@ -3779,23 +3839,23 @@ with tab_portfolio:
                             f'<div style="flex:1;padding:10px 12px;display:flex;'
                             f'flex-direction:column;gap:4px;">'
                             f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">'
-                            f'<div><div style="color:#64748b;font-size:8px;letter-spacing:.06em;">ENTRY</div>'
+                            f'<div><div style="color:#64748b;font-size:8px;letter-spacing:.06em;">🏷 ENTRY</div>'
                             f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:12px;">'
                             f'₹{entry_px:,.2f}</div></div>'
-                            f'<div><div style="color:#64748b;font-size:8px;letter-spacing:.06em;">CURRENT</div>'
+                            f'<div><div style="color:#64748b;font-size:8px;letter-spacing:.06em;">📍 CURRENT</div>'
                             f'<div style="font-family:JetBrains Mono,monospace;color:#e2e8f0;font-size:12px;">'
                             f'₹{curr_px:,.2f}</div></div>'
-                            f'<div><div style="color:#64748b;font-size:8px;letter-spacing:.06em;">DAY</div>'
+                            f'<div><div style="color:#64748b;font-size:8px;letter-spacing:.06em;">📅 DAY</div>'
                             f'<div style="font-family:JetBrains Mono,monospace;color:{day_col};font-size:12px;font-weight:600;">'
                             f'{day_str}</div></div>'
-                            f'<div><div style="color:#64748b;font-size:8px;letter-spacing:.06em;">QTY</div>'
+                            f'<div><div style="color:#64748b;font-size:8px;letter-spacing:.06em;">🔢 QTY</div>'
                             f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:12px;">'
                             f'{qty}</div></div>'
                             f'</div>'
                             f'<div style="margin-top:4px;padding-top:6px;border-top:1px solid #1a1a30;">'
                             f'<div style="display:flex;justify-content:space-between;'
                             f'align-items:center;padding:2px 0;">'
-                            f'<span style="color:#64748b;font-size:9px;letter-spacing:.04em;">P&L</span>'
+                            f'<span style="color:#64748b;font-size:9px;letter-spacing:.04em;">{"📈" if pnl_pct >= 0 else "📉"} P&L</span>'
                             f'<span style="font-family:JetBrains Mono,monospace;color:{pnl_col};'
                             f'font-size:12px;font-weight:700;">'
                             f'{"+"}'  + f'{pnl_pct:.1f}% (₹{pnl_abs:+,.0f})</span></div>'
@@ -3813,7 +3873,7 @@ with tab_portfolio:
                             f'<div style="padding:6px 14px 5px;background:#0e0e1c;'
                             f'border-top:1px solid #1a1a30;">'
                             f'<div style="display:flex;justify-content:space-between;margin-bottom:3px;">'
-                            f'<span style="color:#475569;font-size:8px;letter-spacing:.06em;">EXIT PRESSURE</span>'
+                            f'<span style="color:#475569;font-size:8px;letter-spacing:.06em;">🌡 EXIT PRESSURE</span>'
                             f'<span style="color:{vc};font-size:8px;font-weight:700;">{bar}/100</span></div>'
                             f'<div style="background:#1e1e40;border-radius:2px;height:3px;">'
                             f'<div style="background:{vc};width:{bar}%;height:3px;border-radius:2px;'
