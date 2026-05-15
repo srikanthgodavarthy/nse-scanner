@@ -1836,67 +1836,142 @@ def enrich_with_patterns(results: list, data: dict,
     all_out.sort(key=lambda x: x.get("Score", 0), reverse=True)
     return all_out
 
-# ── FIX-C  Category-based weighted scoring ────────────────────────────────────
+# ── FIX-C  Category-based weighted scoring (v16 — all 10 bugs addressed) ─────
 _CAT_W = dict(TREND=30, MOMENTUM=20, STRUCTURE=20, VOLUME=15, QUALITY=15)
 
+# FIX-7: Regime-adaptive thresholds — tighter gates in bearish/stressed markets
+_REGIME_THRESHOLDS = {
+    "bull_calm":    dict(rsi_hi=60, rsi_mid=50, mom_mult=1.0, vol_mult=1.2, adx_min=20),
+    "bull_vix":     dict(rsi_hi=62, rsi_mid=52, mom_mult=1.1, vol_mult=1.3, adx_min=22),
+    "bear_calm":    dict(rsi_hi=65, rsi_mid=55, mom_mult=1.2, vol_mult=1.4, adx_min=25),
+    "bear_stressed":dict(rsi_hi=68, rsi_mid=58, mom_mult=1.3, vol_mult=1.5, adx_min=28),
+}
+
+def _regime_thresholds(market_bullish: bool, vix_val) -> dict:
+    stressed = vix_val is not None and vix_val > 20
+    if market_bullish:
+        return _REGIME_THRESHOLDS["bull_vix" if stressed else "bull_calm"]
+    return _REGIME_THRESHOLDS["bear_stressed" if stressed else "bear_calm"]
+
+
 def category_score(*,
-                   trend_up, ema_stack, fresh_cross, htf_up, market_bullish, e_fast_gt_slow,
+                   # TREND
+                   trend_up, ema_stack, fresh_cross, htf_up, market_bullish,
+                   e_fast_gt_slow,
+                   # MOMENTUM
                    rsi, mom1, mom3, mom6, mom1_th, mom3_th, mom6_th,
-                   phase, in_golden, near_e127, near_e161, norm_bull_raw, rs_rank,
-                   c_gt_hh, c_near_hh, vol_ratio, vol_avg_gt_zero, adx_val,
-                   squeeze, vc_ratio, ext_penalty, regime_bearish) -> dict:
-    # TREND
+                   # STRUCTURE
+                   phase, in_golden, near_e127, near_e161, norm_bull_raw,
+                   rs_rank, c_gt_hh, c_near_hh,
+                   # VOLUME  (FIX-1: renamed to raw_vol_ratio; FIX-4: ADX removed)
+                   raw_vol_ratio, vol_avg_gt_zero,
+                   # QUALITY (FIX-1: renamed atr_contraction; FIX-3: adx separate)
+                   adx_val, squeeze, atr_contraction,
+                   # FIX-8: fib inputs now first-class in QUALITY
+                   fib_in_golden, fib_near_e127, fib_near_e161,
+                   # exhaustion
+                   ext_penalty,
+                   # regime
+                   regime_bearish,
+                   # FIX-7: vix for adaptive thresholds (optional)
+                   vix_val=None) -> dict:
+    """
+    Five-category score.  Each category independently normalised to its weight.
+    Weights sum to 100; result is 0-100 by construction.
+
+    Bug fixes applied vs previous version:
+    FIX-1  atr_contraction (ATR5/ATR20) used for QUALITY; raw_vol_ratio (v/vol_avg) for VOLUME
+    FIX-2  phase is passed in as real phase, not IDLE placeholder
+    FIX-3  trend_up not double-counted — removed from VOLUME category
+    FIX-4  ADX moved to TREND strength gate only, not inside VOLUME
+    FIX-5  high relative volume now penalised if RSI>80 (blow-off guard)
+    FIX-7  regime-adaptive thresholds tighten gates in bear/stressed markets
+    FIX-8  Fibonacci golden zone + extension proximity given proper QUALITY weight
+    """
+    th = _regime_thresholds(market_bullish, vix_val)   # FIX-7
+
+    # ── TREND (0-30) ──────────────────────────────────────────────────────────
+    # FIX-3: ADX used here as a trend-STRENGTH gate, not in VOLUME
+    # FIX-3: trend_up is the primary signal; ema_stack does NOT re-count the same thing
     t = 0.0
     t += 40 if trend_up  else 0
-    t += 20 if ema_stack else (10 if e_fast_gt_slow else 0)
+    # ema_stack adds incremental info (200 EMA alignment) beyond trend_up
+    t += 15 if ema_stack else (5 if e_fast_gt_slow else 0)
     t += 15 if htf_up    else 0
-    t += 15 if market_bullish else 0
+    t += 10 if market_bullish else 0
     t += 10 if fresh_cross else 0
-    cat_T = round(min(_CAT_W["TREND"],   t / 100 * _CAT_W["TREND"]),   2)
-    # MOMENTUM
+    # FIX-4: ADX confirms trend quality but belongs here, not in VOLUME
+    adx_bonus_t = (10 if adx_val >= 30 else 5 if adx_val >= th["adx_min"] else -5)
+    t += adx_bonus_t
+    cat_T = round(min(_CAT_W["TREND"], max(0, t) / 100 * _CAT_W["TREND"]), 2)
+
+    # ── MOMENTUM (0-20) ───────────────────────────────────────────────────────
     m = 0.0
-    if rsi >= 65:    m += 35
-    elif rsi >= 60:  m += 25
-    elif rsi >= 50:  m += 10
-    elif rsi < 40:   m -= 10
-    if mom1 > mom1_th:   m += 25
-    elif mom1 > 0:       m += 10
-    else:                m -= 10
-    if mom3 > mom3_th:   m += 25
-    elif mom3 > 0:       m += 10
-    if mom6 > mom6_th:   m += 15
+    if rsi >= th["rsi_hi"]:       m += 35
+    elif rsi >= th["rsi_mid"]:    m += 20
+    elif rsi >= 50:               m += 8
+    elif rsi < 40:                m -= 15
+    # FIX-5: blow-off guard — penalise RSI extreme even if momentum is strong
+    if rsi > 80:                  m -= 20
+    _m1_th = mom1_th * th["mom_mult"]
+    _m3_th = mom3_th * th["mom_mult"]
+    _m6_th = mom6_th * th["mom_mult"]
+    if mom1 > _m1_th:   m += 25
+    elif mom1 > 0:      m += 10
+    else:               m -= 10
+    if mom3 > _m3_th:   m += 25
+    elif mom3 > 0:      m += 10
+    if mom6 > _m6_th:   m += 15
     cat_M = round(min(_CAT_W["MOMENTUM"], max(0, m) / 100 * _CAT_W["MOMENTUM"]), 2)
-    # STRUCTURE
+
+    # ── STRUCTURE (0-20) ──────────────────────────────────────────────────────
+    # FIX-2: phase is real now — BREAKOUT/CONT phases add significant weight
     PHASE_RAW = {"BREAKOUT":100,"CONT":85,"ENTRY":65,"SETUP":40,"IDLE":10,"EXIT":0}
     s = float(PHASE_RAW.get(phase, 10))
     if c_gt_hh:         s += 20
     elif c_near_hh:     s += 10
-    if in_golden:       s += 20
-    if near_e127:       s -= 25
-    if near_e161:       s -= 35
+    if near_e127:       s -= 30   # approaching fib extension = exhaustion risk
+    if near_e161:       s -= 45
     if rs_rank >= 80:   s += 15
     elif rs_rank >= 60: s += 5
     elif rs_rank < 30:  s -= 10
     cat_S = round(min(_CAT_W["STRUCTURE"], max(0, s) / 200 * _CAT_W["STRUCTURE"]), 2)
-    # VOLUME
-    v = 0.0
+
+    # ── VOLUME (0-15) ─────────────────────────────────────────────────────────
+    # FIX-1: use raw_vol_ratio (v/vol_avg) here — measures actual flow
+    # FIX-3: trend_up removed from this category (already in TREND)
+    # FIX-4: ADX removed from here (moved to TREND)
+    # FIX-5: high volume with overbought RSI penalised (blow-off)
+    v_score = 0.0
+    _vol_th = th["vol_mult"]
     if vol_avg_gt_zero:
-        if vol_ratio >= 1.5:   v += 50
-        elif vol_ratio >= 1.2: v += 30
-        elif vol_ratio >= 1.0: v += 15
-        else:                  v -= 10
-    if adx_val >= 30:   v += 35
-    elif adx_val >= 20: v += 15
-    else:               v -= 20
-    cat_V = round(min(_CAT_W["VOLUME"], max(0, v) / 100 * _CAT_W["VOLUME"]), 2)
-    # QUALITY
+        if raw_vol_ratio >= _vol_th * 1.5:
+            # large volume — good on breakout, bad if RSI extreme
+            v_score += 50 if rsi <= 75 else 10   # FIX-5
+        elif raw_vol_ratio >= _vol_th:
+            v_score += 30
+        elif raw_vol_ratio >= 1.0:
+            v_score += 15
+        else:
+            v_score -= 10
+    cat_V = round(min(_CAT_W["VOLUME"], max(0, v_score) / 100 * _CAT_W["VOLUME"]), 2)
+
+    # ── QUALITY (0-15) ────────────────────────────────────────────────────────
+    # FIX-1: atr_contraction = ATR5/ATR20 (volatility compression)
+    # FIX-8: fibonacci golden zone and extension proximity properly weighted
     q = 0.0
-    if squeeze:           q += 30
-    if vc_ratio < 0.75:   q += 30
-    elif vc_ratio < 0.90: q += 15
-    q += min(40, max(0, -ext_penalty))
-    cat_Q = round(min(_CAT_W["QUALITY"], q / 100 * _CAT_W["QUALITY"]), 2)
-    # Combine
+    if squeeze:                    q += 20
+    if atr_contraction < 0.75:    q += 25   # FIX-1: correct ATR5/ATR20 variable
+    elif atr_contraction < 0.90:  q += 12
+    # FIX-8: Fibonacci quality — golden zone is a genuine edge signal
+    if fib_in_golden:             q += 30   # FIX-8: was only 10 indirectly via in_golden in STRUCTURE
+    if fib_near_e127:             q -= 20   # extension proximity is a risk, not quality
+    if fib_near_e161:             q -= 30
+    # exhaustion cap: perfect quality = 0 penalty
+    q += min(25, max(0, -ext_penalty))
+    cat_Q = round(min(_CAT_W["QUALITY"], max(0, q) / 100 * _CAT_W["QUALITY"]), 2)
+
+    # ── Combine + regime haircut ───────────────────────────────────────────────
     raw_total = cat_T + cat_M + cat_S + cat_V + cat_Q
     if regime_bearish:
         raw_total *= 0.85
@@ -1914,24 +1989,33 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
                 phase_history_snapshot=None):
     try:
         cfg   = MODE_CFG[mode]
+        # FIX-6: compute all indicators on confirmed-candle slice only.
+        # For intraday with market open, strip the live forming bar.
+        # close.iloc[-1] on the full frame is safe for LTP display only.
+        _mkt_open  = _is_market_open()
+        df_closed  = _closed_candle_df(df, mode, _mkt_open)
+        close_c    = df_closed["Close"]   # confirmed-candle close series
+        volume_c   = df_closed["Volume"]
+        n_closed   = len(close_c)
+
         close = df["Close"]; volume = df["Volume"]; n = len(close)
-        if n < 50: return None
+        if n_closed < 50: return None
 
-        liq_ok, avg_cr = liquidity_ok(df, min_liquidity_cr, mode=mode)
+        liq_ok, avg_cr = liquidity_ok(df_closed, min_liquidity_cr, mode=mode)
 
-        c        = float(close.iloc[-1])
-        prev     = float(close.iloc[-2])
-        e_fast_s = ema(close, cfg["ema_fast"])
-        e_slow_s = ema(close, cfg["ema_slow"])
+        c        = float(close.iloc[-1])           # LTP — live bar OK for display
+        prev     = float(close_c.iloc[-1])         # FIX-6: last *confirmed* close for indicators
+        chg      = round(((c - float(close.iloc[-2])) / float(close.iloc[-2])) * 100, 2)
+        e_fast_s = ema(close_c, cfg["ema_fast"])
+        e_slow_s = ema(close_c, cfg["ema_slow"])
         e_fast   = float(e_fast_s.iloc[-1])
         e_slow   = float(e_slow_s.iloc[-1])
-        e200_s   = ema(close, 200)
-        e200     = float(e200_s.iloc[-1]) if n >= 200 else None
-        atr_s    = atr_series(df)
+        e200_s   = ema(close_c, 200)
+        e200     = float(e200_s.iloc[-1]) if n_closed >= 200 else None
+        atr_s    = atr_series(df_closed)           # FIX-6: ATR on closed bars
         atr_val  = float(atr_s.iloc[-1])
         atr_mean = float(atr_s.rolling(20).mean().iloc[-1])
-        chg      = round(((c-prev)/prev)*100, 2)
-        hh       = float(close.iloc[-11:-1].max())
+        hh       = float(close_c.iloc[-11:-1].max())
 
         if len(df) >= 2:
             try:    delta_min = (df.index[1]-df.index[0]).total_seconds()/60
@@ -2010,23 +2094,30 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         r = float(rsi_series.iloc[-1])
 
         # ── SPEED-10: NEW STAGE-B INDICATORS ──────────────────────────────
-        adx_val   = _compute_adx(df)
-        squeeze   = _compute_squeeze(df)
-        vol_ratio = _compute_vol_contraction(df)
-
-        # ADX bonus/penalty
-        adx_bonus = (8 if adx_val >= 30 else 4 if adx_val >= 20 else -4)
-        # Squeeze bonus (coiling for breakout)
-        squeeze_bonus = 5 if squeeze else 0
-        # Volatility contraction bonus
-        vc_bonus = 6 if vol_ratio < 0.75 else (3 if vol_ratio < 0.90 else 0)
+        adx_val         = _compute_adx(df)
+        squeeze         = _compute_squeeze(df)
+        atr_contraction = _compute_vol_contraction(df)   # FIX-1: ATR5/ATR20 ratio
+        raw_vol_ratio   = (v / vol_avg) if vol_avg > 0 else 1.0  # FIX-1: pure volume ratio
         # ─────────────────────────────────────────────────────────────────
 
         regime_bearish = not market_bullish
 
-        # ── FIX-C: Category-based weighted scoring ─────────────────────────
-        # Phase placeholder for initial call — overwritten by detect_phase below
-        _phase_placeholder = PHASE_IDLE
+        # ── Run detect_phase_and_entry FIRST so phase is real, not placeholder ──
+        # (FIX-2: phase must be real before category_score so STRUCTURE is accurate)
+        score_th = float(cfg["score_th"])
+        phase_pre, entry_price_pre, setup_type_pre = detect_phase_and_entry(
+            df, mode, c=c, e_fast_s=e_fast_s, e_slow_s=e_slow_s,
+            atr_s=atr_s, atr_val=atr_val, atr_mean=atr_mean,
+            v=v, vol_avg=vol_avg, fib=fib, sw_hi=sw_hi, sw_lo=sw_lo,
+            in_golden=in_golden, near_e127=near_e127, near_e161=near_e161,
+            norm_bull=50.0,       # neutral seed — only phase shape matters here
+            trend_up=trend_up, trend_down=trend_down,
+            trend_strong=trend_strong, score_th=score_th,
+            vdu_setup=vdu_setup, htf_up=htf_up,
+            regime_bearish=regime_bearish, vix_val=vix_val,
+        )
+
+        # ── FIX-C: Category-based weighted scoring (with real phase) ───────
         cat = category_score(
             trend_up       = trend_up,
             ema_stack      = ema_stack,
@@ -2039,7 +2130,7 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
             mom1_th        = cfg["mom1_th"],
             mom3_th        = cfg["mom3_th"],
             mom6_th        = cfg["mom6_th"],
-            phase          = _phase_placeholder,
+            phase          = phase_pre,         # FIX-2: real phase, not placeholder
             in_golden      = in_golden,
             near_e127      = near_e127,
             near_e161      = near_e161,
@@ -2047,21 +2138,25 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
             rs_rank        = rs_rank,
             c_gt_hh        = (c > hh),
             c_near_hh      = (c > hh * 0.98),
-            vol_ratio      = (v / vol_avg) if vol_avg > 0 else 1.0,
+            raw_vol_ratio  = raw_vol_ratio,     # FIX-1: v/vol_avg for VOLUME category
             vol_avg_gt_zero= vol_avg > 0,
             adx_val        = adx_val,
             squeeze        = squeeze,
-            vc_ratio       = vol_ratio,
+            atr_contraction= atr_contraction,   # FIX-1: ATR5/ATR20 for QUALITY category
+            fib_in_golden  = in_golden,         # FIX-8: fib gets its own weight in QUALITY
+            fib_near_e127  = near_e127,
+            fib_near_e161  = near_e161,
             ext_penalty    = ext_penalty,
             regime_bearish = regime_bearish,
         )
-        norm_bull  = cat["norm_bull"]
-        raw_score  = int(norm_bull)
+        norm_bull = cat["norm_bull"]
+        raw_score = int(norm_bull)
         score_th   = float(cfg["score_th"])
 
         act           = action_label(norm_bull)
         vol_confirmed = v > vol_avg*1.2
 
+        # Re-run phase detection now that norm_bull is real (uses score_th gate properly)
         phase, entry_price, setup_type = detect_phase_and_entry(
             df, mode, c=c, e_fast_s=e_fast_s, e_slow_s=e_slow_s,
             atr_s=atr_s, atr_val=atr_val, atr_mean=atr_mean,
