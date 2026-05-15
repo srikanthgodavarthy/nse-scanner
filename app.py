@@ -1070,37 +1070,150 @@ def _compute_targets(entry, sl, atr_val, fib, setup_type, sw_hi, sw_lo,
 # FETCH HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _fetch_one(args):
-    sym, mode, min_bars = args
-    cfg    = MODE_CFG[mode]
-    ticker = to_nse(sym)
+def _fetch_ohlcv_safe(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    """
+    Single-ticker OHLCV fetch with retry.  No cache (avoid 500-entry bloat).
+    Used only as the fallback path when a batch fails.
+    """
     for attempt in range(3):
         try:
-            df = yf.download(ticker, period=cfg["period"], interval=cfg["interval"],
-                             auto_adjust=True, progress=False, threads=False)
-            if df.empty:
-                return sym, None
+            df = yf.download(
+                ticker, period=period, interval=interval,
+                auto_adjust=True, progress=False,
+                threads=False,          # BUG-7: never nest yfinance threads
+            )
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             df = df.dropna(how="all")
-            if pd.isna(df["Close"].iloc[-1]):
-                df = df.iloc[:-1]
-            df["Close"]  = df["Close"].ffill()
+            if df.empty:
+                return pd.DataFrame()
+            # BUG-4: drop NaN rows instead of forward-filling Close.
             df["Volume"] = df["Volume"].fillna(0)
-            df = df.dropna(subset=["Close"])
-            return sym, (df if len(df) >= min_bars else None)
+            return df.dropna(subset=["Close"])
         except Exception:
             if attempt < 2:
                 time.sleep(min(0.5 * (attempt + 1), 1.0))
-    return sym, None
+    return pd.DataFrame()
+
+
+def _extract_ticker_df(raw: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """
+    Robustly pull a per-ticker slice from a yfinance multi-ticker DataFrame.
+    Handles both MultiIndex orderings (BUG-1 fix).
+    """
+    if not isinstance(raw.columns, pd.MultiIndex):
+        return raw.copy()
+
+    l0 = raw.columns.get_level_values(0)
+    l1 = raw.columns.get_level_values(1)
+
+    if ticker in l0:
+        return raw[ticker].copy()
+
+    if ticker in l1:
+        return raw.xs(ticker, axis=1, level=1).copy()
+
+    return pd.DataFrame()
+
+
+def _clean_ohlcv(df: pd.DataFrame, min_bars: int) -> pd.DataFrame | None:
+    """Strip MultiIndex, drop bad rows, enforce minimum length."""
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.dropna(how="all")
+    if df.empty:
+        return None
+    # BUG-4: drop incomplete rows instead of ffill
+    df["Volume"] = df["Volume"].fillna(0)
+    df = df.dropna(subset=["Close"])
+    return df if len(df) >= min_bars else None
+
+
+def _batch_fetch_ohlcv(
+    symbols: list,
+    period: str,
+    interval: str,
+    min_bars: int,
+    batch_size: int = 50,
+) -> dict:
+    """
+    Download OHLCV for many symbols using yfinance batch mode where possible,
+    with per-symbol fallback when a batch fails (BUG-2).
+    Returns dict {symbol_str: pd.DataFrame | None}
+    """
+    results: dict = {}
+
+    for i in range(0, len(symbols), batch_size):
+        batch_syms    = symbols[i : i + batch_size]
+        batch_tickers = [to_nse(s) for s in batch_syms]
+
+        raw      = None
+        batch_ok = False
+        for attempt in range(2):
+            try:
+                raw = yf.download(
+                    batch_tickers,
+                    period=period,
+                    interval=interval,
+                    auto_adjust=True,
+                    progress=False,
+                    threads=False,      # BUG-7: no nested yfinance threads
+                    group_by="ticker",
+                )
+                if raw is not None and not raw.empty:
+                    batch_ok = True
+                    break
+            except Exception:
+                pass
+            if attempt == 0:
+                time.sleep(1.0)
+
+        for sym, ticker in zip(batch_syms, batch_tickers):
+            if batch_ok:
+                try:
+                    df = _extract_ticker_df(raw, ticker)  # BUG-1 fixed
+                    results[sym] = _clean_ohlcv(df, min_bars)
+                    continue
+                except Exception:
+                    pass  # fall through to individual fetch
+
+            # BUG-2: fallback — batch failed or ticker missing from result
+            try:
+                df = _fetch_ohlcv_safe(ticker, period, interval)
+                results[sym] = _clean_ohlcv(df, min_bars)
+            except Exception:
+                results[sym] = None
+
+    return results
+
+
+def _fetch_one(args):
+    """Single-symbol fetch via the safe helper (no cache, no nested threads)."""
+    sym, mode, min_bars = args
+    cfg    = MODE_CFG[mode]
+    ticker = to_nse(sym)
+    df     = _fetch_ohlcv_safe(ticker, cfg["period"], cfg["interval"])
+    if df.empty or len(df) < min_bars:
+        return sym, None
+    return sym, df
+
 
 def _fetch_one_with_daily(args):
+    """
+    Fetch primary OHLCV and (for Intraday) the daily context.
+    BUG-5 fix: no nested ThreadPoolExecutor — calls are sequential.
+    This function is now only used as a fallback; the hot path goes through
+    _run_scan_pass1 → _batch_fetch_ohlcv.
+    """
     sym, mode, min_bars = args
     primary_sym, primary_df = _fetch_one(args)
     daily_df = None
     if mode == "Intraday" and primary_df is not None:
         _, daily_df = _fetch_one((sym, "Swing", 50))
-    return primary_sym, primary_df, daily_df
+    daily_close = daily_df["Close"] if daily_df is not None else None
+    return primary_sym, primary_df, daily_close
 
 @st.cache_data(ttl=300)
 def fetch_nifty(mode="Swing"):
@@ -1526,40 +1639,57 @@ def _oi_sentiment(pcr):
 @st.cache_data(ttl=300)
 def fetch_indices(mode="Swing"):
     cfg      = MODE_CFG[mode]
-    ema_f    = cfg["ema_fast"]; ema_s = cfg["ema_slow"]; rsi_l = cfg["rsi_len"]
+    ema_f    = cfg["ema_fast"]
+    ema_s    = cfg["ema_slow"]
+    rsi_l    = cfg["rsi_len"]
     min_bars = 60 if mode == "Intraday" else 50
     out      = {}
+
     index_map = [
         ("Nifty 50",  "^NSEI"),
         ("BankNifty", "^NSEBANK"),
         ("Sensex",    "^BSESN"),
     ]
-    for name, ticker in index_map:
+
+    def _one_index(name_ticker):
+        name, ticker = name_ticker
         try:
-            df = yf.download(ticker, period=cfg["period"], interval=cfg["interval"], progress=False)
+            df = yf.download(
+                ticker,
+                period=cfg["period"],
+                interval=cfg["interval"],
+                progress=False,
+                threads=False,          # BUG-7: no nested yfinance threads
+            )
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             df = df.dropna()
             if len(df) < min_bars:
-                out[name] = None; continue
-            close     = df["Close"]
-            c, prev   = float(close.iloc[-1]), float(close.iloc[-2])
-            chg, pct  = c - prev, (c - prev) / prev * 100
-            ef        = float(ema(close, ema_f).iloc[-1])
-            es        = float(ema(close, ema_s).iloc[-1])
-            e200      = float(ema(close, 200).iloc[-1]) if len(close) >= 200 else es
-            r         = float(rsi(close, rsi_l).iloc[-1])
-            hh        = float(close.iloc[-11:-1].max())
-            trend_up  = c > e200 and c > ef and ef > es
-            bull      = 0
+                return name, None
+
+            close    = df["Close"]
+            c, prev  = float(close.iloc[-1]), float(close.iloc[-2])
+            chg, pct = c - prev, (c - prev) / prev * 100
+            ef       = float(ema(close, ema_f).iloc[-1])
+            es       = float(ema(close, ema_s).iloc[-1])
+            e200     = float(ema(close, 200).iloc[-1]) if len(close) >= 200 else es
+            r        = float(rsi(close, rsi_l).iloc[-1])
+            hh       = float(close.iloc[-11:-1].max())
+            trend_up = c > e200 and c > ef and ef > es
+
+            bull = 0
             bull += 25 if trend_up else 0
             bull += 15 if ef > es else (7 if ef > es * 0.995 else 0)
             bull += (15 if r >= 65 else 10) if r >= 60 else (5 if r > 50 else 0)
             bull += 15 if c > hh else (9 if c > hh * 0.98 else 0)
-            if len(close) >= 3 and c > float(close.iloc[-3]): bull += 8
+            if len(close) >= 3 and c > float(close.iloc[-3]):
+                bull += 8
+
             norm_score     = min(100.0, max(0.0, bull * 100.0 / 78))
-            interval_label = {"5m":"5min","1d":"Daily","1wk":"Weekly"}.get(cfg["interval"], cfg["interval"])
-            out[name] = {
+            interval_label = {"5m": "5min", "1d": "Daily", "1wk": "Weekly"}.get(
+                cfg["interval"], cfg["interval"]
+            )
+            return name, {
                 "value":    round(c, 1),
                 "chg":      round(chg, 2),
                 "pct":      round(pct, 2),
@@ -1572,13 +1702,60 @@ def fetch_indices(mode="Swing"):
                 "ema_slow": ema_s,
             }
         except Exception:
-            out[name] = None
+            return name, None
+
+    # 3 outer threads, but no yfinance internal threads (threads=False above)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        for name, result in pool.map(_one_index, index_map):
+            out[name] = result
+
     return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # RUN SCAN  — v11 with FIX-2 breadth gating
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _run_scan_pass1(symbols, mode, cfg, min_bars, progress_bar, status_text):
+    """
+    Pass 1 for run_scan: batch-fetch all OHLCV (and daily context for Intraday).
+    Returns (data dict, daily_closes dict, rejected count).
+    """
+    data:         dict = {}
+    daily_closes: dict = {}
+    rejected:     int  = 0
+
+    status_text.text("Pass 1/3: Batch-fetching OHLCV…")
+    primary = _batch_fetch_ohlcv(
+        symbols, cfg["period"], cfg["interval"], min_bars, batch_size=50,
+    )
+    for sym, df in primary.items():
+        if df is not None:
+            data[sym] = df
+        else:
+            rejected += 1
+
+    progress_bar.progress(0.25)
+
+    if mode == "Intraday" and data:
+        status_text.text("Pass 1b/3: Fetching daily context (batch)…")
+        daily_cfg = MODE_CFG["Swing"]
+        # BUG-3: store full Series (not just iloc[-1]) —
+        # score_stock uses daily_close.iloc[-21/-63/-126] for momentum.
+        daily = _batch_fetch_ohlcv(
+            list(data.keys()),
+            daily_cfg["period"],
+            daily_cfg["interval"],
+            50,
+            batch_size=50,
+        )
+        for sym, df in daily.items():
+            if df is not None:
+                daily_closes[sym] = df["Close"]  # full Series — needed for momentum
+
+    progress_bar.progress(0.40)
+    return data, daily_closes, rejected
+
 
 def run_scan(symbols, mode, progress_bar, status_text,
              vix_val=None, min_liq_cr=LIQUIDITY_MIN_CR):
@@ -1598,25 +1775,10 @@ def run_scan(symbols, mode, progress_bar, status_text,
             "Scores haircut 15%. Targets compressed."
         )
 
-    status_text.text("Pass 1/3: Fetching OHLCV + daily context (parallel)…")
-    data         = {}
-    daily_closes = {}
-    args_list    = [(sym, mode, min_bars) for sym in symbols]
-    MAX_WORKERS  = min(6, os.cpu_count() or 4, total)
-    completed    = 0
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(_fetch_one_with_daily, a): a[0] for a in args_list}
-        for fut in concurrent.futures.as_completed(futures):
-            sym, df, daily_df = fut.result()
-            completed += 1
-            progress_bar.progress(completed / total * 0.40)
-            if df is not None:
-                data[sym] = df
-                if daily_df is not None:
-                    daily_closes[sym] = daily_df["Close"]
-            else:
-                rejected += 1
+    status_text.text("Pass 1/3: Batch-fetching OHLCV…")
+    data, daily_closes, rejected = _run_scan_pass1(
+        symbols, mode, cfg, min_bars, progress_bar, status_text
+    )
 
     status_text.text("Pass 2/3: Pre-fetching HTF data (parallel)…")
     progress_bar.progress(0.40)
@@ -1733,18 +1895,27 @@ class ShortResult:
 def score_short(sym: str, mode: str = "Swing",
                 htf_cache: dict = None,
                 rs_ranks:  dict = None,
-                vix_val:   float = None) -> ShortResult:
+                vix_val:   float = None,
+                prefetched_df: pd.DataFrame = None) -> "ShortResult":
+
     result = ShortResult(symbol=sym, mode=mode, sector=SECTOR_MAP.get(sym, "—"))
     cfg    = MODE_CFG[mode]
+
     try:
-        ticker = to_nse(sym)
-        df = yf.download(ticker, period=cfg["period"], interval=cfg["interval"],
-                         auto_adjust=True, progress=False, threads=False)
+        # ── data acquisition ──────────────────────────────────────────────────
+        if prefetched_df is not None and not prefetched_df.empty:
+            df = prefetched_df.copy()
+        else:
+            ticker = to_nse(sym)
+            df     = _fetch_ohlcv_safe(ticker, cfg["period"], cfg["interval"])
+
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        df = df.dropna()
+        # BUG-4: dropna instead of ffill
+        df = df.dropna(subset=["Close"])
         if len(df) < 60:
-            result.error = "insufficient data"; return result
+            result.error = "insufficient data"
+            return result
 
         cl    = df["Close"]; hi = df["High"]; lo = df["Low"]; vol = df["Volume"]
         close = float(cl.iloc[-1]); result.current_price = close
@@ -1788,7 +1959,6 @@ def score_short(sym: str, mode: str = "Swing",
         else:                    phase = PHASE_IDLE
         result.phase = phase
 
-        nifty_dummy = cl
         ext_flags, _, _, ext_n = detect_exhaustion(
             close=cl, high=hi, low=lo, volume=vol, rsi_series=rsi_ser,
             e_fast_s=ef_ser, atr_s=atr_s, atr_mean=atr_mean,
@@ -1867,20 +2037,51 @@ def score_short(sym: str, mode: str = "Swing",
     return result
 
 
-def run_short_scan(symbols: list, mode: str,
-                   htf_cache: dict = None, rs_ranks: dict = None,
-                   vix_val: float = None,
-                   status_text=None, progress_bar=None) -> list:
-    results = []; total = len(symbols); done = 0
+def run_short_scan(
+    symbols:      list,
+    mode:         str,
+    htf_cache:    dict  = None,
+    rs_ranks:     dict  = None,
+    vix_val:      float = None,
+    status_text         = None,
+    progress_bar        = None,
+) -> list:
+    total   = len(symbols)
+    results = []
+    done    = 0
+    cfg     = MODE_CFG[mode]
 
-    def _one(sym): return score_short(sym, mode, htf_cache, rs_ranks, vix_val)
+    # Pass 1: batch-download (BUG-2 fallback baked in)
+    if status_text:
+        status_text.text("Short scan 1/2: Batch-fetching OHLCV…")
+    prefetched = _batch_fetch_ohlcv(
+        symbols, cfg["period"], cfg["interval"], min_bars=60, batch_size=50,
+    )
+    if progress_bar:
+        progress_bar.progress(0.50)
+
+    # Pass 2: score using pre-fetched data
+    if status_text:
+        status_text.text("Short scan 2/2: Scoring…")
+
+    def _one(sym):
+        return score_short(
+            sym, mode,
+            htf_cache     = htf_cache,
+            rs_ranks      = rs_ranks,
+            vix_val       = vix_val,
+            prefetched_df = prefetched.get(sym),
+        )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, total)) as pool:
         futures = {pool.submit(_one, sym): sym for sym in symbols}
         for fut in concurrent.futures.as_completed(futures):
-            results.append(fut.result()); done += 1
-            if progress_bar: progress_bar.progress(0.5 + done / total * 0.5)
-            if status_text and done % 20 == 0: status_text.text(f"Short scan {done}/{total}…")
+            results.append(fut.result())
+            done += 1
+            if progress_bar:
+                progress_bar.progress(0.50 + done / total * 0.50)
+            if status_text and done % 20 == 0:
+                status_text.text(f"Short scan {done}/{total}…")
 
     results.sort(key=lambda r: r.short_score, reverse=True)
     return [r for r in results if r.verdict != SHORT_SKIP and not r.error]
