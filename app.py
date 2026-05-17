@@ -1221,7 +1221,7 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
     if n < 60: return PHASE_IDLE, None, "norm"
     e_fast_val = float(e_fast_s.iloc[-1])
     e_slow_val = float(e_slow_s.iloc[-1])
-    brk_lb     = 5
+    brk_lb     = 20   # was 5 — resistance should be measured over a meaningful window
     rolling_hi_brk = float(high.iloc[-brk_lb-1:-1].max()) if n > brk_lb+1 else float(high.iloc[-1])
     buf = atr_val*0.15
     is_compressed = atr_val < atr_mean*0.8
@@ -1232,14 +1232,14 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
     upper_wick = (float(high.iloc[-1])-max(float(close.iloc[-1]),float(df["Open"].iloc[-1]))
                   if "Open" in df.columns else 0)
     is_exhaustion = upper_wick > body*1.5
-    brk_vol_ok = (v > vol_avg*1.5) if vol_avg > 0 else False
-    vol_spike  = v > vol_avg*1.3
+    brk_vol_ok = (v > vol_avg*1.2) if vol_avg > 0 else True   # was 1.5 hard gate
+    vol_spike  = v > vol_avg*1.2                               # was 1.3
     is_fib_buy = trend_up and in_golden
     cont_vol_mult = 1.5 if (regime_bearish or (vix_val and vix_val>VIX_CAUTION)) else 1.2
-    BRK_CONF_MIN  = 0.70 if regime_bearish else 0.65
+    BRK_CONF_MIN  = 0.65 if regime_bearish else 0.55           # was 0.70/0.65
     brk_weights = {
-        "price_above_high":(0.35, c > rolling_hi_brk+buf),
-        "score_ok":        (0.20, norm_bull >= score_th),
+        "price_above_high":(0.40, c > rolling_hi_brk+buf),    # primary — above 20-bar high
+        "score_ok":        (0.15, norm_bull >= score_th*0.9),  # 90% of threshold is enough
         "compressed":      (0.20, is_compressed),
         "expanding":       (0.15, is_expanding),
         "vol_spike":       (0.10, vol_spike),
@@ -1284,8 +1284,12 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
         phase, setup_type = PHASE_SETUP, ("fib" if is_fib_buy else ("vdu" if vdu_setup else "norm"))
     elif trail_break and trend_up:  phase, setup_type = PHASE_EXIT, "norm"
     else:                           phase, setup_type = PHASE_IDLE, "norm"
-    if not htf_up and phase in (PHASE_ENTRY,PHASE_CONT,PHASE_BRK):
-        phase, setup_type = PHASE_SETUP, setup_type
+    # Gate 3 fix: HTF bearish no longer kills ENTRY-phase stocks outright.
+    # BREAKOUT demotes to ENTRY (not SETUP) when HTF unconfirmed.
+    # CONT and ENTRY survive — flagged by htf_up=False in result dict.
+    if not htf_up:
+        if phase == PHASE_BRK:
+            phase, setup_type = PHASE_ENTRY, setup_type   # softer — still actionable
     entry_price = None
     if phase in (PHASE_ENTRY,PHASE_CONT,PHASE_BRK,PHASE_SETUP):
         prox = atr_val*0.3
@@ -2693,8 +2697,8 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         norm_bull = _cat2["norm_bull"]
         raw_score = int(norm_bull)
 
-        # ADX gate: don't declare BREAKOUT if ADX weak (no trend strength)
-        if phase == PHASE_BRK and adx_val < 18:
+        # ADX gate: only demote BREAKOUT if ADX is truly weak (<15). Was 18 — too strict.
+        if phase == PHASE_BRK and adx_val < 15:
             phase = PHASE_ENTRY
 
         phase, _ = ext_phase_override(phase, ext_flags, ext_n, mode)
@@ -2719,6 +2723,12 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
             regime_bullish=market_bullish, ext_n=ext_n, vix_val=vix_val,
             phase_bonus=phase_bonus, rs_rank=rs_rank,
         )
+
+        # Near-breakout flag: within 1 ATR of 20-bar high, score building
+        hi_20 = float(df["High"].iloc[-21:-1].max()) if n > 21 else float(df["High"].max())
+        near_brk = (c >= hi_20 * 0.98 and c < hi_20 * 1.02
+                    and phase in (PHASE_SETUP, PHASE_ENTRY)
+                    and norm_bull >= 48)
 
         ltp   = round(c, 2)
         entry = entry_price if entry_price else ltp
@@ -2804,6 +2814,8 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
             "CandlePatterns":_candle["patterns"],
             "NR7":          _candle["nr7"],
             "InsideBar":    _candle["inside_bar"],
+            "NearBrk":      near_brk,
+            "Hi20":         round(hi_20, 2),
             # ── EMS — Emerging Momentum Score ────────────────────────────────
             "EMS":          _ems["ems"],
             "EMSLabel":     _ems["ems_label"],
@@ -4387,30 +4399,58 @@ with tab_scanner:
             )
 
         ACTIONABLE_PHASES={PHASE_ENTRY,PHASE_CONT,PHASE_BRK}
+        # Gate 5 fix: include WATCH-action stocks in active phases — score
+        # may be borderline but phase classification is valid signal.
         actionable=[r for r in st.session_state.results
-                    if r.get("Phase") in ACTIONABLE_PHASES and r["Action"] in ("BUY","STRONG BUY")]
+                    if r.get("Phase") in ACTIONABLE_PHASES
+                    and r["Action"] in ("BUY","STRONG BUY","WATCH")]
         phase_rank={PHASE_BRK:0,PHASE_CONT:1,PHASE_ENTRY:2}
         actionable.sort(key=lambda x:(phase_rank.get(x.get("Phase"),9),-x["Score"]))
         top_act=actionable[:15]
 
         if top_act:
+            _brk_n  = sum(1 for r in top_act if r.get("Phase")==PHASE_BRK)
+            _cont_n = sum(1 for r in top_act if r.get("Phase")==PHASE_CONT)
+            _ent_n  = sum(1 for r in top_act if r.get("Phase")==PHASE_ENTRY)
             with st.expander(
-                f"READY TO TRADE — {len(top_act)} stocks in ENTRY / CONT / BREAKOUT",
+                f"⚡ READY TO TRADE — "
+                f"{f'🚀 {_brk_n} BREAKOUT · ' if _brk_n else ''}"
+                f"{f'↗ {_cont_n} CONTINUATION · ' if _cont_n else ''}"
+                f"{f'⚡ {_ent_n} ENTRY' if _ent_n else ''}",
                 expanded=True
             ):
                 cards_html='<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
                 for i,r in enumerate(top_act):
-                    cards_html+=make_card(i,r,"#22c55e55",show_entry=True)
+                    _bc = "#22c55e55" if r.get("Phase")==PHASE_BRK else "#3b82f655" if r.get("Phase")==PHASE_CONT else "#6366f155"
+                    cards_html+=make_card(i,r,_bc,show_entry=True)
                 cards_html+="</div>"
                 st.markdown(cards_html,unsafe_allow_html=True)
                 st.markdown(
                     '<div style="text-align:center;color:#3a3a60;font-size:10px;'
                     'font-family:JetBrains Mono,monospace;padding:4px 0 2px;">'
-                    'ⓘ Data is indicator based. Confirm with price action.</div>',
+                    'ⓘ Indicator-based. Always confirm with price action.</div>',
                     unsafe_allow_html=True,
                 )
         else:
-            st.info("No stocks in ENTRY / CONT / BREAKOUT phase.")
+            st.info("No stocks in ENTRY / CONT / BREAKOUT phase. Market may be in low-momentum regime.")
+
+        # ── Near Breakout — approaching resistance with compression ───────────
+        _near_brk = sorted(
+            [r for r in st.session_state.results
+             if r.get("NearBrk") and r.get("Phase") in (PHASE_SETUP, PHASE_ENTRY)
+             and r["Action"] in ("BUY","STRONG BUY","WATCH")],
+            key=lambda x: -x["Score"]
+        )[:8]
+        if _near_brk:
+            with st.expander(
+                f"🎯 NEAR BREAKOUT — {len(_near_brk)} stocks within 2% of 20-day resistance",
+                expanded=len(top_act)==0   # open if nothing in ready-to-trade
+            ):
+                nb_cards='<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
+                for i,r in enumerate(_near_brk):
+                    nb_cards+=make_card(i,r,"#f59e0b55",show_entry=True)
+                nb_cards+="</div>"
+                st.markdown(nb_cards,unsafe_allow_html=True)
 
         # FIX-5: include WATCH action; lower threshold so SETUP stocks (45-57) appear
         watchlist=[r for r in st.session_state.results
