@@ -4490,29 +4490,7 @@ with tab_scanner:
                     "squeeze depth · sector momentum · range expansion. "
                     "These are **pre-breakout candidates** — not yet actionable, but worth monitoring."
                 )
-                # EMS breakdown table
-                _ems_rows = []
-                for r in _ems_candidates:
-                    bd = r.get("EMSBreakdown", {})
-                    _ems_rows.append({
-                        "Symbol":   r["Symbol"],
-                        "Sector":   r.get("Sector","—"),
-                        "EMS":      r.get("EMS", 0),
-                        "Label":    r.get("EMSLabel","—"),
-                        "Score":    r.get("Score", 0),
-                        "Phase":    r.get("Phase","—"),
-                        "RS↑":      bd.get("rs_acc", 0),
-                        "ATR⬇":    bd.get("atr_comp", 0),
-                        "Vol↑":     bd.get("rvol_acc", 0),
-                        "EMA→":     bd.get("ema_conv", 0),
-                        "Sqz":      bd.get("squeeze", 0),
-                        "Sec":      bd.get("sector", 0),
-                        "OR↑":      bd.get("or_exp", 0),
-                        "SqzBars":  r.get("SqzBars", 0),
-                    })
-                _ems_df = pd.DataFrame(_ems_rows)
-
-                # Colour-coded EMS bar cards
+                # EMS breakdown mini-bar cards
                 ems_cards = '<div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px;">'
                 for r in _ems_candidates:
                     ec   = r.get("EMSColor","#334155")
@@ -4571,23 +4549,6 @@ with tab_scanner:
                     )
                 ems_cards += '</div>'
                 st.markdown(ems_cards, unsafe_allow_html=True)
-
-                # Component breakdown table
-                st.dataframe(
-                    _ems_df.style.background_gradient(subset=["EMS"], cmap="YlGn")
-                                 .format({"EMS":"{:.1f}","Score":"{:.1f}",
-                                          "RS↑":"{:.1f}","ATR⬇":"{:.1f}","Vol↑":"{:.1f}",
-                                          "EMA→":"{:.1f}","Sqz":"{:.1f}","Sec":"{:.1f}","OR↑":"{:.1f}"}),
-                    use_container_width=True, hide_index=True,
-                    column_config={
-                        "Symbol":  st.column_config.TextColumn("Symbol", width=80),
-                        "EMS":     st.column_config.ProgressColumn("EMS",  min_value=0, max_value=100, format="%.1f"),
-                        "Score":   st.column_config.ProgressColumn("Score",min_value=0, max_value=100, format="%.1f"),
-                        "Label":   st.column_config.TextColumn("Label",   width=90),
-                        "Phase":   st.column_config.TextColumn("Phase",   width=70),
-                        "SqzBars": st.column_config.NumberColumn("Sqz Bars"),
-                    }
-                )
 
         # ── Short list (derived from scan, unchanged) ──────────────────────────
         short_candidates=derive_short_candidates(st.session_state.results,scan_mode_now,vix_val)
@@ -4675,62 +4636,6 @@ with tab_scanner:
                         '<span style="color:#fca5a5;font-weight:600;">Short selling carries elevated risk — always use disciplined SL management.</span>'
                         '</div>',unsafe_allow_html=True)
 
-        # ── Main table ─────────────────────────────────────────────────────────
-        if results:
-            rows=[]
-            for i,r in enumerate(results):
-                chg=r["%Change"]
-                ph_arrow=get_phase_arrow(r["Symbol"])
-                rows.append({
-                    "#":i+1,"Symbol":r["Symbol"],"Score":r["Score"],"Conf%":r.get("Confidence",0),
-                    "Phase":f'{r.get("Phase","")}{" "+ph_arrow if ph_arrow else ""}',
-                    "Setup":{"fib":"Fib","breakout":"BRK","norm":"std","vdu":"VDU"}.get(r.get("Setup","norm"),"std"),
-                    "Action":r["Action"],"B-Gate":"⚠" if r.get("BreadthGated") else "",
-                    "%Chg":f"+{chg}%" if chg>=0 else f"{chg}%",
-                    "RSI":r.get("RSI","—"),"RS_Rank":r.get("RS_Rank",50),
-                    "ADX":r.get("ADX","—"),"SQZ":"◆" if r.get("Squeeze") else "",
-                    "VCP":r.get("VCPGrade","—"),
-                    "AVWAP":"↑" if r.get("AVWAPAbove") else "↓",
-                    "FibQ":r.get("FibGrade","—"),
-                    "VDU":"×"*int(r.get("VDUIntensity",0)) or "—",
-                    "RVol":r.get("RVolLabel","—"),
-                    "Darvas":("BRK" if r.get("DarvasBrk") else ("□" if r.get("DarvasIn") else "—")),
-                    "LTP":fmt(r["LTP"]),"Entry":fmt(r["Entry"])+(" ⚡" if r["Entry"]!=r["LTP"] else ""),
-                    "SL":fmt(r["SL"]),"T1":fmt(r["T1"]),"T2":fmt(r["T2"]),"T3":fmt(r["T3"]),
-                    "Liq₹Cr":r.get("AvgTradedCr","—"),"HTF":"↑" if r.get("HTFUp",True) else "↓",
-                    "ExtN":r.get("ExtN",0),"Ext":" ".join(r.get("ExtLabels",[])) or "—",
-                })
-            df_display=pd.DataFrame(rows)
-            def color_extn(val):
-                if val==0: return "background-color:transparent;color:#cbd5e1"
-                if val==1: return "background-color:#78350f44;color:#f59e0b"
-                if val==2: return "background-color:#9a3412aa;color:#fb923c"
-                return "background-color:#7f1d1d;color:#fca5a5;font-weight:600"
-            def color_action(val):
-                if val=="STRONG BUY": return "color:#f59e0b;font-weight:600"
-                if val=="BUY": return "color:#22c55e"
-                if val=="WATCH": return "color:#d97706"
-                return "color:#cbd5e1"
-            def color_pct(val):
-                if isinstance(val,str) and val.startswith("+"): return "color:#22c55e;font-family:JetBrains Mono,monospace"
-                if isinstance(val,str) and val.startswith("-"): return "color:#ef4444;font-family:JetBrains Mono,monospace"
-                return ""
-            styled=(df_display.style
-                    .map(color_extn,subset=["ExtN"]).map(color_action,subset=["Action"]).map(color_pct,subset=["%Chg"])
-                    .set_properties(**{"font-family":"JetBrains Mono,monospace","font-size":"11px"}))
-            st.dataframe(styled,use_container_width=True,hide_index=True,height=480)
-            st.markdown(
-                '<div style="font-size:10px;color:#3a3a60;font-family:JetBrains Mono,monospace;margin-top:4px;">'
-                'Score 0-100 · Conf% = confidence · ADX = trend strength (≥30=strong) · SQZ = Keltner/BB squeeze · '
-                'RS_Rank = 52w percentile · HTF ↑/↓ = weekly · ExtN 0=clean 3+=skip</div>',
-                unsafe_allow_html=True,
-            )
-            buy_rows=[r for r in results if r["Action"] in ("BUY","STRONG BUY")]
-            if buy_rows:
-                csv=pd.DataFrame(buy_rows).drop(columns=["ExtFlags"],errors="ignore").to_csv(index=False)
-                ts=datetime.now().strftime("%Y%m%d_%H%M%S")
-                st.download_button("Export BUY results",csv,
-                                   f"NSE_Scan_{st.session_state.scan_mode}_{ts}.csv","text/csv")
         elif st.session_state.results:
             st.warning("No stocks match current filters.")
         else:
