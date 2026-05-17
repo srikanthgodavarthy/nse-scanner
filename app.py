@@ -1,59 +1,38 @@
-"""BULL SUTRA Pro — v15.0
+"""BULL SUTRA Pro — v15.5-emerging
 ═══════════════════════════════════════════════════════════════════
-BASE: v14.3 — all prior fixes 100% preserved.
+BASE: v15.4 — all prior fixes 100% preserved.
 
-SPEED OVERHAUL v15.0:
+NEW: v15.5 — EMERGING MOMENTUM ENGINE
 ─────────────────────────────────────────────────────────────────
-SPEED-1  ASYNC HTTP (aiohttp) — Direct Yahoo Finance endpoints
-         bypass yfinance overhead; raw JSON parsed once.
+Surfaces stocks BEFORE they become obvious.
 
-SPEED-2  TWO-STAGE SCAN
-         Stage-A: price+volume+EMA pre-filter (vectorized, no
-           full indicator suite) — eliminates ~60-70% of symbols.
-         Stage-B: full engine (ADX, RS, squeeze, volatility
-           contraction, structure) only on survivors.
+NEW-1  compute_emerging_score() — 7-component leading indicator (0–100):
+       • RS Acceleration      (15 pts) — relative strength gaining speed
+       • ATR Compression      (15 pts) — volatility coiling toward breakout
+       • RVOL Acceleration    (15 pts) — volume building quietly (smart money)
+       • EMA Convergence      (15 pts) — fast/slow EMAs tightening
+       • Squeeze Pressure     (15 pts) — consecutive BB-inside-KC bars
+       • Sector Momentum      (10 pts) — sector tailwind (enriched post-scan)
+       • Opening Range Exp.   (15 pts) — price beyond recent consolidation
 
-SPEED-3  INCREMENTAL / SPLIT FETCH
-         Historical bars (>1d old) cached to Parquet on disk.
-         Live fetch retrieves ONLY the latest 1-2 candles and
-         appends; avoids re-downloading 1yr of history every scan.
-         Morning "cold-start" flag forces a full refresh once.
+NEW-2  Selection Mode toggle — "🎯 Confirmation" vs "🌱 Emerging"
+       Confirmation = existing ENTRY/CONT/BREAKOUT flow (unchanged).
+       Emerging = stocks in SETUP/IDLE/ENTRY that show all 7 signals
+       building — surfaces setups BEFORE the phase upgrades.
 
-SPEED-4  POLARS CORE
-         All internal indicator math uses Polars DataFrames
-         (lazy evaluation, SIMD-optimised). Pandas kept only at
-         Streamlit display boundaries (st.dataframe / styled).
+NEW-3  Emerging Momentum Score cards — colour-coded by label:
+       IGNITING ≥65 · BUILDING ≥50 · COILING ≥35 · LATENT ≥20 · QUIET <20
+       Component breakdown bars shown for each of the 7 signals.
 
-SPEED-5  VECTORIZED BATCH INDICATORS
-         ema_batch / rsi_batch / atr_batch accept a (N×T) numpy
-         matrix and return results for all symbols in one pass —
-         no Python loop per symbol.
+NEW-4  Sector momentum enriched in run_scan() after breadth data
+       is available; min-score slider to tune sensitivity.
 
-SPEED-6  PRECOMPUTED SHARED INDICATORS
-         Nifty EMA, RS denominator, VIX — fetched ONCE at scan
-         start and shared across all worker threads as read-only
-         numpy arrays.
-
-SPEED-7  REDUCED PANDAS COPIES
-         All intermediate frames use .assign() chaining; .copy()
-         only where mutation is required.
-
-SPEED-8  STREAMLIT RENDER GUARD
-         st.fragment + st.cache_data on card HTML generation;
-         only changed cards re-render (key = hash of result dict).
-
-SPEED-9  CONNECTION POOL
-         aiohttp.TCPConnector(limit=64, ttl_dns_cache=300) keeps
-         sockets warm across the full scan batch.
-
-SPEED-10 ADX / SQUEEZE / VOLATILITY-CONTRACTION INDICATORS
-         Added to Stage-B scoring (not present in v14):
-         — ADX(14): trend strength gate; weak ADX suppresses BRK.
-         — Keltner/BB Squeeze: low-volatility coil detector.
-         — Volatility contraction ratio: ATR[5]/ATR[20] < 0.75.
+NEW-5  _count_squeeze_bars() helper — counts consecutive Keltner/BB
+       squeeze bars efficiently (O(lookback × period) per symbol).
 ═══════════════════════════════════════════════════════════════════
-All v14.3 FIX-1 … FIX-12 and CARD UI unchanged.
+All v15.4 / v15.3 / v14.3 fixes unchanged.
 """
+
 
 import warnings
 import logging
@@ -113,12 +92,23 @@ try:
 except ImportError:
     _SECTORS = None
     try:
-        import urllib.request, types as _types
+        import urllib.request, types as _types, hashlib as _hashlib
         _GH_SECTORS_URL = (
             "https://raw.githubusercontent.com/srikanthgodavarthy/nse-scan/main/sectors.py"
         )
+        # SECURITY NOTE: exec() on remote code is a risk. Pin to a known SHA-256 or
+        # bundle sectors.py locally. The hash check below should be updated whenever
+        # sectors.py changes on the remote. Set _SECTORS_EXPECTED_SHA = None to skip.
+        _SECTORS_EXPECTED_SHA = None   # e.g. "abc123..." — set to your known hash
         with urllib.request.urlopen(_GH_SECTORS_URL, timeout=10) as _resp:
-            _src = _resp.read().decode("utf-8")
+            _src_bytes = _resp.read()
+        if _SECTORS_EXPECTED_SHA is not None:
+            _actual_sha = _hashlib.sha256(_src_bytes).hexdigest()
+            if _actual_sha != _SECTORS_EXPECTED_SHA:
+                raise RuntimeError(
+                    f"sectors.py integrity check failed: got {_actual_sha[:16]}…"
+                )
+        _src = _src_bytes.decode("utf-8")
         _mod = _types.ModuleType("sectors_remote")
         exec(compile(_src, "<sectors_gh>", "exec"), _mod.__dict__)
         _SECTORS = getattr(_mod, "SECTORS", None)
@@ -522,80 +512,7 @@ def _yf_fallback_batch(symbols: list, period: str, interval: str) -> dict[str, p
 # SPEED-3: INCREMENTAL FETCH  — cache + live-tail merge
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _incremental_fetch(sym: str, mode: str,
-                        force_full: bool = False) -> pd.DataFrame:
-    """
-    Return OHLCV for sym:
-    - If cache is fresh and market open → append live tail only.
-    - If cache is stale / missing / force_full → full fetch + save.
-    """
-    cfg      = MODE_CFG[mode]
-    interval = cfg["interval"]
-    period   = cfg["yf_period"]
 
-    # cache age thresholds (hours)
-    _STALE_H = {"Intraday": 0.25, "Swing": 12, "Positional": 24}
-    stale_h  = _STALE_H[mode]
-
-    cached   = _load_cached(sym, interval) if not force_full else None
-
-    if cached is not None and len(cached) >= cfg["hist_min_bars"]:
-        if _is_market_open():
-            # live tail only
-            tail_map  = fetch_async([sym], "1d" if interval not in ("1d",) else "5d",
-                                    interval, concurrency=1)
-            tail_df   = tail_map.get(sym, pd.DataFrame())
-            if not tail_df.empty:
-                cached  = _normalize_index(cached)
-                tail_df = _normalize_index(tail_df)
-                df = pd.concat([cached, tail_df])
-                df = df[~df.index.duplicated(keep="last")].sort_index()
-                _save_cached(sym, interval, df)
-                return df
-        # market closed → use cache as-is
-        return cached
-
-    # full fetch
-    raw = fetch_async([sym], period, interval, concurrency=1)
-    df  = raw.get(sym, pd.DataFrame())
-    if not df.empty:
-        _save_cached(sym, interval, df)
-    return df
-
-def _incremental_fetch_FIXED(sym: str, mode: str, force_full: bool = False) -> pd.DataFrame:
-    """
-    FIXED version of _incremental_fetch.
-    Only the merge block (was lines 495-499) is changed.
-    """
-    cfg      = MODE_CFG[mode]
-    interval = cfg["interval"]
-    period   = cfg["yf_period"]
-
-    _STALE_H = {"Intraday": 0.25, "Swing": 12, "Positional": 24}
-    stale_h  = _STALE_H[mode]
-
-    cached = _load_cached(sym, interval) if not force_full else None
-
-    if cached is not None and len(cached) >= cfg["hist_min_bars"]:
-        if _is_market_open():
-            tail_map = fetch_async([sym], "1d" if interval not in ("1d",) else "5d",
-                                   interval, concurrency=1)
-            tail_df  = tail_map.get(sym, pd.DataFrame())
-            if not tail_df.empty:
-                # FIX: normalize both sides before concat
-                cached  = _normalize_index(cached)
-                tail_df = _normalize_index(tail_df)
-                df = pd.concat([cached, tail_df])
-                df = df[~df.index.duplicated(keep="last")].sort_index()
-                _save_cached(sym, interval, df)
-                return df
-        return cached
-
-    raw = fetch_async([sym], period, interval, concurrency=1)
-    df  = raw.get(sym, pd.DataFrame())
-    if not df.empty:
-        _save_cached(sym, interval, df)
-    return df
 
 
 def batch_incremental_fetch(
@@ -633,6 +550,10 @@ def batch_incremental_fetch(
         if progress_cb:
             progress_cb(len(need_full) / total)
 
+    # Cache staleness thresholds (seconds) — market-closed path also enforces these
+    _STALE_SECS = {"Intraday": 900, "Swing": 43200, "Positional": 86400}
+    _stale_secs = _STALE_SECS.get(mode, 43200)
+
     if can_append and _is_market_open():
         live_int = cfg.get("live_interval", interval)
         tails    = fetch_async(can_append, "1d", live_int, concurrency=64)
@@ -641,7 +562,6 @@ def batch_incremental_fetch(
             cached = _load_cached(sym, interval)
             tail   = tails.get(sym, pd.DataFrame())
             if cached is not None and not tail.empty:
-                # FIX: normalize both sides before concat
                 cached = _normalize_index(cached)
                 tail   = _normalize_index(tail)
                 merged = pd.concat([cached, tail])
@@ -656,7 +576,21 @@ def batch_incremental_fetch(
             if progress_cb:
                 progress_cb(done / total)
     else:
-        for sym in can_append:
+        # FIX-2: enforce staleness even when market is closed; re-fetch stale caches
+        stale_syms = [
+            sym for sym in can_append
+            if not _cache_is_fresh(sym, interval, _stale_secs / 3600)
+        ]
+        fresh_syms = [sym for sym in can_append if sym not in stale_syms]
+
+        if stale_syms:
+            refreshed = fetch_async(stale_syms, period, interval, concurrency=64)
+            for sym, df in refreshed.items():
+                if not df.empty:
+                    _save_cached(sym, interval, df)
+                results[sym] = df if not df.empty else pd.DataFrame()
+
+        for sym in fresh_syms:
             cached = _load_cached(sym, interval)
             results[sym] = cached if cached is not None else pd.DataFrame()
         if progress_cb:
@@ -675,6 +609,26 @@ def _ema_np(arr: np.ndarray, span: int) -> np.ndarray:
     result[0] = arr[0]
     for i in range(1, len(arr)):
         result[i] = alpha * arr[i] + (1 - alpha) * result[i-1]
+    return result
+
+def _rma_np(arr: np.ndarray, period: int) -> np.ndarray:
+    """Wilder's Moving Average (RMA) on 1-D array — alpha = 1/period.
+    Used for ADX/DI smoothing to match charting platform values."""
+    alpha  = 1.0 / period
+    result = np.empty_like(arr)
+    result[0] = arr[0]
+    for i in range(1, len(arr)):
+        result[i] = alpha * arr[i] + (1 - alpha) * result[i-1]
+    return result
+
+def _rma_batch(matrix: np.ndarray, period: int) -> np.ndarray:
+    """Wilder's Moving Average on (N, T) matrix — alpha = 1/period."""
+    alpha  = 1.0 / period
+    result = np.empty_like(matrix)
+    result[:, 0] = matrix[:, 0]
+    beta = 1 - alpha
+    for t in range(1, matrix.shape[1]):
+        result[:, t] = alpha * matrix[:, t] + beta * result[:, t - 1]
     return result
 
 def _ema_batch(matrix: np.ndarray, span: int) -> np.ndarray:
@@ -710,7 +664,8 @@ def _atr_batch(high: np.ndarray, low: np.ndarray,
 
 def _adx_batch(high: np.ndarray, low: np.ndarray,
                close: np.ndarray, period: int = 14) -> np.ndarray:
-    """ADX on (N, T) → returns ADX values (N, T)."""
+    """ADX on (N, T) → returns ADX values (N, T).
+    Uses Wilder's RMA (alpha=1/period) to match standard charting platform values."""
     prev_high  = np.roll(high,  1, axis=1); prev_high[:,  0] = high[:,  0]
     prev_low   = np.roll(low,   1, axis=1); prev_low[:,   0] = low[:,   0]
     prev_close = np.roll(close, 1, axis=1); prev_close[:, 0] = close[:, 0]
@@ -723,11 +678,11 @@ def _adx_batch(high: np.ndarray, low: np.ndarray,
     tr = np.maximum(high - low,
          np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
 
-    atr_s     = _ema_batch(tr,        period)
-    plus_di   = 100 * _ema_batch(plus_dm,  period) / (atr_s + 1e-10)
-    minus_di  = 100 * _ema_batch(minus_dm, period) / (atr_s + 1e-10)
+    atr_s     = _rma_batch(tr,        period)
+    plus_di   = 100 * _rma_batch(plus_dm,  period) / (atr_s + 1e-10)
+    minus_di  = 100 * _rma_batch(minus_dm, period) / (atr_s + 1e-10)
     dx        = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
-    adx       = _ema_batch(dx, period)
+    adx       = _rma_batch(dx, period)
     return adx
 
 def _bb_squeeze_batch(close: np.ndarray, high: np.ndarray, low: np.ndarray,
@@ -937,7 +892,7 @@ def fetch_vix():
         if df.empty:
             return None, "UNKNOWN"
         v = float(df["Close"].iloc[-1])
-        label = "CALM" if v < VIX_CALM else ("CAUTION" if v < VIX_STRESS else "STRESS")
+        label = "CALM" if v < VIX_CALM else ("CAUTION" if v < VIX_CAUTION else "STRESS")
         return round(v, 2), label
     except Exception:
         return None, "UNKNOWN"
@@ -1395,14 +1350,12 @@ def _market_regime(nifty_close):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _compute_adx(df: pd.DataFrame, period: int = 14) -> float:
-    """Single-symbol ADX, returns latest value."""
+    """Single-symbol ADX using Wilder's RMA — matches standard charting platform values."""
     if len(df) < period * 3:
         return 20.0
     hi  = df["High"].values.astype(np.float32)
     lo  = df["Low"].values.astype(np.float32)
     cl  = df["Close"].values.astype(np.float32)
-    mat = np.stack([hi, lo, cl], axis=0)   # not used; compute via 1-D
-    # 1-D path (simpler, avoids matrix overhead for single symbol)
     prev_hi = np.roll(hi, 1); prev_hi[0] = hi[0]
     prev_lo = np.roll(lo, 1); prev_lo[0] = lo[0]
     prev_cl = np.roll(cl, 1); prev_cl[0] = cl[0]
@@ -1410,11 +1363,11 @@ def _compute_adx(df: pd.DataFrame, period: int = 14) -> float:
     pdm   = np.where((up_m > dn_m) & (up_m > 0), up_m, 0.0)
     ndm   = np.where((dn_m > up_m) & (dn_m > 0), dn_m, 0.0)
     tr    = np.maximum(hi-lo, np.maximum(np.abs(hi-prev_cl), np.abs(lo-prev_cl)))
-    atr_v = _ema_np(tr, period)
-    pdi   = 100*_ema_np(pdm, period)/(atr_v+1e-10)
-    ndi   = 100*_ema_np(ndm, period)/(atr_v+1e-10)
+    atr_v = _rma_np(tr, period)
+    pdi   = 100*_rma_np(pdm, period)/(atr_v+1e-10)
+    ndi   = 100*_rma_np(ndm, period)/(atr_v+1e-10)
     dx    = 100*np.abs(pdi-ndi)/(pdi+ndi+1e-10)
-    adx_v = _ema_np(dx, period)
+    adx_v = _rma_np(dx, period)
     return float(adx_v[-1])
 
 def _compute_squeeze(df: pd.DataFrame, period: int = 20) -> bool:
@@ -1448,13 +1401,1065 @@ def _compute_vol_contraction(df: pd.DataFrame) -> float:
     return atr5/(atr20+1e-10)
 
 # ══════════════════════════════════════════════════════════════════════════════
+# v15.5 — EMERGING MOMENTUM ENGINE
+# Surfaces stocks BEFORE they become obvious, using 7 leading indicators.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _count_squeeze_bars(df: pd.DataFrame, period: int = 20,
+                         max_lookback: int = 40) -> int:
+    """Count consecutive bars currently in Keltner/BB squeeze (from most recent bar back)."""
+    n = len(df)
+    if n < period + 2:
+        return 0
+    cl = df["Close"].values.astype(np.float64)
+    hi = df["High"].values.astype(np.float64)
+    lo = df["Low"].values.astype(np.float64)
+    count = 0
+    for offset in range(min(max_lookback, n - period)):
+        end = n - offset
+        if end < period:
+            break
+        cl_w = cl[end - period:end]
+        hi_w = hi[end - period:end]
+        lo_w = lo[end - period:end]
+        mid   = _ema_np(cl_w, period)[-1]
+        dev2  = _ema_np((cl_w - _ema_np(cl_w, period)) ** 2, period)[-1]
+        std   = float(np.sqrt(max(dev2, 0)))
+        bb_hi = mid + 2.0 * std;  bb_lo = mid - 2.0 * std
+        prev_cl_w = np.roll(cl_w, 1); prev_cl_w[0] = cl_w[0]
+        tr_w   = np.maximum(hi_w - lo_w,
+                 np.maximum(np.abs(hi_w - prev_cl_w), np.abs(lo_w - prev_cl_w)))
+        atr_k  = float(_ema_np(tr_w, period)[-1])
+        kc_hi  = mid + 1.5 * atr_k;  kc_lo = mid - 1.5 * atr_k
+        if bb_hi <= kc_hi and bb_lo >= kc_lo:
+            count += 1
+        else:
+            break
+    return count
+
+
+def compute_emerging_score(
+    df: pd.DataFrame,
+    mode: str,
+    nifty_close: pd.Series,
+    rs_rank: int = 50,
+) -> dict:
+    """
+    Emerging Momentum Score (0–100) — surfaces stocks BEFORE they become obvious.
+
+    Components (max pts):
+    1. RS Acceleration      15 — relative strength gaining speed vs index
+    2. ATR Compression      15 — volatility coiling toward a breakout
+    3. RVOL Acceleration    15 — volume building quietly (smart-money fingerprint)
+    4. EMA Convergence      15 — fast/slow EMAs tightening = decision approaching
+    5. Squeeze Pressure     15 — consecutive BB-inside-KC bars = stored energy
+    6. Sector Momentum      10 — sector tailwind (enriched post-scan in run_scan)
+    7. Opening Range Exp.   15 — price expanding beyond recent consolidation
+
+    Labels: IGNITING ≥65 · BUILDING ≥50 · COILING ≥35 · LATENT ≥20 · QUIET <20
+    """
+    out = dict(
+        EmScore=0.0, EmLabel="QUIET",
+        EmRSAccel=0.0, EmATRCompress=0.0, EmRVolAccel=0.0,
+        EmEMAConv=0.0, EmSqzPressure=0.0, EmSectorMom=0.0, EmORExpansion=0.0,
+    )
+    try:
+        if df is None or len(df) < 40:
+            return out
+        cl  = df["Close"].values.astype(np.float64)
+        hi  = df["High"].values.astype(np.float64)
+        lo  = df["Low"].values.astype(np.float64)
+        vol = df["Volume"].values.astype(np.float64)
+        n   = len(cl)
+        cfg = MODE_CFG[mode]
+        ef_span = cfg["ema_fast"]
+        es_span = cfg["ema_slow"]
+
+        # ── 1. RS ACCELERATION (0–15 pts) ────────────────────────────────────
+        # RS is accelerating when recent outperformance > medium > long window
+        rs_pts = 0.0
+        try:
+            nifty = (nifty_close.values.astype(np.float64)
+                     if nifty_close is not None and len(nifty_close) >= 20
+                     else None)
+            if nifty is not None:
+                def _rs(bars):
+                    if n < bars + 1 or len(nifty) < bars + 1:
+                        return 0.0
+                    s = (cl[-1] - cl[-bars]) / (cl[-bars] + 1e-10) * 100
+                    m = (nifty[-1] - nifty[-bars]) / (nifty[-bars] + 1e-10) * 100
+                    return s - m
+                rs5, rs10, rs20 = _rs(5), _rs(10), _rs(20)
+                if rs5 > rs10 > 0:          # Accelerating outperformance
+                    rs_pts = min(15.0, (rs5 - rs10) * 2.5 + 5)
+                elif rs5 > 0 and rs5 > rs20 * 0.5:
+                    rs_pts = min(8.0, rs5 * 0.6)
+                if rs_rank >= 70 and rs5 > 0:  # High rank + still accelerating
+                    rs_pts = min(15.0, rs_pts + 3)
+        except Exception:
+            pass
+
+        # ── 2. ATR COMPRESSION (0–15 pts) ────────────────────────────────────
+        # Volatility contracting → coiling energy before expansion
+        atr_pts = 0.0
+        try:
+            if n >= 25:
+                prev_cl = np.roll(cl, 1); prev_cl[0] = cl[0]
+                tr_arr  = np.maximum(hi - lo, np.maximum(
+                          np.abs(hi - prev_cl), np.abs(lo - prev_cl)))
+                atr5_now  = float(_ema_np(tr_arr, 5)[-1])
+                atr20_now = float(_ema_np(tr_arr, 20)[-1])
+                ratio_now = atr5_now / (atr20_now + 1e-10)
+                if   ratio_now < 0.65: atr_pts = 15.0
+                elif ratio_now < 0.75: atr_pts = 12.0
+                elif ratio_now < 0.85: atr_pts = 8.0
+                elif ratio_now < 0.95: atr_pts = 4.0
+                # Bonus: actively compressing (trend in ratio)
+                if n > 15:
+                    atr5_5  = float(_ema_np(tr_arr[:-5], 5)[-1])
+                    atr20_5 = float(_ema_np(tr_arr[:-5], 20)[-1])
+                    if ratio_now < atr5_5 / (atr20_5 + 1e-10) - 0.05:
+                        atr_pts = min(15.0, atr_pts + 4.0)
+        except Exception:
+            pass
+
+        # ── 3. RVOL ACCELERATION (0–15 pts) ──────────────────────────────────
+        # Volume building quietly across successive windows → smart money
+        rvol_pts = 0.0
+        try:
+            if n >= 20:
+                avg_vol = float(np.mean(vol[-21:-1])) if n >= 22 else float(np.mean(vol[:-1]))
+                if avg_vol > 0:
+                    v_now   = float(np.mean(vol[-3:]))
+                    v_5ago  = float(np.mean(vol[-8:-5]))   if n >= 8  else avg_vol
+                    v_10ago = float(np.mean(vol[-13:-10])) if n >= 13 else avg_vol
+                    r_now   = v_now   / avg_vol
+                    r_5ago  = v_5ago  / avg_vol
+                    r_10ago = v_10ago / avg_vol
+                    if r_now > r_5ago > r_10ago and r_now > 0.8:  # Sequential build
+                        rvol_pts = min(15.0, (r_now - r_10ago) * 15)
+                    elif r_now > r_5ago and r_now > 0.9:
+                        rvol_pts = min(9.0, (r_now - r_5ago) * 12)
+                    elif 0.4 < r_now < 0.75:                       # Quiet dryup = stealth accumulation
+                        rvol_pts = 5.0
+        except Exception:
+            pass
+
+        # ── 4. EMA CONVERGENCE (0–15 pts) ────────────────────────────────────
+        # Fast + slow EMAs tightening → coiling, decision point approaching
+        conv_pts = 0.0
+        try:
+            if n >= es_span + 5:
+                ef_arr = _ema_np(cl, ef_span)
+                es_arr = _ema_np(cl, es_span)
+                dist_now   = abs(ef_arr[-1]  - es_arr[-1])
+                dist_5ago  = abs(ef_arr[-6]  - es_arr[-6])  if n >= 6  else dist_now
+                dist_10ago = abs(ef_arr[-11] - es_arr[-11]) if n >= 11 else dist_now
+                c_last     = cl[-1] + 1e-10
+                dpct_now   = dist_now   / c_last * 100
+                dpct_5ago  = dist_5ago  / c_last * 100
+                dpct_10ago = dist_10ago / c_last * 100
+                converging = dpct_now < dpct_5ago
+                if   converging and dpct_now < 0.5:  conv_pts = 15.0
+                elif converging and dpct_now < 1.0:  conv_pts = 11.0
+                elif converging and dpct_now < 2.0:  conv_pts = 7.0
+                elif converging:                     conv_pts = 4.0
+                elif dpct_now < dpct_10ago * 0.65:   conv_pts = 6.0  # 35% tighter in 10 bars
+                # Bonus: bullish convergence (fast still > slow)
+                if ef_arr[-1] > es_arr[-1] and converging:
+                    conv_pts = min(15.0, conv_pts + 4.0)
+        except Exception:
+            pass
+
+        # ── 5. SQUEEZE PRESSURE (0–15 pts) ───────────────────────────────────
+        # Consecutive bars in BB/KC squeeze → more bars = more stored kinetic energy
+        sqz_pts = 0.0
+        try:
+            csq = _count_squeeze_bars(df, period=20, max_lookback=40)
+            if   csq >= 20: sqz_pts = 15.0
+            elif csq >= 15: sqz_pts = 12.0
+            elif csq >= 10: sqz_pts = 9.0
+            elif csq >= 5:  sqz_pts = 6.0
+            elif csq >= 2:  sqz_pts = 3.0
+        except Exception:
+            pass
+
+        # ── 6. SECTOR MOMENTUM (0–10 pts) — placeholder enriched in run_scan ─
+        sec_pts = 0.0
+
+        # ── 7. OPENING RANGE EXPANSION (0–15 pts) ────────────────────────────
+        # Price moving beyond recent consolidation zone = first activation signal
+        or_pts = 0.0
+        try:
+            if mode == "Intraday" and n >= 8:
+                # First 6 bars (~30 min at 5m) = opening range
+                or_hi = float(np.max(hi[:6]))
+                or_lo = float(np.min(lo[:6]))
+                or_rng = or_hi - or_lo
+                cur = cl[-1]
+                if or_rng > 0:
+                    exp_pct = (cur - or_hi) / or_rng
+                    if   exp_pct > 0.20:  or_pts = 15.0
+                    elif exp_pct > 0.05:  or_pts = 10.0
+                    elif exp_pct >= 0:    or_pts = 6.0
+                    elif exp_pct > -0.15: or_pts = 3.0
+            else:
+                lb = min(10 if mode == "Swing" else 20, n - 2)
+                rng_hi = float(np.max(hi[-lb - 1:-1]))
+                rng_lo = float(np.min(lo[-lb - 1:-1]))
+                rng_w  = rng_hi - rng_lo
+                cur    = cl[-1]
+                if rng_w > 0:
+                    exp_pct = (cur - rng_hi) / rng_w
+                    if   exp_pct > 0.15:  or_pts = 15.0
+                    elif exp_pct > 0.02:  or_pts = 10.0
+                    elif exp_pct >= 0:    or_pts = 6.0
+                    elif cur > rng_lo + rng_w * 0.65: or_pts = 3.0
+        except Exception:
+            pass
+
+        # ── TOTAL ─────────────────────────────────────────────────────────────
+        total = round(float(np.clip(
+            rs_pts + atr_pts + rvol_pts + conv_pts + sqz_pts + sec_pts + or_pts,
+            0, 100)), 1)
+        label = ("IGNITING" if total >= 65 else "BUILDING" if total >= 50
+                 else "COILING" if total >= 35 else "LATENT" if total >= 20 else "QUIET")
+        out.update(
+            EmScore       = total,
+            EmLabel       = label,
+            EmRSAccel     = round(rs_pts,   1),
+            EmATRCompress = round(atr_pts,  1),
+            EmRVolAccel   = round(rvol_pts, 1),
+            EmEMAConv     = round(conv_pts, 1),
+            EmSqzPressure = round(sqz_pts,  1),
+            EmSectorMom   = 0.0,   # filled by enrich_sector_momentum() in run_scan
+            EmORExpansion = round(or_pts,   1),
+        )
+    except Exception:
+        pass
+    return out
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v15.1 PATTERN HELPERS + v15.2 FIXES (closed-candle, pivot tolerance)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# FIX-A: pivot tolerance multipliers per mode
+_PIVOT_TOL = {"Intraday": 0.25, "Swing": 0.15, "Positional": 0.10}
+
+def _tol(atr_val: float, mode: str) -> float:
+    """Absolute price tolerance for pivot comparisons."""
+    return atr_val * _PIVOT_TOL.get(mode, 0.15)
+
+def _closed_candle_df(df: pd.DataFrame, mode: str, market_open: bool) -> pd.DataFrame:
+    """Strip the live forming bar for Intraday when market is open."""
+    if mode == "Intraday" and market_open and len(df) > 1:
+        return df.iloc[:-1]
+    return df
+
+def detect_vcp(df: pd.DataFrame, atr_val: float = 0.0, mode: str = "Swing",
+               min_contractions: int = 2, lookback: int = 60) -> dict:
+    result = dict(detected=False, n_contractions=0, tightest_pct=0.0, vcp_grade="NONE")
+    if len(df) < max(lookback, 20): return result
+    sl = df.iloc[-lookback:]
+    hi = sl["High"].values.astype(np.float64); lo = sl["Low"].values.astype(np.float64)
+    vol = sl["Volume"].values.astype(np.float64); n = len(sl)
+    tol_price = _tol(atr_val, mode) if atr_val > 0 else 0.0
+    wing = 3
+    phi = [i for i in range(wing, n-wing) if hi[i] >= np.max(hi[i-wing:i+wing+1]) - tol_price]
+    plo = [i for i in range(wing, n-wing) if lo[i] <= np.min(lo[i-wing:i+wing+1]) + tol_price]
+    if len(phi) < 2 or len(plo) < 2: return result
+    segments = []
+    for ph in phi:
+        sub = [pl for pl in plo if pl > ph]
+        if not sub: continue
+        pl = sub[0]
+        depth_abs = hi[ph] - lo[pl]; depth_pct = depth_abs / hi[ph] * 100
+        seg_vol = float(np.mean(vol[ph:pl+1])) if pl > ph else float(vol[ph])
+        segments.append((ph, pl, depth_pct, seg_vol, depth_abs))
+    if len(segments) < 2: return result
+    n_cont = 0
+    for i in range(len(segments)-1, 0, -1):
+        cur = segments[i]; prev = segments[i-1]
+        if (cur[2] < prev[2]*0.95 and cur[3] < prev[3]*0.95
+                and (prev[4]-cur[4]) > tol_price):
+            n_cont += 1
+        else: break
+    detected = n_cont >= min_contractions
+    tightest_pct = float(segments[-1][2]) if segments else 0.0
+    grade = "PERFECT" if n_cont>=4 else "GOOD" if n_cont>=3 else "FORMING" if n_cont>=2 else "NONE"
+    result.update(detected=detected, n_contractions=n_cont,
+                  tightest_pct=round(tightest_pct,2), vcp_grade=grade)
+    return result
+
+def compute_anchored_vwap(df: pd.DataFrame, atr_val: float = 0.0,
+                           mode: str = "Swing", lookback: int = 60) -> dict:
+    result = dict(avwap=None, anchor_idx=None, pct_above=0.0,
+                  price_above=False, near_support=False)
+    if not {"High","Low","Close","Volume"}.issubset(df.columns) or len(df) < 10:
+        return result
+    sl = df.iloc[-lookback:]
+    closes = sl["Close"].values.astype(np.float64); highs = sl["High"].values.astype(np.float64)
+    lows = sl["Low"].values.astype(np.float64); volumes = sl["Volume"].values.astype(np.float64)
+    n = len(sl); avg_vol = float(np.mean(volumes)) or 1.0
+    best_idx = None; best_cl = float("inf")
+    for i in range(n-1):
+        if closes[i] < best_cl and volumes[i] >= avg_vol*0.8:
+            best_cl = closes[i]; best_idx = i
+    if best_idx is None: best_idx = int(np.argmin(closes[:-1]))
+    typical = (highs[best_idx:]+lows[best_idx:]+closes[best_idx:])/3.0
+    vols_s = volumes[best_idx:]
+    avwap = float(np.cumsum(typical*vols_s)[-1] / (np.cumsum(vols_s)[-1]+1e-10))
+    current = float(closes[-1])
+    tol_abs = _tol(atr_val, mode) if atr_val > 0 else avwap*0.01
+    pct_above = (current-avwap)/avwap*100 if avwap > 0 else 0.0
+    price_above = current > avwap-tol_abs
+    near_support = price_above and (current-avwap) < tol_abs
+    result.update(avwap=round(avwap,2), anchor_idx=n-1-best_idx,
+                  pct_above=round(pct_above,2), price_above=price_above,
+                  near_support=near_support)
+    return result
+
+def score_fib_pullback(df: pd.DataFrame, atr_val: float,
+                        mode: str = "Swing", lookback: int = 60) -> dict:
+    result = dict(quality=0, grade="POOR", depth_ok=False, vol_ok=False,
+                  recovery_ok=False, fib_level="—")
+    if len(df) < 20 or atr_val <= 0: return result
+    sl = df.iloc[-lookback:]
+    hi_a = sl["High"].values.astype(np.float64); lo_a = sl["Low"].values.astype(np.float64)
+    cl_a = sl["Close"].values.astype(np.float64); vo_a = sl["Volume"].values.astype(np.float64)
+    n = len(sl); tol_abs = _tol(atr_val, mode); wing = 3
+    phi = [i for i in range(wing, n-wing) if hi_a[i] >= np.max(hi_a[i-wing:i+wing+1])-tol_abs]
+    plo = [i for i in range(wing, n-wing) if lo_a[i] <= np.min(lo_a[i-wing:i+wing+1])+tol_abs]
+    if not phi or not plo: return result
+    sw_hi_i = phi[-1]
+    prior_lo = [i for i in plo if i < sw_hi_i]
+    if not prior_lo: return result
+    sw_lo_i = prior_lo[-1]
+    sw_hi = float(hi_a[sw_hi_i]); sw_lo = float(lo_a[sw_lo_i]); rng = sw_hi-sw_lo
+    if rng < atr_val*0.5: return result
+    post_lo = float(np.min(lo_a[sw_hi_i:])); post_cl = float(cl_a[-1])
+    depth_pct = (sw_hi-post_lo)/rng*100; tol_pct = tol_abs/rng*100
+    def _in_zone(lo_p, hi_p): return (lo_p-tol_pct) <= depth_pct <= (hi_p+tol_pct)
+    if _in_zone(38.2,50.0):   ds=40; dok=True; fl="38.2–50"
+    elif _in_zone(50.0,61.8): ds=30; dok=True; fl="50–61.8"
+    elif _in_zone(23.6,38.2): ds=15; dok=False; fl="23.6–38.2"
+    elif _in_zone(61.8,78.6): ds=10; dok=False; fl="61.8–78.6"
+    else:                     ds=0;  dok=False; fl="Outside"
+    adv_v=float(np.mean(vo_a[sw_lo_i:sw_hi_i+1])) if sw_hi_i>sw_lo_i else 1.0
+    pb_v=float(np.mean(vo_a[sw_hi_i:])) if len(vo_a[sw_hi_i:])>0 else 1.0
+    vr=pb_v/(adv_v+1e-10)
+    vs=30 if vr<=0.60 else (20 if vr<=0.75 else (10 if vr<=0.90 else 0))
+    vok=vr<=0.75
+    f500=sw_hi-rng*0.500; f618=sw_hi-rng*0.618; overshoot=max(0.0,f500-post_lo)
+    if post_cl>f500-tol_abs and overshoot<=tol_abs*2: rs=30; rok=True
+    elif post_cl>f618-tol_abs: rs=15; rok=False
+    else: rs=0; rok=False
+    quality=ds+vs+rs
+    grade="EXCELLENT" if quality>=80 else "GOOD" if quality>=60 else "FAIR" if quality>=40 else "POOR"
+    result.update(quality=quality, grade=grade, depth_ok=dok, vol_ok=vok,
+                  recovery_ok=rok, fib_level=fl)
+    return result
+
+def detect_volume_dryup(df: pd.DataFrame, atr_val: float,
+                         mode: str = "Swing", window: int = 5) -> dict:
+    result = dict(dry_up=False, intensity=0, bars=0, vol_pct=100.0)
+    if len(df) < max(window+5, 25) or atr_val <= 0: return result
+    vols = df["Volume"].values.astype(np.float64)
+    highs = df["High"].values.astype(np.float64); lows = df["Low"].values.astype(np.float64)
+    n = len(vols)
+    avg_vol_20 = float(np.mean(vols[-21:-1])) if n>=22 else float(np.mean(vols[:-1]))
+    if avg_vol_20 <= 0: return result
+    consec = 0
+    for i in range(1, min(window+1, n)):
+        if vols[-i] < vols[-(i+1)]: consec += 1
+        else: break
+    tight = False
+    if consec >= 2:
+        tight = (float(np.max(highs[-consec:]))-float(np.min(lows[-consec:]))) < atr_val*1.2
+    latest_vol_pct = float(vols[-1])/avg_vol_20*100
+    dry_up = consec>=2 and tight and latest_vol_pct<80.0
+    if dry_up:
+        intensity = 3 if (latest_vol_pct<40 and consec>=4) else (2 if (latest_vol_pct<60 and consec>=3) else 1)
+    else: intensity = 0
+    result.update(dry_up=dry_up, intensity=intensity, bars=consec, vol_pct=round(latest_vol_pct,1))
+    return result
+
+def compute_relative_volume(df: pd.DataFrame, lookback: int = 60) -> dict:
+    result = dict(rel_vol_pct=50.0, label="NORMAL", ratio=1.0)
+    if len(df) < 10: return result
+    vols = df["Volume"].values.astype(np.float64)
+    window = vols[-lookback-1:-1] if len(vols)>lookback+1 else vols[:-1]
+    cur_vol = float(vols[-1])
+    if len(window)==0 or float(np.max(window))==0: return result
+    pct_rank = float(np.sum(window<cur_vol))/len(window)*100
+    ratio = cur_vol/(float(np.mean(window))+1e-10)
+    label = "SURGE" if pct_rank>=85 else "HIGH" if pct_rank>=65 else "NORMAL" if pct_rank>=30 else "DRY"
+    result.update(rel_vol_pct=round(pct_rank,1), label=label, ratio=round(ratio,2))
+    return result
+
+def detect_darvas_box(df: pd.DataFrame, atr_val: float,
+                       mode: str = "Swing", lookback: int = 60) -> dict:
+    result = dict(in_box=False, breakout=False, box_top=0.0, box_bottom=0.0,
+                  box_width_pct=0.0, bars_in_box=0)
+    if len(df) < 20 or atr_val <= 0: return result
+    sl = df.iloc[-lookback:]
+    hi_a = sl["High"].values.astype(np.float64); lo_a = sl["Low"].values.astype(np.float64)
+    cl_a = sl["Close"].values.astype(np.float64); n = len(sl)
+    tol = _tol(atr_val, mode)
+    peak_i = int(np.argmax(hi_a)); box_top = float(hi_a[peak_i])
+    if peak_i >= n-3: peak_i = max(0, peak_i-3)
+    top_confirmed = False; top_i = peak_i; consec_below = 0
+    for i in range(peak_i+1, min(peak_i+10, n)):
+        if hi_a[i] < box_top+tol: consec_below += 1
+        else: box_top = float(hi_a[i]); consec_below = 0
+        if consec_below >= 3: top_confirmed = True; top_i = i; break
+    if not top_confirmed: return result
+    sub_lo = lo_a[top_i:]
+    if len(sub_lo) < 4: return result
+    trough_i = int(np.argmin(sub_lo))+top_i; box_bottom = float(lo_a[trough_i])
+    btm_confirmed = False; consec_above = 0
+    for i in range(trough_i+1, min(trough_i+10, n)):
+        if lo_a[i] > box_bottom-tol: consec_above += 1
+        else: box_bottom = float(lo_a[i]); consec_above = 0
+        if consec_above >= 3: btm_confirmed = True; break
+    if not btm_confirmed: return result
+    cur = float(cl_a[-1])
+    in_box = (box_bottom-tol) <= cur <= (box_top+tol)
+    breakout = cur > box_top+tol
+    box_width_pct = (box_top-box_bottom)/box_bottom*100 if box_bottom>0 else 0.0
+    result.update(in_box=in_box, breakout=breakout, box_top=round(box_top,2),
+                  box_bottom=round(box_bottom,2), box_width_pct=round(box_width_pct,2),
+                  bars_in_box=n-trough_i)
+    return result
+
+def score_all_patterns(df: pd.DataFrame, atr_val: float,
+                        mode: str = "Swing", market_open: bool = False) -> tuple:
+    """FIX-A+B: runs on closed candles only; called externally via enrich_with_patterns."""
+    closed = _closed_candle_df(df, mode, market_open)
+    if len(closed) < 20: return 0, {}
+    vcp    = detect_vcp(closed,            atr_val=atr_val, mode=mode)
+    avwap  = compute_anchored_vwap(closed, atr_val=atr_val, mode=mode)
+    fibq   = score_fib_pullback(closed,    atr_val=atr_val, mode=mode)
+    vdu    = detect_volume_dryup(closed,   atr_val=atr_val, mode=mode)
+    rvol   = compute_relative_volume(closed)
+    darvas = detect_darvas_box(closed,     atr_val=atr_val, mode=mode)
+    pts = 0
+    if vcp["n_contractions"] >= 3:    pts += 14
+    elif vcp["n_contractions"] >= 2:  pts += 7
+    if avwap["price_above"]:          pts += 8
+    if avwap["near_support"]:         pts += 4
+    fq = fibq["quality"]
+    if fq >= 75:                      pts += 10
+    elif fq >= 50:                    pts += 5
+    if vdu["intensity"] >= 2:         pts += 8
+    elif vdu["intensity"] == 1:       pts += 4
+    rvp = rvol["rel_vol_pct"]
+    if rvp >= 85:                     pts += 10
+    elif rvp >= 65:                   pts += 5
+    if darvas["breakout"]:            pts += 12
+    elif darvas["in_box"]:            pts += 6
+    patterns = dict(vcp=vcp, avwap=avwap, fib_quality=fibq,
+                    vol_dryup=vdu, rel_vol=rvol, darvas=darvas,
+                    total_pattern_pts=pts)
+    return pts, patterns
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENGINE 1 — MULTI-TIMEFRAME MOMENTUM SYNCHRONIZATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+_MTF_CFG = {
+    "Intraday":   (("5m",  "15m", "1h"),  (0.25, 0.40, 0.35)),
+    "Swing":      (("1d",  "1wk", "1mo"), (0.30, 0.40, 0.30)),
+    "Positional": (("1d",  "1wk", "1mo"), (0.20, 0.40, 0.40)),
+}
+
+def _mtf_tf_score(close_s: pd.Series, ema_fast: int, ema_slow: int) -> float:
+    """Score a single timeframe: -1.0 (full bear) to +1.0 (full bull)."""
+    n = len(close_s)
+    if n < ema_slow + 5:
+        return 0.0
+    c   = float(close_s.iloc[-1])
+    ef  = float(close_s.ewm(span=ema_fast, adjust=False).mean().iloc[-1])
+    es  = float(close_s.ewm(span=ema_slow, adjust=False).mean().iloc[-1])
+    rv  = float(rsi(close_s, 14).iloc[-1])
+    lb  = max(1, min(21, n - 1))
+    mom = (c - float(close_s.iloc[-lb])) / float(close_s.iloc[-lb]) * 100
+    s   = 0.0
+    s  += 0.30 if c  > ef  else -0.30
+    s  += 0.30 if ef > es  else -0.30
+    s  += 0.20 if rv > 50  else -0.20
+    s  += 0.20 if mom > 0  else -0.20
+    return float(np.clip(s, -1.0, 1.0))
+
+def compute_mtf_sync(sym: str, mode: str,
+                     prefetched: dict | None = None) -> dict:
+    """
+    Multi-Timeframe Momentum Synchronization.
+    Returns sync_score (0–100), alignment flag, per-TF scores, divergence flag.
+    """
+    out = dict(sync_score=50.0, aligned=False, bull_count=0, bear_count=0,
+               tf_scores={}, divergence=False, mtf_label="NEUTRAL")
+    try:
+        intervals, weights = _MTF_CFG[mode]
+        cfg      = MODE_CFG[mode]
+        ef_span  = cfg["ema_fast"]
+        es_span  = cfg["ema_slow"]
+        data     = prefetched or {}
+        tf_scores: dict = {}
+
+        for tf in intervals:
+            df = data.get(tf)
+            if df is None or df.empty or len(df) < 30:
+                tf_scores[tf] = 0.0
+                continue
+            tf_scores[tf] = _mtf_tf_score(df["Close"], ef_span, es_span)
+
+        weighted  = sum(tf_scores.get(tf, 0.0) * w
+                        for tf, w in zip(intervals, weights))
+        sync_score = round((weighted + 1.0) / 2.0 * 100.0, 1)
+
+        scores    = [tf_scores.get(tf, 0.0) for tf in intervals]
+        bull_cnt  = sum(1 for s in scores if s >  0.2)
+        bear_cnt  = sum(1 for s in scores if s < -0.2)
+        aligned   = (bull_cnt == len(intervals)) or (bear_cnt == len(intervals))
+        diverge   = (len(scores) >= 2
+                     and ((scores[0] > 0.3 and scores[-1] < -0.3)
+                          or (scores[0] < -0.3 and scores[-1] > 0.3)))
+
+        if   sync_score >= 70 and aligned: lbl = "BULL SYNC"
+        elif sync_score >= 60:             lbl = "BULL LEAN"
+        elif sync_score <= 30 and aligned: lbl = "BEAR SYNC"
+        elif sync_score <= 40:             lbl = "BEAR LEAN"
+        elif diverge:                      lbl = "DIVERGE"
+        else:                              lbl = "NEUTRAL"
+
+        out.update(sync_score=sync_score, aligned=aligned,
+                   bull_count=bull_cnt, bear_count=bear_cnt,
+                   tf_scores=tf_scores, divergence=diverge, mtf_label=lbl)
+    except Exception:
+        pass
+    return out
+
+def prefetch_mtf_parallel(symbols: list, mode: str) -> dict:
+    """Batch-fetch secondary/tertiary TF data for all survivors (async)."""
+    intervals, _ = _MTF_CFG[mode]
+    result: dict = {sym: {} for sym in symbols}
+    if len(intervals) < 2 or not symbols:
+        return result
+    for tf in intervals[1:]:
+        period = "1y" if tf in ("15m", "1h") else "3y"
+        raw    = fetch_async(symbols, period, tf, concurrency=64)
+        for sym, df in raw.items():
+            result[sym][tf] = df
+    return result
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENGINE 2 — INSTITUTIONAL VOLUME ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def analyze_institutional_volume(df: pd.DataFrame,
+                                  mode: str = "Swing") -> dict:
+    """
+    Detect institutional accumulation / distribution via OBV, CMF,
+    Acc/Dist line, block-volume fingerprint, and Wyckoff Effort-vs-Result.
+    Returns inst_score (0–100), verdict, and component values.
+    """
+    out = dict(inst_score=50.0, verdict="NEUTRAL", obv_trend=0.0,
+               cmf=0.0, acc_dist=0.0, block_days=0,
+               effort_vs_result="NEUTRAL", inst_label="INST~")
+    try:
+        if len(df) < 30:
+            return out
+        cl  = df["Close"].values.astype(np.float64)
+        hi  = df["High"].values.astype(np.float64)
+        lo  = df["Low"].values.astype(np.float64)
+        vol = df["Volume"].values.astype(np.float64)
+        n   = len(cl)
+
+        # OBV trend — EMA(10) vs EMA(30)
+        direction  = np.sign(np.diff(cl, prepend=cl[0]))
+        obv        = np.cumsum(direction * vol)
+        obv_trend  = 1.0 if float(_ema_np(obv, 10)[-1]) > float(_ema_np(obv, 30)[-1]) else -1.0
+
+        # Chaikin Money Flow (20-bar)
+        win   = min(20, n)
+        hlr   = np.where((hi[-win:] - lo[-win:]) == 0, 1e-10,
+                          hi[-win:] - lo[-win:])
+        mfm   = ((cl[-win:] - lo[-win:]) - (hi[-win:] - cl[-win:])) / hlr
+        cmf   = float(np.sum(mfm * vol[-win:]) / (np.sum(vol[-win:]) + 1e-10))
+
+        # Accumulation / Distribution
+        hlr_full = np.where((hi - lo) == 0, 1e-10, hi - lo)
+        ad_mfm   = ((cl - lo) - (hi - cl)) / hlr_full
+        ad_line  = np.cumsum(ad_mfm * vol)
+        ad_trend = 1.0 if ad_line[-1] > ad_line[-min(10, n)] else -1.0
+
+        # Block volume (institutional fingerprint) — days > 2.5× avg
+        avg_vol    = float(np.mean(vol[-min(60, n):])) or 1.0
+        block_days = int(np.sum(vol[-min(20, n):] > avg_vol * 2.5))
+
+        # Wyckoff Effort-vs-Result (last 5 bars)
+        recent     = min(5, n)
+        avg_rng    = float(np.mean(hi[-min(20,n):] - lo[-min(20,n):])) or 1e-10
+        last_rng   = float(np.mean(hi[-recent:] - lo[-recent:]))
+        last_vr    = float(np.mean(vol[-recent:])) / avg_vol
+        if   last_vr > 1.3 and last_rng > avg_rng * 0.8: evr = "THRUST"
+        elif last_vr > 1.3 and last_rng < avg_rng * 0.6: evr = "ABSORPTION"
+        elif last_vr < 0.7:                               evr = "DRY"
+        else:                                             evr = "NEUTRAL"
+
+        # Composite score (centre 50)
+        score  = 50.0
+        score += obv_trend * 12.0
+        score += float(np.clip(cmf * 100, -15, 15))
+        score += ad_trend  * 8.0
+        score += min(block_days * 3, 12)
+        if evr == "THRUST":        score += 10.0
+        elif evr == "ABSORPTION":  score -=  8.0
+        elif evr == "DRY":         score -=  5.0
+        score = float(np.clip(score, 0, 100))
+
+        if   score >= 70: verdict = "ACCUMULATION"
+        elif score >= 58: verdict = "MILD ACCUM"
+        elif score <= 30: verdict = "DISTRIBUTION"
+        elif score <= 42: verdict = "MILD DIST"
+        else:             verdict = "NEUTRAL"
+
+        inst_label = "INST↑" if score >= 65 else ("INST↓" if score <= 35 else "INST~")
+
+        out.update(inst_score=round(score, 1), verdict=verdict,
+                   obv_trend=round(obv_trend, 2), cmf=round(cmf, 4),
+                   acc_dist=round(ad_trend, 2), block_days=block_days,
+                   effort_vs_result=evr, inst_label=inst_label)
+    except Exception:
+        pass
+    return out
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENGINE 3 — HARMONIC / ABCD PATTERN ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+_HARMONIC_DEF = {
+    "Gartley":   dict(AB_XA=(0.618,0.618), BC_AB=(0.382,0.886),
+                      CD_BC=(1.272,1.618), AD_XA=(0.786,0.786), tol=0.05),
+    "Bat":       dict(AB_XA=(0.382,0.500), BC_AB=(0.382,0.886),
+                      CD_BC=(1.618,2.618), AD_XA=(0.886,0.886), tol=0.05),
+    "Butterfly": dict(AB_XA=(0.786,0.786), BC_AB=(0.382,0.886),
+                      CD_BC=(1.618,2.618), AD_XA=(1.272,1.272), tol=0.06),
+    "Crab":      dict(AB_XA=(0.382,0.618), BC_AB=(0.382,0.886),
+                      CD_BC=(2.618,3.618), AD_XA=(1.618,1.618), tol=0.06),
+    "Cypher":    dict(AB_XA=(0.382,0.618), BC_AB=(1.272,1.414),
+                      CD_BC=(0.382,0.786), AD_XA=(0.786,0.786), tol=0.07),
+}
+
+def _fib_ok(val: float, lo: float, hi: float, tol: float) -> bool:
+    mn, mx = min(lo, hi), max(lo, hi)
+    return mn * (1 - tol) <= val <= mx * (1 + tol)
+
+def _find_swing_pivots(arr: np.ndarray, wing: int = 4) -> list:
+    """Return alternating (idx, price, 'H'/'L') swing pivots."""
+    n = len(arr); pivots = []
+    for i in range(wing, n - wing):
+        w = arr[i - wing: i + wing + 1]
+        if arr[i] == np.max(w):   pivots.append((i, float(arr[i]), "H"))
+        elif arr[i] == np.min(w): pivots.append((i, float(arr[i]), "L"))
+    # Keep only alternating, prefer stronger pivot on same type run
+    deduped: list = []
+    for p in pivots:
+        if deduped and deduped[-1][2] == p[2]:
+            if (p[2] == "H" and p[1] > deduped[-1][1]) or \
+               (p[2] == "L" and p[1] < deduped[-1][1]):
+                deduped[-1] = p
+        else:
+            deduped.append(p)
+    return deduped
+
+def detect_harmonic_patterns(df: pd.DataFrame,
+                              mode: str = "Swing") -> dict:
+    """
+    Detect ABCD and named harmonic patterns (Gartley, Bat, Butterfly, Crab, Cypher).
+    Returns best match: pattern name, direction, quality (0–100),
+    completion zone, and harmonic_score contribution.
+    """
+    out = dict(pattern=None, direction=None, quality=0,
+               completion_zone=(0.0, 0.0), harmonic_score=0,
+               d_level=0.0, detected=False)
+    try:
+        if len(df) < 60:
+            return out
+        hi  = df["High"].values.astype(np.float64)
+        lo  = df["Low"].values.astype(np.float64)
+        mid = (hi + lo) / 2.0
+
+        pivots = _find_swing_pivots(mid, wing=4)
+        if len(pivots) < 5:
+            return out
+
+        best: dict | None = None
+        best_q = 0
+
+        for start in range(max(0, len(pivots) - 5), -1, -1):
+            pts = pivots[start: start + 5]
+            if len(pts) < 5:
+                continue
+            X, A, B, C, D = pts
+            types = [p[2] for p in pts]
+            # Strict alternation required
+            if any(types[i] == types[i+1] for i in range(4)):
+                continue
+
+            px, pa, pb, pc, pd_ = [p[1] for p in pts]
+            bull = types[0] == "L"   # bullish: X=low, completion at D=low
+
+            XA  = abs(pa - px)
+            AB  = abs(pa - pb)
+            BC  = abs(pc - pb)
+            CD  = abs(pc - pd_)
+            if any(v <= 0 for v in (XA, AB, BC, CD)):
+                continue
+
+            ab_xa = AB / XA
+            bc_ab = BC / AB
+            cd_bc = CD / BC
+            ad_xa = abs(pa - pd_) / XA
+
+            # ABCD (simple)
+            abcd_q = 0
+            if _fib_ok(ab_xa, 0.382, 0.786, 0.07) and \
+               _fib_ok(cd_bc, 1.13,  1.618, 0.08):
+                abcd_q = 60
+
+            # Named harmonics
+            for name, r in _HARMONIC_DEF.items():
+                tol = r["tol"]
+                hits = sum([_fib_ok(ab_xa, *r["AB_XA"], tol),
+                            _fib_ok(bc_ab, *r["BC_AB"], tol),
+                            _fib_ok(cd_bc, *r["CD_BC"], tol),
+                            _fib_ok(ad_xa, *r["AD_XA"], tol)])
+                q = int(hits / 4 * 100)
+                if hits >= 3 and q > best_q:
+                    d_lo = (pc - XA * r["AD_XA"][0] if bull
+                            else pc + XA * r["AD_XA"][0])
+                    d_hi = (pc - XA * r["AD_XA"][1] if bull
+                            else pc + XA * r["AD_XA"][1])
+                    best_q = q
+                    best   = dict(pattern=name,
+                                  direction="BULL" if bull else "BEAR",
+                                  quality=q,
+                                  completion_zone=(round(min(d_lo,d_hi),2),
+                                                   round(max(d_lo,d_hi),2)),
+                                  d_level=round(pd_, 2), detected=True)
+
+            if abcd_q > best_q and best is None:
+                best_q = abcd_q
+                best   = dict(pattern="ABCD",
+                              direction="BULL" if bull else "BEAR",
+                              quality=abcd_q,
+                              completion_zone=(round(pd_*0.995,2),
+                                               round(pd_*1.005,2)),
+                              d_level=round(pd_,2), detected=True)
+
+        if best:
+            best["harmonic_score"] = int(best["quality"] * 0.8)
+            out.update(best)
+    except Exception:
+        pass
+    return out
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENGINE 4 — ADAPTIVE REGIME SCORING
+# ══════════════════════════════════════════════════════════════════════════════
+
+_REGIME_WEIGHTS = {
+    "TREND_BULL":   dict(TREND=35, MOMENTUM=22, STRUCTURE=18, VOLUME=13, QUALITY=12),
+    "TREND_BEAR":   dict(TREND=28, MOMENTUM=15, STRUCTURE=22, VOLUME=18, QUALITY=17),
+    "RANGE_BULL":   dict(TREND=22, MOMENTUM=18, STRUCTURE=28, VOLUME=15, QUALITY=17),
+    "RANGE_BEAR":   dict(TREND=18, MOMENTUM=12, STRUCTURE=30, VOLUME=18, QUALITY=22),
+    "HIGHVOL_BULL": dict(TREND=25, MOMENTUM=18, STRUCTURE=20, VOLUME=17, QUALITY=20),
+    "HIGHVOL_BEAR": dict(TREND=15, MOMENTUM=10, STRUCTURE=20, VOLUME=20, QUALITY=35),
+    "DEFAULT":      dict(TREND=30, MOMENTUM=20, STRUCTURE=20, VOLUME=15, QUALITY=15),
+}
+_REGIME_LABELS = {
+    "TREND_BULL": "Trending Bull",   "TREND_BEAR": "Trending Bear",
+    "RANGE_BULL": "Ranging Bull",    "RANGE_BEAR": "Ranging Bear",
+    "HIGHVOL_BULL":"High-Vol Bull",  "HIGHVOL_BEAR":"High-Vol Bear",
+    "DEFAULT":    "Default",
+}
+
+def classify_regime(market_bullish: bool,
+                    adx_val: float,
+                    vix_val: float | None = None) -> tuple:
+    """
+    Classify the market regime into one of 6 buckets.
+    Returns (regime_key, regime_label, weights_dict).
+    """
+    trending = adx_val >= 22
+    high_vol  = vix_val is not None and vix_val >= VIX_CAUTION
+
+    if   high_vol  and     market_bullish: key = "HIGHVOL_BULL"
+    elif high_vol  and not market_bullish: key = "HIGHVOL_BEAR"
+    elif trending  and     market_bullish: key = "TREND_BULL"
+    elif trending  and not market_bullish: key = "TREND_BEAR"
+    elif market_bullish:                   key = "RANGE_BULL"
+    else:                                  key = "RANGE_BEAR"
+
+    return key, _REGIME_LABELS[key], _REGIME_WEIGHTS[key]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENGINE 5 — CANDLE STRUCTURE INTELLIGENCE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_candle_structure(df: pd.DataFrame,
+                             atr_val: float,
+                             mode: str = "Swing") -> dict:
+    """
+    Identify single, two, and three-candle patterns on the last 1–5 bars.
+    Returns candle_score (−10 to +10), list of pattern names, and signal.
+    """
+    out = dict(candle_score=0, patterns=[], candle_signal="NEUTRAL",
+               nr7=False, inside_bar=False)
+    try:
+        if len(df) < 10 or atr_val <= 0:
+            return out
+        op  = (df["Open"].values.astype(np.float64)
+               if "Open" in df.columns else df["Close"].values.astype(np.float64))
+        hi  = df["High"].values.astype(np.float64)
+        lo  = df["Low"].values.astype(np.float64)
+        cl  = df["Close"].values.astype(np.float64)
+        n   = len(cl)
+
+        score    = 0
+        patterns: list = []
+
+        c0,o0,h0,l0 = cl[-1],op[-1],hi[-1],lo[-1]
+        c1,o1,h1,l1 = cl[-2],op[-2],hi[-2],lo[-2]
+        body0       = abs(c0 - o0)
+        body1       = abs(c1 - o1)
+        rng0        = h0 - l0
+        bull0       = c0 > o0
+        bull1       = c1 > o1
+        uw0         = h0 - max(c0, o0)   # upper wick
+        lw0         = min(c0, o0) - l0   # lower wick
+
+        # ── Single-candle ──────────────────────────────────────────────────────
+        if rng0 > atr_val * 0.5:
+            if lw0 > body0 * 2.0 and uw0 < body0 * 0.5:
+                patterns.append("Hammer"); score += 4
+            if uw0 > body0 * 2.0 and lw0 < body0 * 0.5:
+                if bull0: patterns.append("Inverted Hammer"); score += 2
+                else:     patterns.append("Shooting Star");  score -= 5
+
+        if rng0 > 0 and body0 / rng0 < 0.10:
+            if   lw0 > rng0 * 0.60: patterns.append("Dragonfly Doji");  score += 3
+            elif uw0 > rng0 * 0.60: patterns.append("Gravestone Doji"); score -= 3
+            else:                   patterns.append("Doji")
+
+        if body0 > atr_val * 0.7:
+            if bull0: patterns.append("Bull Marubozu"); score += 3
+            else:     patterns.append("Bear Marubozu"); score -= 3
+
+        # ── Two-candle ────────────────────────────────────────────────────────
+        if n >= 2:
+            if not bull1 and bull0 and body0 > body1*1.2 and c0>o1 and o0<c1:
+                patterns.append("Bullish Engulfing"); score += 6
+            if bull1 and not bull0 and body0 > body1*1.2 and c0<o1 and o0>c1:
+                patterns.append("Bearish Engulfing"); score -= 6
+            if h0 < h1 and l0 > l1:
+                patterns.append("Inside Bar"); out["inside_bar"] = True; score += 1
+            if not bull1 and bull0 and o0 < l1 and c0 > (o1+c1)/2:
+                patterns.append("Piercing Line"); score += 4
+            if bull1 and not bull0 and o0 > h1 and c0 < (o1+c1)/2:
+                patterns.append("Dark Cloud Cover"); score -= 4
+
+        # ── Three-candle ──────────────────────────────────────────────────────
+        if n >= 3:
+            c2,o2 = cl[-3],op[-3]
+            bull2 = c2 > o2
+            if not bull2 and abs(c1-o1)<atr_val*0.3 and bull0 and c0>(c2+o2)/2:
+                patterns.append("Morning Star"); score += 7
+            if bull2 and abs(c1-o1)<atr_val*0.3 and not bull0 and c0<(c2+o2)/2:
+                patterns.append("Evening Star"); score -= 7
+            if bull0 and bull1 and bull2 and c0>c1>c2 and o0>o1>o2:
+                patterns.append("3 White Soldiers"); score += 5
+            if not bull0 and not bull1 and not bull2 and c0<c1<c2 and o0<o1<o2:
+                patterns.append("3 Black Crows"); score -= 5
+
+        # ── NR7 ───────────────────────────────────────────────────────────────
+        if n >= 7:
+            ranges = hi[-7:] - lo[-7:]
+            if rng0 == float(np.min(ranges)):
+                patterns.append("NR7"); out["nr7"] = True; score += 2
+
+        score = int(np.clip(score, -10, 10))
+        if   score >=  4: sig = "BULL"
+        elif score >=  1: sig = "BULL LEAN"
+        elif score <= -4: sig = "BEAR"
+        elif score <= -1: sig = "BEAR LEAN"
+        else:             sig = "NEUTRAL"
+
+        out.update(candle_score=score, patterns=patterns, candle_signal=sig)
+    except Exception:
+        pass
+    return out
+
+# FIX-B: gate constants
+PATTERN_ENRICH_SCORE_MIN = 45
+PATTERN_ENRICH_PHASES    = {"ENTRY", "CONT", "BREAKOUT", "SETUP"}
+
+_EMPTY_PAT = dict(
+    vcp=dict(detected=False,n_contractions=0,tightest_pct=0.0,vcp_grade="NONE"),
+    avwap=dict(avwap=None,price_above=False,near_support=False,pct_above=0.0),
+    fib_quality=dict(quality=0,grade="POOR",depth_ok=False,vol_ok=False,recovery_ok=False,fib_level="—"),
+    vol_dryup=dict(dry_up=False,intensity=0,bars=0,vol_pct=100.0),
+    rel_vol=dict(rel_vol_pct=50.0,label="NORMAL",ratio=1.0),
+    darvas=dict(in_box=False,breakout=False,box_top=0.0,box_bottom=0.0,box_width_pct=0.0,bars_in_box=0),
+    total_pattern_pts=0)
+
+def _apply_pattern_keys(r: dict, patterns: dict) -> dict:
+    r["Patterns"]     = patterns
+    r["VCP"]          = patterns.get("vcp",{}).get("detected",False)
+    r["VCPGrade"]     = patterns.get("vcp",{}).get("vcp_grade","NONE")
+    r["AVWAP"]        = patterns.get("avwap",{}).get("avwap")
+    r["AVWAPAbove"]   = patterns.get("avwap",{}).get("price_above",False)
+    r["FibQuality"]   = patterns.get("fib_quality",{}).get("quality",0)
+    r["FibGrade"]     = patterns.get("fib_quality",{}).get("grade","POOR")
+    r["VolDryup"]     = patterns.get("vol_dryup",{}).get("dry_up",False)
+    r["VDUIntensity"] = patterns.get("vol_dryup",{}).get("intensity",0)
+    r["RVolPct"]      = patterns.get("rel_vol",{}).get("rel_vol_pct",50.0)
+    r["RVolLabel"]    = patterns.get("rel_vol",{}).get("label","NORMAL")
+    r["DarvasIn"]     = patterns.get("darvas",{}).get("in_box",False)
+    r["DarvasBrk"]    = patterns.get("darvas",{}).get("breakout",False)
+    r["DarvasTop"]    = patterns.get("darvas",{}).get("box_top",0.0)
+    return r
+
+def enrich_with_patterns(results: list, data: dict, mode: str, market_open: bool) -> list:
+    """FIX-B: pattern engine runs ONLY on shortlisted stocks after Stage-B."""
+    to_enrich = [r for r in results
+                 if r.get("Score",0) >= PATTERN_ENRICH_SCORE_MIN
+                 and r.get("Phase","") in PATTERN_ENRICH_PHASES
+                 and r.get("Symbol","") in data
+                 and data.get(r.get("Symbol","")) is not None
+                 and not data.get(r.get("Symbol",""),pd.DataFrame()).empty]
+    passthrough = [r for r in results if r not in to_enrich]
+    for r in passthrough:
+        _apply_pattern_keys(r, dict(_EMPTY_PAT))
+
+    def _enrich_one(r):
+        sym = r["Symbol"]; df = data[sym]; atr_val = r.get("ATR", 0.0)
+        try:
+            pts, patterns = score_all_patterns(df, atr_val=atr_val, mode=mode,
+                                               market_open=market_open)
+        except Exception:
+            pts, patterns = 0, dict(_EMPTY_PAT)
+        _apply_pattern_keys(r, patterns)
+        if pts > 0:
+            # FIX-5: scale down pattern bonus when exhaustion flags have fired
+            # so patterns cannot leapfrog a stock past the exhaustion gate
+            ext_n = r.get("ExtN", 0)
+            if ext_n >= 3:
+                bonus = 0.0                     # critical exhaustion — block bonus entirely
+            elif ext_n == 2:
+                bonus = round(pts * 0.25, 1)    # moderate exhaustion — halved bonus
+            else:
+                bonus = round(pts * 0.5, 1)     # clean stock — full 50% bonus
+            r["Score"] = round(min(100.0, r.get("Score", 0) + bonus), 1)
+            ns = r["Score"]
+            r["Action"] = ("STRONG BUY" if ns>=75 else "BUY" if ns>=58
+                           else "WATCH" if ns>=42 else "SKIP")
+        return r
+
+    if to_enrich:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16,len(to_enrich))) as pool:
+            enriched = list(pool.map(_enrich_one, to_enrich))
+    else:
+        enriched = []
+    all_out = enriched + passthrough
+    all_out.sort(key=lambda x: x.get("Score",0), reverse=True)
+    return all_out
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIX-C: CATEGORY-BASED WEIGHTED SCORING (v15.3 calibrated)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_CAT_W = dict(TREND=30, MOMENTUM=20, STRUCTURE=20, VOLUME=15, QUALITY=15)
+_PHASE_RAW = {"BREAKOUT":100,"CONT":85,"ENTRY":65,"SETUP":40,"IDLE":10,"EXIT":0}
+
+def category_score(*,
+                   trend_up, ema_stack, fresh_cross, htf_up, market_bullish, e_fast_gt_slow,
+                   rsi, mom1, mom3, mom6, mom1_th, mom3_th, mom6_th,
+                   phase, in_golden, near_e127, near_e161, norm_bull_raw,
+                   rs_rank, c_gt_hh, c_near_hh,
+                   vol_ratio, vol_avg_gt_zero, adx_val,
+                   squeeze, vc_ratio, ext_penalty,
+                   regime_bearish,
+                   # Engine 1 — MTF sync (optional, safe default = neutral)
+                   mtf_sync_score: float = 50.0,
+                   # Engine 2 — Institutional volume (optional, safe default = neutral)
+                   inst_score: float = 50.0,
+                   # Engine 3 — Harmonics (optional)
+                   harmonic_score: int = 0,
+                   # Engine 5 — Candle structure (optional)
+                   candle_score: int = 0,
+                   # Engine 4 — Adaptive regime weights (None → use static _CAT_W)
+                   regime_weights: dict | None = None) -> dict:
+
+    W = regime_weights if regime_weights is not None else _CAT_W
+
+    # TREND — MTF sync adds ±10 raw points (centred at 50)
+    t = (40 if trend_up else 0) \
+      + (20 if ema_stack else (10 if e_fast_gt_slow else 0)) \
+      + (15 if htf_up else 0) \
+      + (15 if market_bullish else 0) \
+      + (10 if fresh_cross else 0)
+    t = max(0.0, t + (mtf_sync_score - 50.0) / 50.0 * 10.0)
+    cat_T = min(W["TREND"], t / 100 * W["TREND"])
+
+    # MOMENTUM
+    m = (40 if rsi>=70 else 35 if rsi>=65 else 25 if rsi>=60 else 18 if rsi>=55
+         else 10 if rsi>=50 else 0 if rsi>=40 else -10)
+    m += (25 if mom1>mom1_th else 12 if mom1>0 else -5)
+    m += (20 if mom3>mom3_th else 10 if mom3>0 else 0)
+    m += (15 if mom6>mom6_th else 5 if mom6>0 else 0)
+    cat_M = min(W["MOMENTUM"], max(0.0, m) / 100 * W["MOMENTUM"])
+
+    # STRUCTURE — harmonic patterns add up to +12 raw
+    s = float(_PHASE_RAW.get(phase, 10))
+    s += (20 if c_gt_hh else (10 if c_near_hh else 0))
+    s += (20 if in_golden else 0)
+    s += (-25 if near_e127 else (-35 if near_e161 else 0))
+    s += (15 if rs_rank>=80 else (5 if rs_rank>=60 else (-10 if rs_rank<30 else 0)))
+    s += harmonic_score * 0.15   # quality*0.8 → max ~64; ×0.15 → ≤9.6 raw pts
+    cat_S = min(W["STRUCTURE"], max(0.0, s) / 120 * W["STRUCTURE"])
+
+    # VOLUME — institutional score replaces static ADX-only centre
+    v = 0.0
+    if vol_avg_gt_zero:
+        v += (50 if vol_ratio>=1.5 else 35 if vol_ratio>=1.2 else 20 if vol_ratio>=1.0 else -5)
+    v += (35 if adx_val>=30 else 20 if adx_val>=20 else 8 if adx_val>=15 else -8)
+    v += (inst_score - 50.0) / 50.0 * 15.0   # institutional: ±15 raw
+    cat_V = min(W["VOLUME"], max(0.0, v) / 100 * W["VOLUME"])
+
+    # QUALITY — candle structure adds ±10 raw points
+    q = (25 if squeeze else 0) + (25 if vc_ratio<0.75 else (12 if vc_ratio<0.90 else 0))
+    q += max(0.0, 40.0 + ext_penalty)
+    q += candle_score   # −10 to +10
+    cat_Q = min(W["QUALITY"], q / 100 * W["QUALITY"])
+
+    raw = cat_T + cat_M + cat_S + cat_V + cat_Q
+    if regime_bearish:
+        raw *= 0.85
+    return dict(norm_bull=round(min(100.0, max(0.0, raw)), 1),
+                cat_T=round(cat_T,2), cat_M=round(cat_M,2),
+                cat_S=round(cat_S,2), cat_V=round(cat_V,2), cat_Q=round(cat_Q,2))
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CORE SCORING — v14 logic + SPEED-10 new indicators
 # ══════════════════════════════════════════════════════════════════════════════
 
 def score_stock(df, nifty_close, mode="Swing", daily_close=None,
                 market_bullish=True, vix_val=None, min_liquidity_cr=LIQUIDITY_MIN_CR,
                 sym=None, htf_up=True, rs_rank=50,
-                phase_history_snapshot=None):
+                phase_history_snapshot=None, mtf_prefetched=None):
     try:
         cfg   = MODE_CFG[mode]
         close = df["Close"]; volume = df["Volume"]; n = len(close)
@@ -1557,41 +2562,62 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         squeeze   = _compute_squeeze(df)
         vol_ratio = _compute_vol_contraction(df)
 
-        # ADX bonus/penalty
-        adx_bonus = (8 if adx_val >= 30 else 4 if adx_val >= 20 else -4)
-        # Squeeze bonus (coiling for breakout)
-        squeeze_bonus = 5 if squeeze else 0
-        # Volatility contraction bonus
-        vc_bonus = 6 if vol_ratio < 0.75 else (3 if vol_ratio < 0.90 else 0)
-        # ─────────────────────────────────────────────────────────────────
-
-        bull  = 0
-        bull += 25 if trend_up else 0
-        bull += ema_cross_bonus
-        bull += (15 if r >= 65 else 10) if r >= 60 else (5 if r > 50 else 0)
-        bull += 10 if v > vol_avg*1.2 else (5 if v > vol_avg else 0)
-        bull += 15 if c > hh else (9 if c > hh*0.98 else 0)
-        if n >= 3 and c > float(close.iloc[-3]): bull += 8
-        bull += 7 if rs_rank>=80 else (3 if rs_rank>=60 else (0 if rs_rank>=40 else -3))
-        if mode == "Positional":
-            bull += 15 if qualified else -15
-        else:
-            bull += 15 if strong_htf else -10
-        bull += 10 if in_golden else 0
-        if near_e127:   bull -= 20
-        elif near_e161: bull -= 30
-        bull += ext_penalty
-        # v15 new indicator contributions
-        bull += adx_bonus + squeeze_bonus + vc_bonus
-
-        BEARISH_HAIRCUT=0.85
+        # ── NEW ENGINES (v15.4) ────────────────────────────────────────────
+        # Engine 4 first — its weights feed both category_score calls below
         regime_bearish = not market_bullish
-        if regime_bearish: bull = int(bull*BEARISH_HAIRCUT)
+        _regime_key, _regime_label, _regime_w = classify_regime(
+            market_bullish, adx_val, vix_val)
 
-        raw_score = max(0, bull)
-        BULL_MAX_V15 = 120   # slightly higher ceiling due to new indicators
-        norm_bull  = min(100.0, max(0.0, bull*100.0/BULL_MAX_V15))
-        score_th   = float(cfg["score_th"])
+        # Engine 2: institutional volume
+        _inst = analyze_institutional_volume(df, mode)
+
+        # Engine 3: harmonic / ABCD patterns
+        _harm = detect_harmonic_patterns(df, mode)
+
+        # Engine 5: candle structure
+        _candle = detect_candle_structure(df, atr_val, mode)
+
+        # Engine 1: MTF sync — inject base TF df so all three TFs are present
+        _mtf_data = dict(mtf_prefetched or {})
+        _base_tf   = MODE_CFG[mode]["interval"]
+        if _base_tf not in _mtf_data:
+            _mtf_data[_base_tf] = df
+        _mtf = compute_mtf_sync(sym or "", mode, prefetched=_mtf_data)
+        # ── FIX-C: category-based scoring — placeholder phase ──────────────
+        _cat = category_score(
+            trend_up       = trend_up,
+            ema_stack      = ema_stack,
+            fresh_cross    = fresh_cross,
+            htf_up         = htf_up,
+            market_bullish = market_bullish,
+            e_fast_gt_slow = (e_fast > e_slow),
+            rsi            = r,
+            mom1=mom1, mom3=mom3, mom6=mom6,
+            mom1_th=cfg["mom1_th"], mom3_th=cfg["mom3_th"], mom6_th=cfg["mom6_th"],
+            phase          = PHASE_IDLE,        # placeholder; overwritten after detect_phase
+            in_golden      = in_golden,
+            near_e127      = near_e127,
+            near_e161      = near_e161,
+            norm_bull_raw  = 50.0,
+            rs_rank        = rs_rank,
+            c_gt_hh        = (c > hh),
+            c_near_hh      = (c > hh*0.98),
+            vol_ratio      = (v/vol_avg) if vol_avg > 0 else 1.0,
+            vol_avg_gt_zero= vol_avg > 0,
+            adx_val        = adx_val,
+            squeeze        = squeeze,
+            vc_ratio       = vol_ratio,
+            ext_penalty    = ext_penalty,
+            regime_bearish = regime_bearish,
+            mtf_sync_score = _mtf["sync_score"],
+            inst_score     = _inst["inst_score"],
+            harmonic_score = _harm["harmonic_score"],
+            candle_score   = _candle["candle_score"],
+            regime_weights = _regime_w,
+        )
+        norm_bull = _cat["norm_bull"]
+        raw_score = int(norm_bull)
+        score_th  = float(cfg["score_th"])
 
         act           = action_label(norm_bull)
         vol_confirmed = v > vol_avg*1.2
@@ -1605,6 +2631,27 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
             trend_strong=trend_strong, score_th=score_th, vdu_setup=vdu_setup,
             htf_up=htf_up, regime_bearish=regime_bearish, vix_val=vix_val,
         )
+
+        # Re-score with the real phase now known
+        _cat2 = category_score(
+            trend_up=trend_up, ema_stack=ema_stack, fresh_cross=fresh_cross,
+            htf_up=htf_up, market_bullish=market_bullish, e_fast_gt_slow=(e_fast>e_slow),
+            rsi=r, mom1=mom1, mom3=mom3, mom6=mom6,
+            mom1_th=cfg["mom1_th"], mom3_th=cfg["mom3_th"], mom6_th=cfg["mom6_th"],
+            phase=phase, in_golden=in_golden, near_e127=near_e127, near_e161=near_e161,
+            norm_bull_raw=norm_bull, rs_rank=rs_rank,
+            c_gt_hh=(c>hh), c_near_hh=(c>hh*0.98),
+            vol_ratio=(v/vol_avg) if vol_avg>0 else 1.0,
+            vol_avg_gt_zero=vol_avg>0, adx_val=adx_val, squeeze=squeeze,
+            vc_ratio=vol_ratio, ext_penalty=ext_penalty, regime_bearish=regime_bearish,
+            mtf_sync_score=_mtf["sync_score"],
+            inst_score=_inst["inst_score"],
+            harmonic_score=_harm["harmonic_score"],
+            candle_score=_candle["candle_score"],
+            regime_weights=_regime_w,
+        )
+        norm_bull = _cat2["norm_bull"]
+        raw_score = int(norm_bull)
 
         # ADX gate: don't declare BREAKOUT if ADX weak (no trend strength)
         if phase == PHASE_BRK and adx_val < 18:
@@ -1673,10 +2720,52 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
             "ATR_Mean":    round(atr_mean,2), "PhaseBonus":phase_bonus,
             "BreadthGated":False, "Mom1":round(mom1,2), "Mom3":round(mom3,2),
             "TrendUp":     trend_up, "TrendDown":trend_down,
-            # v15 extras
+            # v15 speed-10
             "ADX":         round(adx_val,1), "Squeeze":squeeze,
             "VolRatio":    round(vol_ratio,2),
+            # v15.3 category scores
+            "CatT":_cat2["cat_T"],"CatM":_cat2["cat_M"],"CatS":_cat2["cat_S"],
+            "CatV":_cat2["cat_V"],"CatQ":_cat2["cat_Q"],
+            # v15.1/15.2 pattern keys — populated by enrich_with_patterns after Stage-B
+            "Patterns":{},"VCP":False,"VCPGrade":"NONE","AVWAP":None,
+            "AVWAPAbove":False,"FibQuality":0,"FibGrade":"POOR",
+            "VolDryup":False,"VDUIntensity":0,"RVolPct":50.0,"RVolLabel":"NORMAL",
+            "DarvasIn":False,"DarvasBrk":False,"DarvasTop":0.0,
             "_detected_phase": phase,
+            # ── v15.4: Five new engines ───────────────────────────────────────
+            # Engine 1 — MTF sync
+            "MTFScore":   _mtf["sync_score"],
+            "MTFLabel":   _mtf["mtf_label"],
+            "MTFAligned": _mtf["aligned"],
+            "MTFDiverge": _mtf["divergence"],
+            "MTFTFScores":_mtf["tf_scores"],
+            # Engine 2 — Institutional volume
+            "InstScore":  _inst["inst_score"],
+            "InstVerdict":_inst["verdict"],
+            "InstLabel":  _inst["inst_label"],
+            "InstEVR":    _inst["effort_vs_result"],
+            "InstCMF":    _inst["cmf"],
+            "InstOBV":    _inst["obv_trend"],
+            "InstBlocks": _inst["block_days"],
+            # Engine 3 — Harmonic / ABCD
+            "HarmonicDetected": _harm["detected"],
+            "HarmonicPattern":  _harm["pattern"],
+            "HarmonicDir":      _harm["direction"],
+            "HarmonicQuality":  _harm["quality"],
+            "HarmonicZone":     _harm["completion_zone"],
+            "HarmonicScore":    _harm["harmonic_score"],
+            # Engine 4 — Adaptive regime
+            "RegimeKey":    _regime_key,
+            "RegimeLabel":  _regime_label,
+            "RegimeWeights":_regime_w,
+            # Engine 5 — Candle structure
+            "CandleScore":  _candle["candle_score"],
+            "CandleSignal": _candle["candle_signal"],
+            "CandlePatterns":_candle["patterns"],
+            "NR7":          _candle["nr7"],
+            "InsideBar":    _candle["inside_bar"],
+            # ── v15.5: Emerging Momentum Score (7-component leading indicator) ──
+            **compute_emerging_score(df, mode, nifty_close, rs_rank),
         }
     except Exception:
         return None
@@ -1743,14 +2832,24 @@ def _db_ensure(cur):
 
 def _db_save(table, payload):
     try:
-        conn=_db_conn(); cur=conn.cursor()
+        conn = _db_conn(); cur = conn.cursor()
         _db_ensure(cur); conn.commit()
-        cur.execute(f"DELETE FROM {table}")
-        cur.execute(f"INSERT INTO {table} (data) VALUES (%s)",[json.dumps(payload)])
+        # FIX-6: atomic save — insert first, then trim old rows in one transaction
+        # This prevents data loss if the process crashes between a DELETE and INSERT.
+        cur.execute(
+            f"INSERT INTO {table} (data) VALUES (%s)",
+            [json.dumps(payload)]
+        )
+        cur.execute(
+            f"""DELETE FROM {table}
+                WHERE id NOT IN (
+                    SELECT id FROM {table} ORDER BY ts DESC LIMIT 1
+                )"""
+        )
         conn.commit(); cur.close(); conn.close()
-        st.session_state["_db_error"]=None
+        st.session_state["_db_error"] = None
     except Exception as e:
-        st.session_state["_db_error"]=str(e)
+        st.session_state["_db_error"] = str(e)
 
 def _db_load(table):
     try:
@@ -1817,6 +2916,11 @@ def run_scan(symbols, mode, progress_bar, status_text,
     htf_map = prefetch_htf_parallel(survivors, mode, status_text, progress_bar)
     progress_bar.progress(0.55)
 
+    # ── MTF pre-fetch (Engine 1 — secondary/tertiary TFs for survivors) ───
+    status_text.text("📊 Multi-timeframe data for survivors…")
+    mtf_prefetched = prefetch_mtf_parallel(survivors, mode)
+    progress_bar.progress(0.57)
+
     # ── RS ranks ──────────────────────────────────────────────────────────
     sym_52w_returns = {sym: _52w_return(valid_data[sym]["Close"])
                        for sym in survivors if sym in valid_data}
@@ -1855,6 +2959,7 @@ def run_scan(symbols, mode, progress_bar, status_text,
             htf_up                 = htf_up,
             rs_rank                = rs_rank,
             phase_history_snapshot = phase_history_snapshot,
+            mtf_prefetched         = mtf_prefetched.get(sym, {}),
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, n_surv)) as pool:
@@ -1879,9 +2984,35 @@ def run_scan(symbols, mode, progress_bar, status_text,
         record_phase_transition(sym, phase)
         res["PhaseBonus"] = phase_transition_conf_bonus(sym)
 
+    # FIX-B: pattern enrichment — runs only on shortlisted stocks
+    status_text.text("🔬 Pattern enrichment on shortlisted stocks…")
+    results = enrich_with_patterns(
+        results, data=valid_data, mode=mode, market_open=_is_market_open()
+    )
+
     breadth_pulse = compute_breadth(results)
     pct_ema50_now = breadth_pulse.get("pct_above_ema50", 100)
     ad_ratio_now  = breadth_pulse.get("ad_ratio", 2.0)
+
+    # ── v15.5: Enrich Emerging Scores with sector momentum ────────────────
+    _sec_avg   = breadth_pulse.get("sector_avg", {})
+    _ovl_avg   = float(np.mean(list(_sec_avg.values()))) if _sec_avg else 50.0
+    for _res in results:
+        _sb = 0.0
+        if _sec_avg:
+            _sa = _sec_avg.get(_res.get("Sector", "Other"), _ovl_avg)
+            if   _sa >= _ovl_avg + 10: _sb = 10.0
+            elif _sa >= _ovl_avg + 5:  _sb = 7.0
+            elif _sa >= _ovl_avg:      _sb = 4.0
+            elif _sa >= _ovl_avg - 5:  _sb = 2.0
+        _res["EmSectorMom"] = round(_sb, 1)
+        _em_total = round(min(100.0, _res.get("EmScore", 0) + _sb), 1)
+        _res["EmScore"] = _em_total
+        _res["EmLabel"] = ("IGNITING" if _em_total >= 65 else "BUILDING" if _em_total >= 50
+                           else "COILING" if _em_total >= 35 else "LATENT" if _em_total >= 20
+                           else "QUIET")
+    # ─────────────────────────────────────────────────────────────────────────
+
     breadth_weak  = (pct_ema50_now < 40) and (ad_ratio_now < 0.8)
 
     if breadth_weak:
@@ -2180,8 +3311,12 @@ def run_exit_scan(positions:list, vix_val:float=None) -> dict:
 def add_position(sym:str, entry_price:float, qty:int, mode:str, entry_date:str=None):
     pos=dict(symbol=sym.upper(),entry_price=entry_price,qty=qty,mode=mode,
              entry_date=entry_date or datetime.now().date().isoformat(),current_price=entry_price)
+    # FIX-7: deduplicate on (symbol, entry_date, entry_price) so different-price
+    # lots entered on the same day are preserved separately.
     existing=[p for p in st.session_state.get("open_positions",[])
-              if not (p["symbol"]==sym.upper() and p["entry_date"]==pos["entry_date"])]
+              if not (p["symbol"]==sym.upper()
+                      and p["entry_date"]==pos["entry_date"]
+                      and p["entry_price"]==entry_price)]
     st.session_state["open_positions"]=existing+[pos]
     _db_save("bs_positions",st.session_state["open_positions"])
 
@@ -2238,11 +3373,14 @@ def fetch_oi_data(symbol="NIFTY"):
     }
     session=requests.Session(); session.headers.update(HEADERS)
     def _warm():
+        # FIX-9: removed time.sleep() calls that blocked the UI thread for 1.3s;
+        # session warming is best-effort — the retry loop handles 401/403 responses.
         try:
-            session.get("https://www.nseindia.com",timeout=10); time.sleep(0.8)
-            session.get("https://www.nseindia.com/market-data/equity-derivatives-watch",timeout=10)
-            time.sleep(0.5); return True
-        except Exception: return False
+            session.get("https://www.nseindia.com", timeout=5)
+            session.get("https://www.nseindia.com/market-data/equity-derivatives-watch", timeout=5)
+            return True
+        except Exception:
+            return False
     _warm()
     oc_url=f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
     data=None
@@ -2408,6 +3546,30 @@ with gc5:
 with gc6:
     search_q=st.text_input("Search symbol",placeholder="e.g. RELIANCE",
                             label_visibility="collapsed")
+
+# ── v15.5: Selection type row ──────────────────────────────────────────────────
+_sc1, _sc2, _sc3 = st.columns([3, 3, 6])
+with _sc1:
+    selection_type = st.radio(
+        "Selection Mode",
+        ["🎯 Confirmation", "🌱 Emerging"],
+        horizontal=True,
+        key="sel_type",
+        help=(
+            "Confirmation — stocks already in ENTRY/CONT/BREAKOUT phase.\n"
+            "Emerging — stocks BEFORE they become obvious (coiling, building momentum)."
+        ),
+    )
+with _sc2:
+    if selection_type == "🌱 Emerging":
+        em_min_score = st.slider(
+            "Min Emerging Score", 20, 80,
+            st.session_state.get("em_min_score", 35), 5,
+            key="em_min_score_slider",
+        )
+        st.session_state["em_min_score"] = em_min_score
+    else:
+        em_min_score = st.session_state.get("em_min_score", 35)
 
 vix_val,vix_label=fetch_vix()
 vix_color={"CALM":"#22c55e","CAUTION":"#f59e0b","STRESS":"#ef4444","UNKNOWN":"#cbd5e1"}.get(vix_label,"#cbd5e1")
@@ -2722,6 +3884,97 @@ with tab_scanner:
                 'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">VC</span>'
                 if vol_ratio<0.75 else ""
             )
+            # v15.1/15.3 pattern badges
+            vcp_grade   = r.get("VCPGrade","NONE")
+            avwap_above = r.get("AVWAPAbove",False)
+            fib_grade   = r.get("FibGrade","POOR")
+            vdu_int     = r.get("VDUIntensity",0)
+            rvol_label  = r.get("RVolLabel","NORMAL")
+            darvas_brk  = r.get("DarvasBrk",False)
+            darvas_in   = r.get("DarvasIn",False)
+            vcp_badge=(
+                f'<span style="background:#7c3aed22;border:1px solid #7c3aed88;color:#a78bfa;'
+                f'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
+                f'VCP·{vcp_grade}</span>'
+            ) if vcp_grade not in ("NONE","") else ""
+            avwap_badge=(
+                '<span style="background:#0369a122;border:1px solid #0369a155;color:#38bdf8;'
+                'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">AVWAP↑</span>'
+            ) if avwap_above else ""
+            fib_q_badge=(
+                f'<span style="background:#d9770622;border:1px solid #d9770688;color:#fb923c;'
+                f'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
+                f'FIB·{fib_grade}</span>'
+            ) if fib_grade in ("EXCELLENT","GOOD") else ""
+            vdu_badge=(
+                f'<span style="background:#16213022;border:1px solid #0ea5e955;color:#67e8f9;'
+                f'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
+                f'VDU{"×"*int(vdu_int)}</span>'
+            ) if vdu_int>=1 else ""
+            _rl_colors={"SURGE":("#22c55e","#22c55e22"),"HIGH":("#84cc16","#84cc1622"),
+                        "DRY":("#64748b","#64748b22")}
+            rvol_badge=""
+            if rvol_label in _rl_colors:
+                _rc,_rb=_rl_colors[rvol_label]
+                rvol_badge=(f'<span style="background:{_rb};border:1px solid {_rc}55;color:{_rc};'
+                            f'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
+                            f'RVOL·{rvol_label}</span>')
+            darvas_badge=(
+                '<span style="background:#a3284322;border:1px solid #f4386988;color:#f87171;'
+                'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">DARVAS↑</span>'
+                if darvas_brk else
+                '<span style="background:#78350f22;border:1px solid #f59e0b55;color:#fbbf24;'
+                'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">DARVAS□</span>'
+                if darvas_in else ""
+            )
+            # ── v15.4 engine badges ────────────────────────────────────────────
+            _mtf_lbl = r.get("MTFLabel","NEUTRAL")
+            _mtf_colors = {
+                "BULL SYNC": ("#22c55e","#22c55e22"), "BULL LEAN": ("#86efac","#86efac22"),
+                "BEAR SYNC": ("#ef4444","#ef444422"), "BEAR LEAN": ("#fca5a5","#fca5a522"),
+                "DIVERGE":   ("#f59e0b","#f59e0b22"), "NEUTRAL":   None,
+            }
+            mtf_badge = ""
+            if _mtf_lbl in _mtf_colors and _mtf_colors[_mtf_lbl]:
+                _mc, _mb = _mtf_colors[_mtf_lbl]
+                mtf_badge = (f'<span style="background:{_mb};border:1px solid {_mc}55;color:{_mc};'
+                             f'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
+                             f'MTF·{_mtf_lbl}</span>')
+
+            _inst_lbl = r.get("InstLabel","INST~")
+            _inst_colors = {"INST↑":("#22c55e","#22c55e22"), "INST↓":("#ef4444","#ef444422")}
+            inst_badge = ""
+            if _inst_lbl in _inst_colors:
+                _ic, _ib = _inst_colors[_inst_lbl]
+                inst_badge = (f'<span style="background:{_ib};border:1px solid {_ic}55;color:{_ic};'
+                              f'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
+                              f'{_inst_lbl}</span>')
+
+            harm_badge = ""
+            if r.get("HarmonicDetected"):
+                _hp = r.get("HarmonicPattern","?")
+                _hd = r.get("HarmonicDir","?")
+                _hc = "#22c55e" if _hd=="BULL" else "#ef4444"
+                harm_badge = (f'<span style="background:{_hc}22;border:1px solid {_hc}55;color:{_hc};'
+                              f'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
+                              f'{_hp}</span>')
+
+            _cs = r.get("CandleSignal","NEUTRAL")
+            _candle_colors = {
+                "BULL":("#22c55e","#22c55e22"),"BULL LEAN":("#86efac","#86efac22"),
+                "BEAR":("#ef4444","#ef444422"),"BEAR LEAN":("#fca5a5","#fca5a522"),
+            }
+            candle_badge = ""
+            if _cs in _candle_colors:
+                _cc, _cb = _candle_colors[_cs]
+                _cpats = r.get("CandlePatterns",[])
+                _cpat_str = _cpats[0] if _cpats else _cs
+                candle_badge = (f'<span style="background:{_cb};border:1px solid {_cc}55;color:{_cc};'
+                                f'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
+                                f'🕯 {_cpat_str}</span>')
+            if r.get("NR7"):
+                candle_badge += ('<span style="background:#7c3aed22;border:1px solid #7c3aed55;color:#a78bfa;'
+                                 'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">NR7</span>')
             metrics=[
                 ("Trend",f'<span style="color:{trend_col};font-weight:600;">{"+ Bullish" if htf_up else "− Bearish"}</span>'),
                 ("RSI",  f'<span style="color:#e8e8f4;">{rsi_val}</span>'),
@@ -2729,6 +3982,8 @@ with tab_scanner:
                 ("HTF",  f'<span style="color:{trend_col};font-weight:700;">{"↑ Bull" if htf_up else "↓ Bear"}</span>'),
                 ("Vol",  f'<span style="color:#e8e8f4;">{vol_label}</span>'),
                 ("Conf", f'<span style="color:{conf_col};font-family:JetBrains Mono,monospace;letter-spacing:.1em;">{conf_sym}</span>'),
+                ("Regime", f'<span style="color:#94a3b8;font-size:9px;">{r.get("RegimeLabel","—")}</span>'),
+                ("Inst",   f'<span style="color:#94a3b8;font-size:9px;">{r.get("InstVerdict","—")}</span>'),
             ]
             metric_grid_html=(
                 '<div style="display:grid;grid-template-columns:1fr 1fr;gap:0;'
@@ -2775,7 +4030,7 @@ with tab_scanner:
                 f'<div style="display:flex;align-items:center;gap:5px;flex-wrap:nowrap;">'
                 f'<span style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:15px;font-weight:700;letter-spacing:-.02em;white-space:nowrap;">{sym}</span>'
                 f'{golden_badge}{breadth_badge}</div>'
-                f'<div style="margin-top:3px;display:flex;flex-wrap:wrap;gap:2px;">{phase_chip_html}{adx_badge}{squeeze_badge}{vc_badge}</div>'
+                f'<div style="margin-top:3px;display:flex;flex-wrap:wrap;gap:2px;">{phase_chip_html}{adx_badge}{squeeze_badge}{vc_badge}{vcp_badge}{avwap_badge}{fib_q_badge}{vdu_badge}{rvol_badge}{darvas_badge}{mtf_badge}{inst_badge}{harm_badge}{candle_badge}</div>'
                 f'</div>'
                 f'<span style="background:{act_bg};border:1px solid {act_brd};color:{act_txt};'
                 f'padding:3px 8px;border-radius:5px;font-size:10px;font-weight:700;font-family:DM Sans,sans-serif;flex-shrink:0;">{act}</span>'
@@ -2803,37 +4058,230 @@ with tab_scanner:
         actionable.sort(key=lambda x:(phase_rank.get(x.get("Phase"),9),-x["Score"]))
         top_act=actionable[:15]
 
-        if top_act:
-            with st.expander(
-                f"READY TO TRADE — {len(top_act)} stocks in ENTRY / CONT / BREAKOUT",
-                expanded=True
-            ):
-                cards_html='<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
-                for i,r in enumerate(top_act):
-                    cards_html+=make_card(i,r,"#22c55e55",show_entry=True)
-                cards_html+="</div>"
-                st.markdown(cards_html,unsafe_allow_html=True)
-                st.markdown(
-                    '<div style="text-align:center;color:#3a3a60;font-size:10px;'
-                    'font-family:JetBrains Mono,monospace;padding:4px 0 2px;">'
-                    'ⓘ Data is indicator based. Confirm with price action.</div>',
-                    unsafe_allow_html=True,
+        # ── v15.5: EMERGING MOMENTUM CARD ─────────────────────────────────────
+        _EM_COLORS = {
+            "IGNITING": ("#f59e0b","#f59e0b22"),
+            "BUILDING": ("#22c55e","#22c55e22"),
+            "COILING":  ("#8b5cf6","#8b5cf622"),
+            "LATENT":   ("#38bdf8","#38bdf822"),
+            "QUIET":    ("#475569","#47556922"),
+        }
+        _EM_COMPONENTS = [
+            ("RS Accel",    "EmRSAccel",     15, "📈"),
+            ("ATR Cmprss",  "EmATRCompress", 15, "🗜"),
+            ("RVOL Accel",  "EmRVolAccel",   15, "📊"),
+            ("EMA Conv",    "EmEMAConv",     15, "🔀"),
+            ("Sqz Press",   "EmSqzPressure", 15, "🔄"),
+            ("Sector Mom",  "EmSectorMom",   10, "🏭"),
+            ("Range Exp",   "EmORExpansion", 15, "🚀"),
+        ]
+
+        def make_emerging_card(i, r):
+            sym   = r["Symbol"]; ltp = r["LTP"]; chg = r["%Change"]
+            em    = r.get("EmScore", 0); lbl = r.get("EmLabel","QUIET")
+            phase = r.get("Phase", PHASE_IDLE)
+            act   = r.get("Action","SKIP"); sector = r.get("Sector","—")
+            em_c, em_bg = _EM_COLORS.get(lbl, ("#475569","#47556922"))
+            chg_col = "#22c55e" if chg >= 0 else "#ef4444"
+            chg_arr = "▲" if chg >= 0 else "▼"
+            chg_str = f"+{chg:.2f}%" if chg >= 0 else f"{chg:.2f}%"
+            phase_col = _phase_color(phase)
+            act_bg,act_brd,act_txt = _action_colors(act)
+            # 7-component breakdown bars
+            bars_html = ""
+            for comp_name, comp_key, comp_max, comp_icon in _EM_COMPONENTS:
+                val = r.get(comp_key, 0.0)
+                pct = int(val / comp_max * 100)
+                bar_col = "#22c55e" if pct >= 70 else "#f59e0b" if pct >= 40 else "#475569"
+                bars_html += (
+                    f'<div style="margin:3px 0;">'
+                    f'<div style="display:flex;justify-content:space-between;margin-bottom:1px;">'
+                    f'<span style="color:#94a3b8;font-size:9px;">{comp_icon} {comp_name}</span>'
+                    f'<span style="color:{bar_col};font-family:JetBrains Mono,monospace;font-size:9px;font-weight:600;">'
+                    f'{val:.0f}/{comp_max}</span></div>'
+                    f'<div style="background:#1e1e40;border-radius:2px;height:4px;">'
+                    f'<div style="background:{bar_col};width:{pct}%;height:4px;border-radius:2px;'
+                    f'transition:width 0.3s;"></div></div></div>'
                 )
+            # squeeze + atr badges
+            sqz_badge = ('<span style="background:#8b5cf622;border:1px solid #8b5cf655;color:#a78bfa;'
+                         'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">🔄 SQZ</span>'
+                         if r.get("Squeeze") else "")
+            vc_badge = ('<span style="background:#0ea5e922;border:1px solid #0ea5e955;color:#38bdf8;'
+                        'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">VC</span>'
+                        if r.get("VolRatio", 1.0) < 0.75 else "")
+            # MTF badge (if useful)
+            mtf_lbl = r.get("MTFLabel","NEUTRAL")
+            mtf_c_map = {"BULL SYNC":"#22c55e","BULL LEAN":"#86efac","BEAR SYNC":"#ef4444",
+                         "BEAR LEAN":"#fca5a5","DIVERGE":"#f59e0b"}
+            mtf_badge = ""
+            if mtf_lbl in mtf_c_map:
+                mc = mtf_c_map[mtf_lbl]
+                mtf_badge = (f'<span style="background:{mc}22;border:1px solid {mc}55;color:{mc};'
+                             f'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">'
+                             f'MTF·{mtf_lbl}</span>')
+            return (
+                f'<div style="background:#0e0e1c;border:1.5px solid {em_c}55;border-radius:12px;'
+                f'overflow:hidden;width:340px;min-width:300px;max-width:360px;flex:1 1 340px;">'
+                # Header
+                f'<div style="background:{em_bg};border-bottom:1px solid {em_c}33;padding:8px 12px 7px;'
+                f'display:flex;align-items:center;gap:8px;">'
+                f'<div style="flex:1;">'
+                f'<div style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:15px;font-weight:700;">{sym}</div>'
+                f'<div style="font-size:9px;color:#94a3b8;font-family:DM Sans,sans-serif;">{sector}</div>'
+                f'</div>'
+                f'<div style="text-align:right;">'
+                f'<div style="background:{em_c};color:#0a0a0f;font-family:JetBrains Mono,monospace;'
+                f'font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap;">'
+                f'EM {em:.0f} · {lbl}</div>'
+                f'<div style="margin-top:4px;display:flex;gap:3px;justify-content:flex-end;">'
+                f'<span style="background:{phase_col}22;border:1px solid {phase_col}55;color:{phase_col};'
+                f'padding:1px 5px;border-radius:3px;font-size:9px;">{phase}</span>'
+                f'<span style="background:{act_bg};border:1px solid {act_brd};color:{act_txt};'
+                f'padding:1px 5px;border-radius:3px;font-size:9px;font-weight:600;">{act}</span>'
+                f'</div></div></div>'
+                # Price row
+                f'<div style="padding:8px 12px 4px;display:flex;justify-content:space-between;align-items:center;">'
+                f'<div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:20px;font-weight:600;">₹{ltp:,.2f}</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:{chg_col};font-size:11px;">{chg_arr} {chg_str}</div>'
+                f'</div>'
+                f'<div style="text-align:right;">'
+                f'{sqz_badge}{vc_badge}{mtf_badge}'
+                f'<div style="color:#475569;font-size:8px;margin-top:3px;">RSI {r.get("RSI","—")} · RS{r.get("RS_Rank",50)}</div>'
+                f'</div></div>'
+                # Emerging score bar
+                f'<div style="padding:4px 12px 2px;">'
+                f'<div style="background:#1e1e40;border-radius:3px;height:5px;">'
+                f'<div style="background:linear-gradient(90deg,{em_c},{em_c}aa);'
+                f'width:{min(em,100)}%;height:5px;border-radius:3px;"></div></div></div>'
+                # Component breakdown
+                f'<div style="padding:6px 12px 10px;">'
+                + bars_html +
+                f'</div>'
+                # Footer
+                f'<div style="background:#07070f;border-top:1px solid #1e1e40;padding:5px 12px;'
+                f'display:flex;justify-content:space-between;align-items:center;">'
+                f'<span style="color:#475569;font-size:9px;font-family:JetBrains Mono,monospace;">'
+                f'ATR {r.get("ATR","—")} · ADX {r.get("ADX","—")}</span>'
+                f'<span style="color:{em_c};font-size:9px;font-weight:600;">'
+                f'SL ₹{r.get("SL",0):,.0f}</span>'
+                f'</div>'
+                f'</div>'
+            )
+
+        # ── Render section based on Selection Mode ─────────────────────────────
+        if selection_type == "🌱 Emerging":
+            # ── EMERGING: stocks coiling BEFORE becoming obvious ───────────────
+            em_candidates = [
+                r for r in st.session_state.results
+                if r.get("EmScore", 0) >= em_min_score
+                and r.get("Phase") in (PHASE_SETUP, PHASE_IDLE, PHASE_ENTRY)
+            ]
+            em_candidates.sort(key=lambda x: x.get("EmScore", 0), reverse=True)
+            top_em = em_candidates[:20]
+
+            # Label distribution
+            _em_dist = {"IGNITING":0,"BUILDING":0,"COILING":0,"LATENT":0}
+            for r in em_candidates:
+                lbl = r.get("EmLabel","QUIET")
+                if lbl in _em_dist: _em_dist[lbl] += 1
+
+            if top_em:
+                _em_header_cols = st.columns(5)
+                _em_header_cols[0].metric("🌱 Emerging Total", len(em_candidates))
+                for idx,(lbl,col) in enumerate([("IGNITING","#f59e0b"),("BUILDING","#22c55e"),
+                                                ("COILING","#8b5cf6"),("LATENT","#38bdf8")]):
+                    _em_header_cols[idx+1].metric(lbl, _em_dist.get(lbl,0))
+
+                with st.expander(
+                    f"🌱 EMERGING MOMENTUM — {len(top_em)} stocks building before breakout",
+                    expanded=True,
+                ):
+                    st.markdown(
+                        '<div style="color:#94a3b8;font-size:11px;font-family:JetBrains Mono,monospace;'
+                        'margin-bottom:10px;">These stocks are NOT yet in ENTRY/CONT/BREAKOUT. '
+                        'They show convergent signals across RS acceleration, volatility compression, '
+                        'volume build, EMA convergence, squeeze pressure, sector strength, and range expansion. '
+                        'Add to watchlist and monitor for phase upgrade.</div>',
+                        unsafe_allow_html=True,
+                    )
+                    em_cards_html = '<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
+                    for i, r in enumerate(top_em):
+                        em_cards_html += make_emerging_card(i, r)
+                    em_cards_html += "</div>"
+                    st.markdown(em_cards_html, unsafe_allow_html=True)
+                    st.markdown(
+                        '<div style="text-align:center;color:#3a3a60;font-size:10px;'
+                        'font-family:JetBrains Mono,monospace;padding:6px 0 2px;">'
+                        'ⓘ Emerging score identifies setups in formation — NOT entry signals. '
+                        'Wait for phase upgrade to ENTRY/CONT/BREAKOUT before acting.</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Emerging table
+                em_rows = []
+                for i, r in enumerate(em_candidates[:50]):
+                    em_rows.append({
+                        "#": i+1, "Symbol": r["Symbol"],
+                        "EmScore": r.get("EmScore",0), "EmLabel": r.get("EmLabel","—"),
+                        "Phase": r.get("Phase","—"), "Action": r.get("Action","—"),
+                        "RS↑": r.get("EmRSAccel",0),    "ATR↓": r.get("EmATRCompress",0),
+                        "RVOL↑": r.get("EmRVolAccel",0), "EMAconv": r.get("EmEMAConv",0),
+                        "SqzPrs": r.get("EmSqzPressure",0), "SecMom": r.get("EmSectorMom",0),
+                        "RngExp": r.get("EmORExpansion",0),
+                        "Score": r.get("Score",0), "%Chg": f'{r.get("%Change",0):+.2f}%',
+                        "RSI": r.get("RSI","—"), "RS_Rank": r.get("RS_Rank",50),
+                        "LTP": fmt(r["LTP"]), "SL": fmt(r.get("SL",0)),
+                        "Sector": r.get("Sector","—"),
+                    })
+                if em_rows:
+                    em_df = pd.DataFrame(em_rows)
+                    st.dataframe(em_df, use_container_width=True, hide_index=True, height=360)
+                    em_buy = [r for r in em_candidates if r.get("Action") in ("BUY","STRONG BUY","WATCH")]
+                    if em_buy:
+                        csv = pd.DataFrame(em_buy).drop(columns=["ExtFlags","Patterns","RegimeWeights","MTFTFScores","CandlePatterns"], errors="ignore").to_csv(index=False)
+                        st.download_button("Export Emerging list",csv,
+                                           f"NSE_Emerging_{mode_opt}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv","text/csv")
+            else:
+                st.info(f"No emerging stocks found with score ≥ {em_min_score}. "
+                        "Try lowering the minimum score or run a scan first.")
+
         else:
-            st.info("No stocks in ENTRY / CONT / BREAKOUT phase.")
+            # ── CONFIRMATION: stocks already in actionable phases ──────────────
+            if top_act:
+                with st.expander(
+                    f"READY TO TRADE — {len(top_act)} stocks in ENTRY / CONT / BREAKOUT",
+                    expanded=True
+                ):
+                    cards_html='<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
+                    for i,r in enumerate(top_act):
+                        cards_html+=make_card(i,r,"#22c55e55",show_entry=True)
+                    cards_html+="</div>"
+                    st.markdown(cards_html,unsafe_allow_html=True)
+                    st.markdown(
+                        '<div style="text-align:center;color:#3a3a60;font-size:10px;'
+                        'font-family:JetBrains Mono,monospace;padding:4px 0 2px;">'
+                        'ⓘ Data is indicator based. Confirm with price action.</div>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.info("No stocks in ENTRY / CONT / BREAKOUT phase.")
 
-        watchlist=[r for r in st.session_state.results
-                   if r.get("Phase") in (PHASE_SETUP,PHASE_IDLE)
-                   and r["Score"]>=58 and r["Action"] in ("BUY","STRONG BUY")][:10]
-        if watchlist:
-            with st.expander(f"WATCHLIST — {len(watchlist)} high-score, not yet ready",expanded=False):
-                cards_html='<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
-                for i,r in enumerate(watchlist):
-                    cards_html+=make_card(i,r,"#f59e0b55",show_entry=False)
-                cards_html+="</div>"
-                st.markdown(cards_html,unsafe_allow_html=True)
+            # FIX-5: include WATCH action; lower threshold so SETUP stocks (45-57) appear
+            watchlist=[r for r in st.session_state.results
+                       if r.get("Phase") in (PHASE_SETUP,PHASE_IDLE)
+                       and r["Score"]>=45
+                       and r["Action"] in ("BUY","STRONG BUY","WATCH")][:10]
+            if watchlist:
+                with st.expander(f"WATCHLIST — {len(watchlist)} high-score, not yet ready",expanded=False):
+                    cards_html='<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
+                    for i,r in enumerate(watchlist):
+                        cards_html+=make_card(i,r,"#f59e0b55",show_entry=False)
+                    cards_html+="</div>"
+                    st.markdown(cards_html,unsafe_allow_html=True)
 
-        # ── Short list (derived from scan, unchanged) ──────────────────────────
+        # ── Short list (derived from scan, shown in both modes) ────────────────
         short_candidates=derive_short_candidates(st.session_state.results,scan_mode_now,vix_val)
         if short_candidates:
             sh_now=sum(1 for s in short_candidates if s.verdict==SHORT_CONFIRMED)
@@ -2933,6 +4381,12 @@ with tab_scanner:
                     "%Chg":f"+{chg}%" if chg>=0 else f"{chg}%",
                     "RSI":r.get("RSI","—"),"RS_Rank":r.get("RS_Rank",50),
                     "ADX":r.get("ADX","—"),"SQZ":"◆" if r.get("Squeeze") else "",
+                    "VCP":r.get("VCPGrade","—"),
+                    "AVWAP":"↑" if r.get("AVWAPAbove") else "↓",
+                    "FibQ":r.get("FibGrade","—"),
+                    "VDU":"×"*int(r.get("VDUIntensity",0)) or "—",
+                    "RVol":r.get("RVolLabel","—"),
+                    "Darvas":("BRK" if r.get("DarvasBrk") else ("□" if r.get("DarvasIn") else "—")),
                     "LTP":fmt(r["LTP"]),"Entry":fmt(r["Entry"])+(" ⚡" if r["Entry"]!=r["LTP"] else ""),
                     "SL":fmt(r["SL"]),"T1":fmt(r["T1"]),"T2":fmt(r["T2"]),"T3":fmt(r["T3"]),
                     "Liq₹Cr":r.get("AvgTradedCr","—"),"HTF":"↑" if r.get("HTFUp",True) else "↓",
@@ -3090,6 +4544,49 @@ with tab_detail:
             vc_c.metric("Vol Contraction",f'{r.get("VolRatio","—")}',
                         delta="Compressed" if (r.get("VolRatio") or 1)<0.75 else "Normal",
                         delta_color="normal" if (r.get("VolRatio") or 1)<0.75 else "off")
+            # v15.3 category score breakdown
+            st.markdown("**Score Breakdown (Category Weights)**")
+            _cT=r.get("CatT",0); _cM=r.get("CatM",0); _cS=r.get("CatS",0)
+            _cV=r.get("CatV",0); _cQ=r.get("CatQ",0)
+            _cat_cols=st.columns(5)
+            for _col,_lbl,_val,_mx,_tip in [
+                (_cat_cols[0],"TREND",    _cT,30,"EMA stack · HTF · regime · cross"),
+                (_cat_cols[1],"MOMENTUM", _cM,20,"RSI · 1M/3M/6M mom"),
+                (_cat_cols[2],"STRUCTURE",_cS,20,"Phase · Fib zone · HH · RS rank"),
+                (_cat_cols[3],"VOLUME",   _cV,15,"Vol ratio · ADX strength"),
+                (_cat_cols[4],"QUALITY",  _cQ,15,"Squeeze · Vol contraction · Clean"),
+            ]:
+                _pct=int(_val/_mx*100) if _mx>0 else 0
+                _col.metric(_lbl,f"{_val:.1f}/{_mx}",f"{_pct}%",
+                            delta_color="normal" if _pct>=60 else ("off" if _pct>=30 else "inverse"))
+            # v15.1/15.2 pattern signals
+            st.markdown("**Pattern Signals** *(enriched post-scan)*")
+            _pat=r.get("Patterns",{})
+            _vcp_d=_pat.get("vcp",{}); _avwap_d=_pat.get("avwap",{})
+            _fibq_d=_pat.get("fib_quality",{}); _vdu_d=_pat.get("vol_dryup",{})
+            _rvol_d=_pat.get("rel_vol",{}); _darv_d=_pat.get("darvas",{})
+            pc1,pc2,pc3,pc4,pc5,pc6=st.columns(6)
+            pc1.metric("VCP",f'{_vcp_d.get("vcp_grade","—")} ({_vcp_d.get("n_contractions",0)}×)',
+                       delta="Confirmed" if _vcp_d.get("detected") else None,
+                       delta_color="normal" if _vcp_d.get("detected") else "off")
+            _av=_avwap_d.get("avwap"); _avp=_avwap_d.get("pct_above",0)
+            pc2.metric("Anch.VWAP",f'₹{_av:,.1f}' if _av else "—",
+                       delta=f'{_avp:+.1f}%',
+                       delta_color="normal" if _avwap_d.get("price_above") else "inverse")
+            pc3.metric("Fib Pullback",_fibq_d.get("grade","—"),
+                       delta=f'Q:{_fibq_d.get("quality",0)}',
+                       delta_color="normal" if _fibq_d.get("quality",0)>=60 else "off")
+            pc4.metric("Vol Dry-up",f'{"×"*int(_vdu_d.get("intensity",0)) or "—"} ({_vdu_d.get("bars",0)}b)',
+                       delta="Active" if _vdu_d.get("dry_up") else None,
+                       delta_color="normal" if _vdu_d.get("dry_up") else "off")
+            pc5.metric("Rel.Volume",_rvol_d.get("label","—"),
+                       delta=f'{_rvol_d.get("rel_vol_pct",50):.0f}th · {_rvol_d.get("ratio",1):.1f}×',
+                       delta_color="normal" if _rvol_d.get("rel_vol_pct",50)>=65 else "off")
+            _dbrk=_darv_d.get("breakout"); _din=_darv_d.get("in_box")
+            _dtop=_darv_d.get("box_top",0); _dbot=_darv_d.get("box_bottom",0)
+            pc6.metric("Darvas","BREAKOUT" if _dbrk else ("IN BOX" if _din else "—"),
+                       delta=f'₹{_dbot:,.0f}–₹{_dtop:,.0f}' if _dtop else None,
+                       delta_color="normal" if _dbrk else "off")
             st.markdown("---")
             with st.expander("Position Sizing",expanded=True):
                 _acct_size=st.session_state.get("account_size",500000)
