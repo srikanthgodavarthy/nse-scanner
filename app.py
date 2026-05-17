@@ -3857,7 +3857,296 @@ with tab_scanner:
             if signal_is_stale(entry["timestamp"],entry.get("mode",scan_mode_now)):
                 stale_syms.add(entry["symbol"])
 
-        def make_card(i,r,border_color,show_entry=True):
+        # ── Decision synthesis — picks top 3 reasons + 1 watch in plain English ─
+        def _synthesize_reasons(r: dict) -> tuple:
+            """
+            Returns (reasons: list[str], watch: str | None)
+            Each reason is one plain-English sentence drawn from the strongest signal.
+            At most 3 reasons, 1 watch. No jargon codes.
+            """
+            reasons: list = []
+            cautions: list = []
+
+            # ── Bullish signals ranked by conviction ────────────────────────────
+            # MTF alignment
+            if r.get("MTFAligned") and r.get("MTFScore", 50) >= 68:
+                reasons.append(("All 3 timeframes aligned bullish", 100))
+            elif r.get("MTFLabel") == "BULL LEAN":
+                reasons.append(("Momentum building across timeframes", 65))
+
+            # Institutional
+            iv = r.get("InstVerdict","")
+            ic = r.get("InstCMF", 0)
+            if iv == "ACCUMULATION":
+                reasons.append((f"Institutional accumulation (CMF {ic:+.2f})", 95))
+            elif iv == "MILD ACCUM":
+                reasons.append((f"Mild institutional buying (CMF {ic:+.2f})", 60))
+
+            # Squeeze break
+            sqz_b = r.get("SqzBars", 0)
+            if r.get("Squeeze") and sqz_b >= 5:
+                reasons.append((f"{sqz_b}-bar squeeze coiling — breakout likely", 90))
+            elif r.get("Squeeze"):
+                reasons.append(("Volatility squeeze — energy building", 70))
+
+            # Harmonic pattern
+            if r.get("HarmonicDetected"):
+                hp = r.get("HarmonicPattern",""); hq = r.get("HarmonicQuality",0)
+                dl = r.get("DarvasTop") or r.get("HarmonicZone",(0,0))[0]
+                reasons.append((f"{hp} pattern — {hq}% quality", 85))
+
+            # Candle structure
+            cs = r.get("CandleSignal","")
+            cpats = r.get("CandlePatterns",[])
+            if cs == "BULL" and cpats:
+                reasons.append((f"{cpats[0]} candle — bullish reversal signal", 80))
+            elif r.get("NR7"):
+                reasons.append(("NR7 compression — imminent directional move", 75))
+
+            # Darvas breakout
+            if r.get("DarvasBrk"):
+                reasons.append(("Darvas box breakout — institutional trigger", 88))
+
+            # EMA convergence
+            ec = r.get("EMS_EMAConv", 0)
+            if ec >= 11:
+                reasons.append(("EMAs converging — cluster interaction imminent", 72))
+
+            # ATR compression
+            ac = r.get("EMS_ATRComp", 0)
+            if ac >= 15:
+                reasons.append(("ATR at multi-week low — stored energy", 78))
+            elif ac >= 10:
+                reasons.append(("Volatility contracted — low-risk entry window", 60))
+
+            # Volume building
+            vc2 = r.get("EMS_RVOLAcc", 0)
+            if vc2 >= 11:
+                reasons.append(("Volume accumulating steadily before the move", 68))
+
+            # RS acceleration
+            rsa = r.get("EMS_RSAcc", 0)
+            if rsa >= 14:
+                reasons.append(("Relative strength accelerating vs Nifty", 82))
+            elif rsa >= 8:
+                reasons.append(("RS rank rising — outperforming the index", 62))
+
+            # Sector tailwind
+            sm = r.get("EMS_Sector", 0)
+            sec = r.get("Sector","")
+            if sm >= 7:
+                reasons.append((f"{sec} sector leading — rotation tailwind", 74))
+
+            # VCP
+            vg = r.get("VCPGrade","")
+            if vg in ("EXCELLENT","GOOD"):
+                reasons.append((f"VCP {vg.lower()} — classic contraction setup", 83))
+
+            # AVWAP
+            if r.get("AVWAPAbove"):
+                reasons.append(("Holding above anchored VWAP — institutional support", 70))
+
+            # Fib pullback
+            fg = r.get("FibGrade","")
+            if fg in ("EXCELLENT","GOOD"):
+                reasons.append((f"Fibonacci pullback {fg.lower()} — high-quality retracement", 76))
+
+            # 52W high
+            if r.get("Phase") == PHASE_BRK:
+                reasons.append(("Breakout above 52-week resistance", 92))
+
+            # Golden zone
+            if r.get("InGolden"):
+                reasons.append(("In Fibonacci golden zone — key support level", 68))
+
+            # Sort by conviction and take top 3
+            reasons.sort(key=lambda x: x[1], reverse=True)
+            top3 = [txt for txt, _ in reasons[:3]]
+
+            # ── Cautions ─────────────────────────────────────────────────────
+            ext_n  = r.get("ExtN", 0)
+            ext_lb = r.get("ExtLabels", [])
+            rsi_v  = r.get("RSI", 50)
+            if r.get("BreadthGated"):
+                cautions.append(("Market breadth weak — signal capped, smaller size", 100))
+            if ext_n >= 3:
+                cautions.append((f"{ext_lb[0] if ext_lb else 'Exhaustion'} — consider waiting for pullback", 95))
+            elif ext_n == 2:
+                cautions.append((f"{ext_n} exhaustion flags — trim position size", 80))
+            if r.get("MTFDiverge"):
+                cautions.append(("Timeframe divergence — confirm on higher TF first", 85))
+            if rsi_v >= 72:
+                cautions.append((f"RSI {rsi_v:.0f} — extended, prefer pullback entry", 70))
+            if r.get("InstVerdict") in ("DISTRIBUTION","MILD DIST"):
+                cautions.append(("Institutional distribution signs — verify before entry", 75))
+
+            cautions.sort(key=lambda x: x[1], reverse=True)
+            watch = cautions[0][0] if cautions else None
+            return top3, watch
+
+        def make_card(i, r, border_color, show_entry=True):
+            sym    = r["Symbol"]
+            act    = r["Action"]
+            ltp    = r["LTP"]
+            chg    = r["%Change"]
+            score  = r["Score"]
+            phase  = r.get("Phase", PHASE_IDLE)
+            conf   = r.get("Confidence", 0)
+            entry  = r.get("Entry")
+            sl     = r.get("SL")
+            t1     = r.get("T1")
+            t2     = r.get("T2")
+            sector = r.get("Sector", SECTOR_MAP.get(sym,"—"))
+            is_stale = sym in stale_syms
+
+            reasons, watch = _synthesize_reasons(r)
+
+            # ── Colours ─────────────────────────────────────────────────────
+            chg_col  = "#22c55e" if chg >= 0 else "#ef4444"
+            chg_str  = f"+{chg:.2f}%" if chg >= 0 else f"{chg:.2f}%"
+            chg_arr  = "▲" if chg >= 0 else "▼"
+            act_bg, act_brd, act_txt = _action_colors(act)
+            phase_col  = _phase_color(phase)
+            conf_col   = _conf_color(conf)
+            num_bg     = "#22c55e" if act in ("BUY","STRONG BUY") else "#d97706" if act=="WATCH" else "#3a3a60"
+            num_txt    = "#f0fdf4" if act in ("BUY","STRONG BUY") else "#fefce8" if act=="WATCH" else "#c4c6d0"
+            phase_icon = {"BREAKOUT":"🚀","CONT":"↗","ENTRY":"⚡","SETUP":"◎","IDLE":"–","EXIT":"↘"}.get(phase,"")
+            ph_arrow   = get_phase_arrow(sym)
+            conf_dots  = "◆◆◆" if conf>=75 else "◆◆◇" if conf>=50 else "◆◇◇" if conf>=25 else "◇◇◇"
+
+            def _p(v):
+                if v is None: return "—"
+                try:    return f"₹{v:,.0f}"
+                except: return "—"
+
+            # ── Trade numbers ────────────────────────────────────────────────
+            risk_pct = reward_pct = rr = None
+            if entry and sl and ltp:
+                ref   = entry if (show_entry and entry != ltp) else ltp
+                risk  = ref - sl
+                if risk > 0:
+                    risk_pct   = risk / ref * 100
+                    tgt        = t2 or t1
+                    if tgt:
+                        reward_pct = (tgt - ref) / ref * 100
+                        rr         = reward_pct / risk_pct
+
+            entry_str  = _p(entry) if (show_entry and entry and entry != ltp) else _p(ltp)
+            risk_str   = f"−{risk_pct:.1f}%" if risk_pct else "—"
+            rwd_str    = f"+{reward_pct:.1f}%" if reward_pct else "—"
+            rr_str     = f"{rr:.1f}×" if rr else "—"
+            rr_col     = "#22c55e" if (rr and rr>=2) else "#f59e0b" if (rr and rr>=1.5) else "#94a3b8"
+
+            # ── Reason bullets ────────────────────────────────────────────────
+            reasons_html = "".join(
+                f'<div style="display:flex;align-items:flex-start;gap:6px;'
+                f'margin-bottom:5px;">'
+                f'<span style="color:#22c55e;margin-top:1px;flex-shrink:0;">●</span>'
+                f'<span style="color:#cbd5e1;font-size:11px;line-height:1.4;">{txt}</span>'
+                f'</div>'
+                for txt in reasons
+            ) if reasons else (
+                '<div style="color:#475569;font-size:11px;">—</div>'
+            )
+
+            watch_html = (
+                f'<div style="display:flex;align-items:flex-start;gap:6px;margin-top:2px;">'
+                f'<span style="color:#f59e0b;flex-shrink:0;font-size:11px;">⚠</span>'
+                f'<span style="color:#94a3b8;font-size:11px;line-height:1.4;">{watch}</span>'
+                f'</div>'
+            ) if watch else ""
+
+            stale_pip = (' <span style="color:#64748b;font-size:9px;">⏱ stale</span>'
+                         if is_stale else "")
+
+            ems_v = r.get("EMS", 0)
+            ems_c = r.get("EMSColor","#334155")
+            ems_bar = (
+                f'<div style="margin-top:8px;padding-top:8px;border-top:1px solid #1e1e40;">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;">'
+                f'<span style="color:#64748b;font-size:9px;letter-spacing:.06em;">EMERGING PRESSURE</span>'
+                f'<span style="color:{ems_c};font-size:9px;font-family:JetBrains Mono,monospace;font-weight:600;">'
+                f'{r.get("EMSLabel","—")} {ems_v:.0f}</span></div>'
+                f'<div style="background:#1e1e40;border-radius:2px;height:3px;">'
+                f'<div style="width:{min(int(ems_v),100)}%;background:{ems_c};height:3px;border-radius:2px;"></div>'
+                f'</div></div>'
+            ) if phase in (PHASE_SETUP, PHASE_IDLE) and ems_v >= 45 else ""
+
+            return (
+                # ── Card shell ──────────────────────────────────────────────
+                f'<div style="background:#0f0f1c;border:1px solid {border_color};border-radius:14px;'
+                f'overflow:hidden;width:400px;min-width:360px;max-width:420px;flex:1 1 400px;'
+                f'display:flex;flex-direction:column;">'
+
+                # ── Header ──────────────────────────────────────────────────
+                f'<div style="display:flex;align-items:center;padding:10px 14px 9px;'
+                f'border-bottom:1px solid #1a1a2e;gap:8px;background:#0b0b16;">'
+                f'<div style="background:{num_bg};color:{num_txt};font-family:JetBrains Mono,monospace;'
+                f'font-size:11px;font-weight:700;padding:3px 7px;border-radius:5px;'
+                f'min-width:26px;text-align:center;flex-shrink:0;">{i+1:02d}</div>'
+                f'<div style="flex:1;min-width:0;">'
+                f'<div style="font-family:Syne,sans-serif;color:#f0f4ff;font-size:16px;'
+                f'font-weight:700;letter-spacing:-.02em;">{sym}{stale_pip}</div>'
+                f'<div style="color:#475569;font-size:9px;margin-top:1px;'
+                f'font-family:Inter,sans-serif;">{sector}'
+                f' &nbsp;·&nbsp; '
+                f'<span style="color:{phase_col};">{phase_icon} {phase}'
+                f'{(" " + ph_arrow) if ph_arrow else ""}</span></div>'
+                f'</div>'
+                f'<span style="background:{act_bg};border:1px solid {act_brd};color:{act_txt};'
+                f'padding:4px 10px;border-radius:6px;font-size:10px;font-weight:700;'
+                f'font-family:DM Sans,sans-serif;flex-shrink:0;">{act}</span>'
+                f'</div>'
+
+                # ── Price + confidence ───────────────────────────────────────
+                f'<div style="padding:10px 14px 8px;border-bottom:1px solid #1a1a2e;'
+                f'display:flex;align-items:center;justify-content:space-between;">'
+                f'<div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#f0f4ff;'
+                f'font-size:22px;font-weight:600;line-height:1;">₹{ltp:,.2f}</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:{chg_col};'
+                f'font-size:12px;margin-top:3px;">{chg_str} {chg_arr}</div>'
+                f'</div>'
+                f'<div style="text-align:right;">'
+                f'<div style="color:{conf_col};font-family:JetBrains Mono,monospace;'
+                f'font-size:16px;letter-spacing:.08em;">{conf_dots}</div>'
+                f'<div style="color:#475569;font-size:9px;margin-top:2px;">Score {score:.0f} / 100</div>'
+                f'</div>'
+                f'</div>'
+
+                # ── Trade setup ─────────────────────────────────────────────
+                f'<div style="padding:10px 14px;border-bottom:1px solid #1a1a2e;">'
+                f'<div style="color:#475569;font-size:8px;letter-spacing:.1em;'
+                f'text-transform:uppercase;margin-bottom:6px;">Trade Setup</div>'
+                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;">'
+                f'<div style="background:#111128;border-radius:6px;padding:6px 8px;">'
+                f'<div style="color:#64748b;font-size:8px;text-transform:uppercase;letter-spacing:.06em;">Entry</div>'
+                f'<div style="color:#f0f4ff;font-family:JetBrains Mono,monospace;font-size:12px;font-weight:600;margin-top:2px;">{entry_str}</div>'
+                f'</div>'
+                f'<div style="background:#111128;border-radius:6px;padding:6px 8px;">'
+                f'<div style="color:#64748b;font-size:8px;text-transform:uppercase;letter-spacing:.06em;">Stop</div>'
+                f'<div style="color:#ef4444;font-family:JetBrains Mono,monospace;font-size:12px;font-weight:600;margin-top:2px;">{_p(sl)}</div>'
+                f'<div style="color:#ef444488;font-size:9px;">{risk_str}</div>'
+                f'</div>'
+                f'<div style="background:#111128;border-radius:6px;padding:6px 8px;">'
+                f'<div style="color:#64748b;font-size:8px;text-transform:uppercase;letter-spacing:.06em;">Target</div>'
+                f'<div style="color:#22c55e;font-family:JetBrains Mono,monospace;font-size:12px;font-weight:600;margin-top:2px;">{_p(t2 or t1)}</div>'
+                f'<div style="color:{rr_col};font-size:9px;">{rwd_str} &nbsp; R:R {rr_str}</div>'
+                f'</div>'
+                f'</div>'
+                f'</div>'
+
+                # ── Why now ─────────────────────────────────────────────────
+                f'<div style="padding:10px 14px;flex:1;">'
+                f'<div style="color:#475569;font-size:8px;letter-spacing:.1em;'
+                f'text-transform:uppercase;margin-bottom:7px;">Why Now</div>'
+                + reasons_html
+                + watch_html
+                + ems_bar
+                + f'</div>'
+
+                f'</div>'   # card close
+            )
             sym=r["Symbol"]; act=r["Action"]; ltp=r["LTP"]; chg=r["%Change"]
             score=r["Score"]; phase=r.get("Phase",PHASE_IDLE); conf=r.get("Confidence",0)
             rsi_val=r.get("RSI","—"); rs_rank=r.get("RS_Rank",50)
