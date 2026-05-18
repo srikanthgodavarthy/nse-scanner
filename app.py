@@ -5262,7 +5262,7 @@ with tab_scanner:
             return (
                 f'<div style="background:#07101e;border:1px solid {border_color};'
                 f'border-top:3px solid {border_color};border-radius:10px;'
-                f'overflow:hidden;width:300px;min-width:270px;max-width:320px;flex:1 1 300px;">'
+                f'overflow:hidden;min-width:210px;max-width:300px;flex:1 1 210px;">'
 
                 # ── Header: symbol · phase · action ──────────────────────────
                 f'<div style="display:flex;align-items:center;padding:9px 12px 8px;'
@@ -5333,11 +5333,10 @@ with tab_scanner:
                 f'<div style="background:{rr_col};width:{rr_bar_pct}%;height:3px;border-radius:2px;"></div></div>'
                 f'</div></div>'
 
-                # ── Why Now signals ───────────────────────────────────────────
-                f'<div style="padding:7px 12px 5px;border-bottom:1px solid #1e2a3a;">'
-                f'<div style="color:#334155;font-size:7.5px;letter-spacing:.08em;text-transform:uppercase;margin-bottom:5px;">Why now</div>'
-                + sig_rows + caution_html +
-                f'</div>'
+                # ── Caution alert only (RSI extended, etc.) ──────────────────
+                + (f'<div style="padding:3px 12px 2px;border-top:1px solid #1e2a3a;">'
+                   + caution_html
+                   + f'</div>' if caution else '')
 
                 # ── Intelligence grid ─────────────────────────────────────────
                 + intel_grid
@@ -5501,7 +5500,7 @@ with tab_scanner:
 
             return (
                 f'<div style="background:#0e0e1c;border:1.5px solid {em_c}55;border-radius:12px;'
-                f'overflow:hidden;width:300px;min-width:260px;max-width:320px;flex:1 1 300px;">'
+                f'overflow:hidden;min-width:210px;max-width:300px;flex:1 1 210px;">'
                 # ── Header: symbol + dual score chips + phase/action ──────────
                 f'<div style="background:{em_bg};border-bottom:1px solid {em_c}33;padding:8px 12px 7px;'
                 f'display:flex;align-items:center;gap:8px;">'
@@ -5718,7 +5717,7 @@ with tab_scanner:
                                    f'EXT {sr.ext_n} — short fuel</span>') if sr.ext_n>=2 else ""
                         sh_cards+=(
                             f'<div style="background:#1b1113;border:1px solid {vc}55;border-radius:12px;'
-                            f'overflow:hidden;width:360px;min-width:320px;max-width:380px;flex:1 1 360px;">'
+                            f'overflow:hidden;min-width:240px;max-width:340px;flex:1 1 240px;">'
                             f'<div style="display:flex;align-items:center;padding:12px 16px 10px;'
                             f'border-bottom:1px solid rgba(255,255,255,0.08);gap:10px;">'
                             f'<div style="background:{vc}22;color:{vc};font-family:JetBrains Mono,monospace;'
@@ -6182,7 +6181,7 @@ with tab_portfolio:
                        f'<span style="font-family:JetBrains Mono,monospace;color:#f59e0b;font-size:12px;font-weight:600;">₹{trail_sl:,.2f}</span></div>'
                        ) if trail_sl else ""
             st.markdown(
-                f'<div style="background:#111120;border:1.5px solid {vc};border-radius:12px;overflow:hidden;margin-bottom:12px;">'
+                f'<div style="background:#111120;border:1.5px solid {vc};border-radius:12px;overflow:hidden;min-width:220px;max-width:320px;flex:1 1 220px;margin-bottom:12px;">'
                 f'<div style="display:flex;justify-content:space-between;align-items:center;padding:11px 14px 9px;'
                 f'border-bottom:1px solid #1e1e40;background:#0e0e1c;">'
                 f'<div><span style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:15px;font-weight:700;">{sym}</span>'
