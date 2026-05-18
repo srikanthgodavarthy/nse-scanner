@@ -5127,7 +5127,7 @@ with tab_scanner:
                 risk = ref - sl
                 if risk > 0:
                     risk_pct = risk / ref * 100
-                    tgt = t2 or t1
+                    tgt = t1  # T1 is the first real target; R:R based on that
                     if tgt:
                         reward_pct = (tgt - ref) / ref * 100
                         rr = reward_pct / risk_pct
@@ -5225,9 +5225,9 @@ with tab_scanner:
                 )
 
             intel_grid = (
-                f'<div style="padding:6px 10px 7px;border-top:1px solid #1e2a3a;">'
-                f'<div style="color:#334155;font-size:7.5px;letter-spacing:.08em;text-transform:uppercase;margin-bottom:5px;">Intelligence</div>'
-                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;">'
+                f'<div style="padding:5px 8px 6px;border-top:1px solid #1e2a3a;">'
+                f'<div style="color:#334155;font-size:7px;letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px;">Intelligence</div>'
+                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:3px;">'
                 + _icell("Smart $", sm_short,  sm_c,   dim=(sm_verdict=="NEUTRAL"))
                 + _icell("Stage",   as_disp,   as_c,   dim=(accum_stage=="NONE"))
                 + _icell("RS Lead", rl_short,  rl_c,   dim=(rl_label=="NEUTRAL"))
@@ -5247,15 +5247,15 @@ with tab_scanner:
             c_adx_val = r.get("ADX", "—")
             conf_metrics_grid = (
                 f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;'
-                f'gap:0;padding:6px 12px;border-top:1px solid #1e2a3a;">'
-                f'<div><div style="color:#475569;font-size:8px;">RSI</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{c_rsi_val}</div></div>'
-                f'<div><div style="color:#475569;font-size:8px;">RS RNK</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{c_rs_rank}</div></div>'
-                f'<div><div style="color:#475569;font-size:8px;">ATR</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{c_atr_val}</div></div>'
-                f'<div><div style="color:#475569;font-size:8px;">ADX</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{c_adx_val}</div></div>'
+                f'gap:0;padding:4px 10px;border-top:1px solid #1e2a3a;">'
+                f'<div><div style="color:#475569;font-size:7.5px;">RSI</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:10px;font-weight:600;">{c_rsi_val}</div></div>'
+                f'<div><div style="color:#475569;font-size:7.5px;">RS RNK</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:10px;font-weight:600;">{c_rs_rank}</div></div>'
+                f'<div><div style="color:#475569;font-size:7.5px;">ATR</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:10px;font-weight:600;">{c_atr_val}</div></div>'
+                f'<div><div style="color:#475569;font-size:7.5px;">ADX</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:10px;font-weight:600;">{c_adx_val}</div></div>'
                 f'</div>'
             )
 
@@ -5281,57 +5281,46 @@ with tab_scanner:
                 f'padding:3px 9px;border-radius:5px;font-size:10px;font-weight:700;">{act}</span>'
                 f'</div>'
 
-                # ── Price row + score ─────────────────────────────────────────
+                # ── Price + score (compact) ───────────────────────────────────
                 f'<div style="display:flex;align-items:center;justify-content:space-between;'
-                f'padding:8px 12px;border-bottom:1px solid #1e2a3a;">'
+                f'padding:6px 12px;border-bottom:1px solid #1e2a3a;">'
                 f'<div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#f8fafc;font-size:20px;font-weight:700;line-height:1;">₹{ltp:,.2f}</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:{chg_col};font-size:10px;margin-top:3px;">{chg_arr} {chg_str}</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#f8fafc;font-size:18px;font-weight:700;line-height:1;">₹{ltp:,.2f}</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:{chg_col};font-size:9px;margin-top:2px;">{chg_arr} {chg_str}</div>'
                 f'</div>'
                 f'<div style="text-align:right;">'
-                f'<div style="color:{score_col};font-family:JetBrains Mono,monospace;font-size:22px;font-weight:700;line-height:1;">{score:.0f}</div>'
-                f'<div style="color:#475569;font-size:8px;margin-top:2px;">score / 100</div>'
-                f'<div style="background:#1e2a3a;border-radius:2px;width:60px;height:3px;margin-top:4px;margin-left:auto;">'
-                f'<div style="background:{score_col};width:{min(int(score),100)}%;height:3px;border-radius:2px;"></div></div>'
-                f'<div style="color:{conf_col};font-size:8px;margin-top:2px;">{conf}% confidence</div>'
+                f'<div style="color:{score_col};font-family:JetBrains Mono,monospace;font-size:20px;font-weight:700;line-height:1;">{score:.0f}</div>'
+                f'<div style="color:{conf_col};font-size:8px;margin-top:1px;">{conf}% conf</div>'
                 f'</div></div>'
 
-                # ── Trade plan: entry → stop → target ────────────────────────
-                f'<div style="background:#050d18;border-bottom:1px solid #1e2a3a;">'
-                f'<div style="padding:5px 12px 3px;">'
-                f'<div style="color:#334155;font-size:7.5px;letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px;">Trade plan</div>'
-                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;">'
-
-                # Entry cell
-                f'<div style="background:#0f1e30;border-radius:6px 0 0 6px;padding:6px 8px;">'
-                f'<div style="color:#64748b;font-size:7.5px;text-transform:uppercase;letter-spacing:.05em;">Buy around</div>'
-                f'<div style="color:#e2e8f0;font-family:JetBrains Mono,monospace;font-size:11px;font-weight:700;margin-top:1px;">{entry_disp}</div>'
-                f'<div style="color:#334155;font-size:8px;margin-top:1px;">entry zone</div>'
+                # ── Compact trade strip: entry · SL · T1 · R:R · T2 T3 ────────
+                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;'
+                f'gap:1px;background:#1e2a3a;border-bottom:1px solid #1e2a3a;">'
+                f'<div style="background:#050d18;padding:5px 8px;">'
+                f'<div style="color:#475569;font-size:7.5px;">ENTRY</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#e2e8f0;font-size:10px;font-weight:700;">{entry_disp}</div>'
                 f'</div>'
-
-                # Stop cell
-                f'<div style="background:#1a0f0f;border-radius:0;padding:6px 8px;">'
-                f'<div style="color:#64748b;font-size:7.5px;text-transform:uppercase;letter-spacing:.05em;">Exit if wrong</div>'
-                f'<div style="color:#f87171;font-family:JetBrains Mono,monospace;font-size:11px;font-weight:700;margin-top:1px;">{_p(sl)}</div>'
-                f'<div style="color:#7f1d1d;font-size:8px;margin-top:1px;">{"−"+str(round(risk_pct,1))+"% risk" if risk_pct else "stop loss"}</div>'
+                f'<div style="background:#0e0808;padding:5px 8px;">'
+                f'<div style="color:#475569;font-size:7.5px;">SL</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#f87171;font-size:10px;font-weight:700;">{_p(sl)}</div>'
                 f'</div>'
-
-                # Target cell
-                f'<div style="background:#0a1a10;border-radius:0 6px 6px 0;padding:6px 8px;">'
-                f'<div style="color:#64748b;font-size:7.5px;text-transform:uppercase;letter-spacing:.05em;">Take profit</div>'
-                f'<div style="color:#4ade80;font-family:JetBrains Mono,monospace;font-size:11px;font-weight:700;margin-top:1px;">{_p(t2 or t1)}</div>'
-                f'<div style="color:{rr_col};font-size:8px;font-weight:600;margin-top:1px;">R:R = {rr_str}</div>'
-                f'</div></div>'
-
-                # All targets row
-                f'<div style="display:flex;gap:8px;padding:4px 8px 6px;align-items:center;">'
-                f'<span style="color:#334155;font-size:8px;flex-shrink:0;">All targets →</span>'
-                f'<span style="color:#86efac;font-family:JetBrains Mono,monospace;font-size:9px;">{_p(t1)}</span>'
-                f'<span style="color:#4ade80;font-family:JetBrains Mono,monospace;font-size:9px;font-weight:600;">{_p(t2)}</span>'
-                f'<span style="color:#22c55e;font-family:JetBrains Mono,monospace;font-size:9px;">{_p(t3)}</span>'
-                f'<div style="flex:1;background:#1e2a3a;border-radius:2px;height:3px;margin-left:4px;">'
-                f'<div style="background:{rr_col};width:{rr_bar_pct}%;height:3px;border-radius:2px;"></div></div>'
-                f'</div></div></div>'
+                f'<div style="background:#07120a;padding:5px 8px;">'
+                f'<div style="color:#475569;font-size:7.5px;">T1</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#4ade80;font-size:10px;font-weight:700;">{_p(t1)}</div>'
+                f'</div>'
+                f'<div style="background:#050d18;padding:5px 8px;">'
+                f'<div style="color:#475569;font-size:7.5px;">R:R</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:{rr_col};font-size:10px;font-weight:700;">{rr_str}</div>'
+                f'</div>'
+                f'</div>'
+                # T2 / T3 as small chips if present
+                + (f'<div style="display:flex;gap:6px;padding:4px 10px;border-bottom:1px solid #1e2a3a;background:#050d18;">'
+                   f'<span style="color:#334155;font-size:8px;align-self:center;">ext →</span>'
+                   + (f'<span style="background:#07120a;border:1px solid #14532d44;color:#86efac;font-family:JetBrains Mono,monospace;font-size:9px;padding:1px 6px;border-radius:3px;">T2 {_p(t2)}</span>' if t2 else '')
+                   + (f'<span style="background:#07120a;border:1px solid #14532d33;color:#4ade80;font-family:JetBrains Mono,monospace;font-size:9px;padding:1px 6px;border-radius:3px;">T3 {_p(t3)}</span>' if t3 else '')
+                   + f'<div style="flex:1;background:#1e2a3a;border-radius:2px;height:2px;align-self:center;margin-left:4px;">'
+                   f'<div style="background:{rr_col};width:{min(int((rr/3)*100),100) if rr else 0}%;height:2px;border-radius:2px;"></div></div>'
+                   f'</div>' if (t2 or t3) else '')
 
                 # ── Caution alert only (RSI extended, etc.) ──────────────────
                 + (f'<div style="padding:3px 12px 2px;border-top:1px solid #1e2a3a;">'
