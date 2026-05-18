@@ -5098,61 +5098,64 @@ with tab_scanner:
             return None
 
         def make_card(i, r, border_color, show_entry=True):
-            sym=r["Symbol"]; act=r["Action"]; ltp=r["LTP"]; chg=r["%Change"]
-            score=r["Score"]; phase=r.get("Phase",PHASE_IDLE); conf=r.get("Confidence",0)
-            entry=r.get("Entry"); sl=r.get("SL"); t1=r.get("T1"); t2=r.get("T2"); t3=r.get("T3")
-            ext_n=r.get("ExtN",0); ext_labels=r.get("ExtLabels",[])
-            sector=r.get("Sector",SECTOR_MAP.get(sym,"—"))
-            is_stale=sym in stale_syms
-            adx_val=r.get("ADX",0); squeeze=r.get("Squeeze",False); vol_ratio=r.get("VolRatio",1.0)
-            # ── computed values shared across both sections ────────────────────
-            chg_str=f"+{chg:.2f}%" if chg>=0 else f"{chg:.2f}%"
-            chg_col="#22c55e" if chg>=0 else "#ef4444"
-            act_bg,act_brd,act_txt=_action_colors(act)
-            phase_col=_phase_color(phase)
-            conf_col=_conf_color(conf)
-            phase_icon={"BREAKOUT":"🚀","CONT":"↗","ENTRY":"⚡","SETUP":"◎","IDLE":"–","EXIT":"↘"}.get(phase,"")
-            ph_arrow=get_phase_arrow(sym)
-            num_bg="#22c55e" if act in ("BUY","STRONG BUY") else "#f59e0b" if act=="PRE-CONFIRM" else "#d97706" if act=="WATCH" else "#3a3a60"
-            num_txt="#064e3b" if act in ("BUY","STRONG BUY") else "#1a0a00" if act=="PRE-CONFIRM" else "#431407" if act=="WATCH" else "#c4c6d0"
-            score_col="#f59e0b" if act=="STRONG BUY" else "#22c55e" if act in ("BUY","PRE-CONFIRM") else "#3b82f6"
+            sym   = r["Symbol"]; act = r["Action"]; ltp = r["LTP"]; chg = r["%Change"]
+            score = r["Score"];  phase = r.get("Phase", PHASE_IDLE); conf = r.get("Confidence", 0)
+            entry = r.get("Entry"); sl = r.get("SL"); t1 = r.get("T1"); t2 = r.get("T2"); t3 = r.get("T3")
+            ext_n = r.get("ExtN", 0); ext_labels = r.get("ExtLabels", [])
+            sector = r.get("Sector", SECTOR_MAP.get(sym, "—"))
+            is_stale = sym in stale_syms
+
+            # ── Derived values ────────────────────────────────────────────────
+            chg_str = f"+{chg:.2f}%" if chg >= 0 else f"{chg:.2f}%"
+            chg_col = "#22c55e" if chg >= 0 else "#ef4444"
+            chg_arr = "▲" if chg >= 0 else "▼"
+            act_bg, act_brd, act_txt = _action_colors(act)
+            phase_col = _phase_color(phase)
+            conf_col  = _conf_color(conf)
+            phase_icon = {"BREAKOUT":"🚀","CONT":"↗","ENTRY":"⚡","SETUP":"◎","IDLE":"–","EXIT":"↘"}.get(phase,"")
+            ph_arrow   = get_phase_arrow(sym)
+            score_col  = "#f59e0b" if act == "STRONG BUY" else "#22c55e" if act in ("BUY","PRE-CONFIRM") else "#3b82f6"
+
             def _p(v):
                 if v is None: return "—"
                 try: return f"₹{int(round(v)):,}"
                 except: return "—"
-            ref = entry if (show_entry and entry and entry!=ltp) else ltp
+
+            ref = entry if (show_entry and entry and entry != ltp) else ltp
             risk_pct = reward_pct = rr = None
             if ref and sl:
-                risk = ref-sl
-                if risk>0:
-                    risk_pct = risk/ref*100
+                risk = ref - sl
+                if risk > 0:
+                    risk_pct = risk / ref * 100
                     tgt = t2 or t1
                     if tgt:
-                        reward_pct = (tgt-ref)/ref*100
-                        rr = reward_pct/risk_pct
-            rr_col="#22c55e" if (rr and rr>=2) else "#f59e0b" if (rr and rr>=1.5) else "#475569"
-            rr_str=f"{rr:.1f}×" if rr else "—"
-            entry_disp = f"₹{entry:,.0f}" if (show_entry and entry and entry!=ltp) else f"₹{ltp:,.2f}"
+                        reward_pct = (tgt - ref) / ref * 100
+                        rr = reward_pct / risk_pct
+            rr_col = "#22c55e" if (rr and rr >= 2) else "#f59e0b" if (rr and rr >= 1.5) else "#64748b"
+            rr_str = f"{rr:.1f}×" if rr else "—"
+            entry_disp = f"₹{entry:,.0f}" if (show_entry and entry and entry != ltp) else f"₹{ltp:,.2f}"
+
             stale_dot = ' <span style="color:#475569;font-size:9px;">⏱</span>' if is_stale else ""
-            # earnings badge
-            ed = st.session_state.get("earnings_map",{}).get(sym)
+            ed = st.session_state.get("earnings_map", {}).get(sym)
             earn_html = (f'<span style="background:#7f1d1d;border:1px solid #ef4444;color:#fca5a5;'
                          f'padding:1px 5px;border-radius:3px;font-size:9px;font-weight:700;margin-left:4px;">'
                          f'⚠ RESULTS {ed}</span>') if ed else ""
-            # unique signal rows
+
+            # ── Why Now signals ───────────────────────────────────────────────
             sigs = _unique_signals(r)
             sig_rows = "".join(
                 f'<div style="display:flex;align-items:center;justify-content:space-between;'
-                f'padding:4px 0;border-bottom:1px solid #0c1222;">'
-                f'<span style="color:#475569;font-family:JetBrains Mono,monospace;font-size:9px;'
+                f'padding:4px 0;border-bottom:1px solid #12182a;">'
+                f'<span style="color:#94a3b8;font-family:JetBrains Mono,monospace;font-size:9px;'
                 f'width:90px;flex-shrink:0;">{s["label"]}</span>'
-                f'<div style="flex:1;margin:0 6px;background:#0c1222;border-radius:2px;height:3px;">'
+                f'<div style="flex:1;margin:0 6px;background:#12182a;border-radius:2px;height:3px;">'
                 f'<div style="background:{s["color"]};width:{min(s["rank"],100)}%;height:3px;border-radius:2px;"></div></div>'
                 f'<span style="color:{s["color"]};font-family:JetBrains Mono,monospace;font-size:9px;'
                 f'font-weight:600;text-align:right;min-width:70px;">{s["value"]}</span>'
                 f'</div>'
                 for s in sigs
-            ) if sigs else '<div style="color:#1e293b;font-size:9px;padding:4px 0;">No dominant signals</div>'
+            ) if sigs else '<div style="color:#334155;font-size:9px;padding:4px 0;">No dominant signals</div>'
+
             caution = _caution_line(r)
             caution_html = (
                 f'<div style="display:flex;gap:4px;align-items:flex-start;'
@@ -5160,79 +5163,169 @@ with tab_scanner:
                 f'<span style="color:#f59e0b;font-size:9px;flex-shrink:0;">⚠</span>'
                 f'<span style="color:#fbbf24;font-size:9px;">{caution}</span></div>'
             ) if caution else ""
-            # exhaustion strip
+
+            # ── Exhaustion warning ────────────────────────────────────────────
             ext_html = ""
-            if ext_n>0:
-                ec="#fca5a5" if ext_n>=3 else "#fbbf24"
-                eb="#3b1a0a" if ext_n>=3 else "#2a1e00"
-                pills="  ".join(f'⚠ {lb}' for lb in ext_labels[:2])
-                ext_html=(f'<div style="padding:3px 10px;background:{eb};'
-                          f'border-top:1px solid #1e293b;">'
-                          f'<span style="color:{ec};font-size:9px;">{pills}</span></div>')
+            if ext_n > 0:
+                ec = "#fca5a5" if ext_n >= 3 else "#fbbf24"
+                eb = "#3b1a0a" if ext_n >= 3 else "#2a1e00"
+                skip_warn = " — SKIP ENTRY" if ext_n >= 3 else " — reduce size"
+                pills = "  ".join(f'⚠ {lb}' for lb in ext_labels[:2])
+                ext_html = (f'<div style="padding:4px 12px;background:{eb};border-top:1px solid #1e293b;">'
+                            f'<span style="color:{ec};font-size:9px;">{pills}{skip_warn}</span></div>')
+
+            # ── Intelligence grid (same 3×2 as emerging cards) ────────────────
+            sm_verdict = r.get("SmartMoneyVerdict","NEUTRAL")
+            sm_c_map   = {"MARKUP_READY":"#f59e0b","ACCUMULATING":"#22c55e",
+                          "ABSORBING":"#38bdf8","NEUTRAL":"#64748b","DISTRIBUTING":"#ef4444"}
+            sm_c     = sm_c_map.get(sm_verdict,"#64748b")
+            sm_short = {"MARKUP_READY":"MKUP▲","ACCUMULATING":"ACCUM","ABSORBING":"ABSO",
+                        "NEUTRAL":"NEUT","DISTRIBUTING":"DIST▼"}.get(sm_verdict, sm_verdict[:5])
+
+            accum_stage = r.get("AccumStage","NONE")
+            as_c_map = {"NONE":"#374151","1A":"#64748b","1B":"#38bdf8","1C":"#a78bfa","2A":"#22c55e","2B":"#f59e0b"}
+            as_c    = as_c_map.get(accum_stage,"#374151")
+            as_disp = "—" if accum_stage == "NONE" else f"Stage {accum_stage}"
+
+            rl_label = r.get("RSLeaderLabel","NEUTRAL")
+            rl_c_map = {"LEADER":"#f59e0b","IMPROVING":"#22c55e","NEUTRAL":"#64748b","LAGGARD":"#ef4444"}
+            rl_c     = rl_c_map.get(rl_label,"#64748b")
+            rl_short = {"LEADER":"LEADER","IMPROVING":"IMPRV↑","NEUTRAL":"NEUT","LAGGARD":"LAGGARD"}.get(rl_label, rl_label)
+
+            micro_lbl = r.get("MicroLabel","NEUTRAL_FLOW")
+            mf_c_map  = {"STRONG_BUY_FLOW":"#22c55e","BUY_FLOW":"#86efac",
+                         "NEUTRAL_FLOW":"#64748b","SELL_FLOW":"#fca5a5","STRONG_SELL_FLOW":"#ef4444"}
+            mf_c     = mf_c_map.get(micro_lbl,"#64748b")
+            mf_short = {"STRONG_BUY_FLOW":"↑↑ BUY","BUY_FLOW":"↑ BUY",
+                        "NEUTRAL_FLOW":"~ NEUT","SELL_FLOW":"↓ SELL",
+                        "STRONG_SELL_FLOW":"↓↓ SELL"}.get(micro_lbl,"~")
+
+            mtf_lbl   = r.get("MTFLabel","NEUTRAL")
+            mtf_c_map = {"BULL SYNC":"#22c55e","BULL LEAN":"#86efac","BEAR SYNC":"#ef4444",
+                         "BEAR LEAN":"#fca5a5","DIVERGE":"#f59e0b"}
+            mtf_c     = mtf_c_map.get(mtf_lbl,"#475569")
+            mtf_short = {"BULL SYNC":"BULL⚡","BULL LEAN":"BULL~","BEAR SYNC":"BEAR⚡",
+                         "BEAR LEAN":"BEAR~","DIVERGE":"DIVG"}.get(mtf_lbl,"NEUT")
+
+            inst_lbl   = r.get("InstLabel","INST~")
+            inst_c_map = {"INST↑":"#22c55e","INST↓":"#ef4444","INST~":"#475569"}
+            inst_c     = inst_c_map.get(inst_lbl,"#475569")
+            inst_short = {"INST↑":"↑ BUY","INST↓":"↓ SELL","INST~":"~ NEUT"}.get(inst_lbl,"~")
+
+            def _icell(label, value, color, dim=False):
+                bg  = f"{color}18" if not dim else "#37415118"
+                brd = f"{color}40" if not dim else "#37415130"
+                vc  = f"{color}cc" if not dim else "#47556955"
+                return (
+                    f'<div style="background:{bg};border:1px solid {brd};border-radius:6px;padding:4px 6px;min-width:0;">'
+                    f'<div style="color:#475569;font-size:7.5px;letter-spacing:.05em;text-transform:uppercase;margin-bottom:2px;">{label}</div>'
+                    f'<div style="color:{vc};font-family:JetBrains Mono,monospace;font-size:10px;font-weight:700;'
+                    f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{value}</div>'
+                    f'</div>'
+                )
+
+            intel_grid = (
+                f'<div style="padding:6px 10px 7px;border-top:1px solid #1e2a3a;">'
+                f'<div style="color:#334155;font-size:7.5px;letter-spacing:.08em;text-transform:uppercase;margin-bottom:5px;">Intelligence</div>'
+                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;">'
+                + _icell("Smart $", sm_short,  sm_c,   dim=(sm_verdict=="NEUTRAL"))
+                + _icell("Stage",   as_disp,   as_c,   dim=(accum_stage=="NONE"))
+                + _icell("RS Lead", rl_short,  rl_c,   dim=(rl_label=="NEUTRAL"))
+                + _icell("Flow",    mf_short,  mf_c,   dim=(micro_lbl=="NEUTRAL_FLOW"))
+                + _icell("MTF",     mtf_short, mtf_c,  dim=(mtf_lbl not in mtf_c_map))
+                + _icell("Inst",    inst_short, inst_c, dim=(inst_lbl=="INST~"))
+                + f'</div></div>'
+            )
+
+            # ── R:R visual bar ────────────────────────────────────────────────
+            rr_bar_pct = min(int((rr / 4) * 100), 100) if rr else 0
 
             return (
-                f'<div style="background:#080d16;border:1px solid {border_color};'
-                f'border-top:2px solid {border_color};border-radius:8px;'
-                f'overflow:hidden;width:340px;min-width:310px;max-width:360px;flex:1 1 340px;">'
-                # Header
-                f'<div style="display:flex;align-items:center;padding:9px 11px 7px;'
-                f'gap:7px;background:#0b1120;border-bottom:1px solid #0c1222;">'
-                f'<div style="background:{num_bg};color:{num_txt};font-family:JetBrains Mono,monospace;'
-                f'font-size:11px;font-weight:700;padding:2px 6px;border-radius:4px;'
-                f'min-width:24px;text-align:center;flex-shrink:0;">{i+1:02d}</div>'
+                f'<div style="background:#07101e;border:1px solid {border_color};'
+                f'border-top:3px solid {border_color};border-radius:10px;'
+                f'overflow:hidden;width:300px;min-width:270px;max-width:320px;flex:1 1 300px;">'
+
+                # ── Header: symbol · phase · action ──────────────────────────
+                f'<div style="display:flex;align-items:center;padding:9px 12px 8px;'
+                f'gap:7px;background:#0b1422;border-bottom:1px solid #1e2a3a;">'
                 f'<div style="flex:1;min-width:0;">'
-                f'<div style="display:flex;align-items:center;gap:4px;">'
-                f'<span style="font-family:Syne,sans-serif;color:#f1f5f9;font-size:14px;'
-                f'font-weight:700;letter-spacing:-.01em;">{sym}</span>{stale_dot}{earn_html}</div>'
-                f'<div style="display:flex;align-items:center;gap:4px;margin-top:2px;">'
-                f'<span style="background:{phase_col}18;color:{phase_col};font-size:9px;'
-                f'font-weight:600;padding:1px 5px;border-radius:3px;">'
+                f'<div style="display:flex;align-items:center;gap:5px;">'
+                f'<span style="font-family:Syne,sans-serif;color:#f1f5f9;font-size:15px;font-weight:700;">{sym}</span>'
+                f'{stale_dot}{earn_html}</div>'
+                f'<div style="display:flex;align-items:center;gap:4px;margin-top:3px;">'
+                f'<span style="background:{phase_col}20;color:{phase_col};font-size:9px;font-weight:600;'
+                f'padding:1px 6px;border-radius:3px;border:1px solid {phase_col}40;">'
                 f'{phase_icon} {phase}{(" "+ph_arrow) if ph_arrow else ""}</span>'
-                f'<span style="color:#1e293b;font-size:9px;">{sector}</span></div></div>'
+                f'<span style="color:#475569;font-size:9px;">{sector}</span>'
+                f'</div></div>'
                 f'<span style="background:{act_bg};border:1px solid {act_brd};color:{act_txt};'
-                f'padding:2px 7px;border-radius:4px;font-size:9px;font-weight:700;flex-shrink:0;">{act}</span>'
+                f'padding:3px 9px;border-radius:5px;font-size:10px;font-weight:700;">{act}</span>'
                 f'</div>'
-                # Price + score
+
+                # ── Price row + score ─────────────────────────────────────────
                 f'<div style="display:flex;align-items:center;justify-content:space-between;'
-                f'padding:7px 11px;border-bottom:1px solid #0c1222;">'
+                f'padding:8px 12px;border-bottom:1px solid #1e2a3a;">'
                 f'<div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#f8fafc;'
-                f'font-size:19px;font-weight:700;line-height:1;">₹{ltp:,.2f}</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:{chg_col};'
-                f'font-size:10px;margin-top:2px;">{chg_str}</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#f8fafc;font-size:20px;font-weight:700;line-height:1;">₹{ltp:,.2f}</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:{chg_col};font-size:10px;margin-top:3px;">{chg_arr} {chg_str}</div>'
                 f'</div>'
                 f'<div style="text-align:right;">'
-                f'<div style="background:#0c1222;border-radius:2px;width:72px;height:3px;'
-                f'margin-bottom:3px;margin-left:auto;">'
+                f'<div style="color:{score_col};font-family:JetBrains Mono,monospace;font-size:22px;font-weight:700;line-height:1;">{score:.0f}</div>'
+                f'<div style="color:#475569;font-size:8px;margin-top:2px;">score / 100</div>'
+                f'<div style="background:#1e2a3a;border-radius:2px;width:60px;height:3px;margin-top:4px;margin-left:auto;">'
                 f'<div style="background:{score_col};width:{min(int(score),100)}%;height:3px;border-radius:2px;"></div></div>'
-                f'<div style="color:{score_col};font-family:JetBrains Mono,monospace;'
-                f'font-size:14px;font-weight:700;">{score:.0f}</div>'
-                f'<div style="color:{conf_col};font-size:9px;">{conf}% conf</div>'
+                f'<div style="color:{conf_col};font-size:8px;margin-top:2px;">{conf}% confidence</div>'
                 f'</div></div>'
-                # Trade levels (compact grid)
-                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;'
-                f'background:#0c1222;border-bottom:1px solid #0c1222;">'
-                f'<div style="background:#080d16;padding:5px 9px;">'
-                f'<div style="color:#1e293b;font-size:8px;text-transform:uppercase;">Entry</div>'
-                f'<div style="color:#e2e8f0;font-family:JetBrains Mono,monospace;font-size:10px;font-weight:600;">{entry_disp}</div>'
+
+                # ── Trade plan: entry → stop → target ────────────────────────
+                f'<div style="background:#050d18;border-bottom:1px solid #1e2a3a;">'
+                f'<div style="padding:5px 12px 3px;">'
+                f'<div style="color:#334155;font-size:7.5px;letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px;">Trade plan</div>'
+                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;">'
+
+                # Entry cell
+                f'<div style="background:#0f1e30;border-radius:6px 0 0 6px;padding:6px 8px;">'
+                f'<div style="color:#64748b;font-size:7.5px;text-transform:uppercase;letter-spacing:.05em;">Buy around</div>'
+                f'<div style="color:#e2e8f0;font-family:JetBrains Mono,monospace;font-size:11px;font-weight:700;margin-top:1px;">{entry_disp}</div>'
+                f'<div style="color:#334155;font-size:8px;margin-top:1px;">entry zone</div>'
                 f'</div>'
-                f'<div style="background:#080d16;padding:5px 9px;">'
-                f'<div style="color:#1e293b;font-size:8px;text-transform:uppercase;">Stop</div>'
-                f'<div style="color:#f87171;font-family:JetBrains Mono,monospace;font-size:10px;font-weight:600;">{_p(sl)}</div>'
-                f'<div style="color:#7f1d1d;font-size:8px;">{"−"+str(round(risk_pct,1))+"%" if risk_pct else "—"}</div>'
+
+                # Stop cell
+                f'<div style="background:#1a0f0f;border-radius:0;padding:6px 8px;">'
+                f'<div style="color:#64748b;font-size:7.5px;text-transform:uppercase;letter-spacing:.05em;">Exit if wrong</div>'
+                f'<div style="color:#f87171;font-family:JetBrains Mono,monospace;font-size:11px;font-weight:700;margin-top:1px;">{_p(sl)}</div>'
+                f'<div style="color:#7f1d1d;font-size:8px;margin-top:1px;">{"−"+str(round(risk_pct,1))+"% risk" if risk_pct else "stop loss"}</div>'
                 f'</div>'
-                f'<div style="background:#080d16;padding:5px 9px;">'
-                f'<div style="color:#1e293b;font-size:8px;text-transform:uppercase;">Target</div>'
-                f'<div style="color:#4ade80;font-family:JetBrains Mono,monospace;font-size:10px;font-weight:600;">{_p(t2 or t1)}</div>'
-                f'<div style="color:{rr_col};font-size:8px;">R:R {rr_str}</div>'
+
+                # Target cell
+                f'<div style="background:#0a1a10;border-radius:0 6px 6px 0;padding:6px 8px;">'
+                f'<div style="color:#64748b;font-size:7.5px;text-transform:uppercase;letter-spacing:.05em;">Take profit</div>'
+                f'<div style="color:#4ade80;font-family:JetBrains Mono,monospace;font-size:11px;font-weight:700;margin-top:1px;">{_p(t2 or t1)}</div>'
+                f'<div style="color:{rr_col};font-size:8px;font-weight:600;margin-top:1px;">R:R = {rr_str}</div>'
                 f'</div></div>'
-                # Signals section
-                f'<div style="padding:7px 11px 5px;">'
-                f'<div style="color:#1e293b;font-size:8px;letter-spacing:.1em;'
-                f'text-transform:uppercase;margin-bottom:5px;">WHY NOW</div>'
+
+                # All targets row
+                f'<div style="display:flex;gap:8px;padding:4px 8px 6px;align-items:center;">'
+                f'<span style="color:#334155;font-size:8px;flex-shrink:0;">All targets →</span>'
+                f'<span style="color:#86efac;font-family:JetBrains Mono,monospace;font-size:9px;">{_p(t1)}</span>'
+                f'<span style="color:#4ade80;font-family:JetBrains Mono,monospace;font-size:9px;font-weight:600;">{_p(t2)}</span>'
+                f'<span style="color:#22c55e;font-family:JetBrains Mono,monospace;font-size:9px;">{_p(t3)}</span>'
+                f'<div style="flex:1;background:#1e2a3a;border-radius:2px;height:3px;margin-left:4px;">'
+                f'<div style="background:{rr_col};width:{rr_bar_pct}%;height:3px;border-radius:2px;"></div></div>'
+                f'</div></div>'
+
+                # ── Why Now signals ───────────────────────────────────────────
+                f'<div style="padding:7px 12px 5px;border-bottom:1px solid #1e2a3a;">'
+                f'<div style="color:#334155;font-size:7.5px;letter-spacing:.08em;text-transform:uppercase;margin-bottom:5px;">Why now</div>'
                 + sig_rows + caution_html +
                 f'</div>'
+
+                # ── Intelligence grid ─────────────────────────────────────────
+                + intel_grid
+
+                # ── Exhaustion warning ────────────────────────────────────────
                 + ext_html +
+
                 f'</div>'
             )
 
@@ -5284,67 +5377,88 @@ with tab_scanner:
             phase_col = _phase_color(phase)
             act_bg, act_brd, act_txt = _action_colors(act)
 
-            # ── Badges (squeeze / vol-contraction / MTF / inst) ──────────────
+            # ── Squeeze / Vol-Contraction strip (price-area only) ─────────────
             sqz_badge = ('<span style="background:#8b5cf622;border:1px solid #8b5cf655;color:#a78bfa;'
                          'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">🔄 SQZ</span>'
                          if r.get("Squeeze") else "")
             vc_badge  = ('<span style="background:#0ea5e922;border:1px solid #0ea5e955;color:#38bdf8;'
                          'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">VC</span>'
                          if r.get("VolRatio", 1.0) < 0.75 else "")
-            mtf_lbl   = r.get("MTFLabel","NEUTRAL")
-            mtf_c_map = {"BULL SYNC":"#22c55e","BULL LEAN":"#86efac","BEAR SYNC":"#ef4444",
-                         "BEAR LEAN":"#fca5a5","DIVERGE":"#f59e0b"}
-            mtf_badge = ""
-            if mtf_lbl in mtf_c_map:
-                mc = mtf_c_map[mtf_lbl]
-                mtf_badge = (f'<span style="background:{mc}22;border:1px solid {mc}55;color:{mc};'
-                             f'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">'
-                             f'MTF·{mtf_lbl}</span>')
-            inst_lbl  = r.get("InstLabel","INST~")
-            inst_c_map = {"INST↑":"#22c55e","INST↓":"#ef4444"}
-            inst_badge = ""
-            if inst_lbl in inst_c_map:
-                ic = inst_c_map[inst_lbl]
-                inst_badge = (f'<span style="background:{ic}22;border:1px solid {ic}55;color:{ic};'
-                              f'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">'
-                              f'{inst_lbl}</span>')
 
-            # ── v15.7 intelligence badges (SM · Stage · RS · Flow) ────────────
+            # ── Resolve all 6 intelligence signal values + colors ─────────────
+            # Smart Money
             sm_verdict = r.get("SmartMoneyVerdict","NEUTRAL")
-            sm_c_map = {"MARKUP_READY":"#f59e0b","ACCUMULATING":"#22c55e",
-                        "ABSORBING":"#38bdf8","NEUTRAL":"#64748b","DISTRIBUTING":"#ef4444"}
-            sm_c = sm_c_map.get(sm_verdict,"#64748b")
-            sm_badge = (f'<span style="background:{sm_c}22;border:1px solid {sm_c}55;color:{sm_c};'
-                        f'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">'
-                        f'SM·{sm_verdict[:4]}</span>')
+            sm_c_map   = {"MARKUP_READY":"#f59e0b","ACCUMULATING":"#22c55e",
+                          "ABSORBING":"#38bdf8","NEUTRAL":"#64748b","DISTRIBUTING":"#ef4444"}
+            sm_c       = sm_c_map.get(sm_verdict,"#64748b")
+            sm_short   = {"MARKUP_READY":"MKUP▲","ACCUMULATING":"ACCUM","ABSORBING":"ABSO",
+                          "NEUTRAL":"NEUT","DISTRIBUTING":"DIST▼"}.get(sm_verdict, sm_verdict[:5])
 
+            # Accumulation Stage
             accum_stage = r.get("AccumStage","NONE")
-            as_c_map = {"NONE":"#374151","1A":"#64748b","1B":"#38bdf8",
-                        "1C":"#a78bfa","2A":"#22c55e","2B":"#f59e0b"}
-            as_c = as_c_map.get(accum_stage,"#374151")
-            accum_badge = "" if accum_stage == "NONE" else (
-                f'<span style="background:{as_c}22;border:1px solid {as_c}55;color:{as_c};'
-                f'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">'
-                f'Stage {accum_stage}</span>'
-            )
+            as_c_map    = {"NONE":"#374151","1A":"#64748b","1B":"#38bdf8",
+                           "1C":"#a78bfa","2A":"#22c55e","2B":"#f59e0b"}
+            as_c        = as_c_map.get(accum_stage,"#374151")
+            as_disp     = "—" if accum_stage == "NONE" else f"Stage {accum_stage}"
 
+            # RS Leadership
             rl_label = r.get("RSLeaderLabel","NEUTRAL")
             rl_c_map = {"LEADER":"#f59e0b","IMPROVING":"#22c55e","NEUTRAL":"#64748b","LAGGARD":"#ef4444"}
-            rl_c = rl_c_map.get(rl_label,"#64748b")
-            rs_lead_badge = (f'<span style="background:{rl_c}22;border:1px solid {rl_c}55;color:{rl_c};'
-                             f'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">'
-                             f'RS·{rl_label[:4]}</span>')
+            rl_c     = rl_c_map.get(rl_label,"#64748b")
+            rl_short = {"LEADER":"LEADER","IMPROVING":"IMPRV↑","NEUTRAL":"NEUT","LAGGARD":"LAGGARD"}.get(rl_label,rl_label)
 
+            # Microstructure Flow
             micro_lbl = r.get("MicroLabel","NEUTRAL_FLOW")
             mf_c_map  = {"STRONG_BUY_FLOW":"#22c55e","BUY_FLOW":"#86efac",
                          "NEUTRAL_FLOW":"#64748b","SELL_FLOW":"#fca5a5","STRONG_SELL_FLOW":"#ef4444"}
-            mf_c = mf_c_map.get(micro_lbl,"#64748b")
-            mf_short = {"STRONG_BUY_FLOW":"↑↑FLOW","BUY_FLOW":"↑FLOW",
-                        "NEUTRAL_FLOW":"~FLOW","SELL_FLOW":"↓FLOW",
-                        "STRONG_SELL_FLOW":"↓↓FLOW"}.get(micro_lbl,"~")
-            micro_badge = (f'<span style="background:{mf_c}22;border:1px solid {mf_c}55;color:{mf_c};'
-                           f'padding:1px 5px;border-radius:3px;font-size:9px;">'
-                           f'{mf_short}</span>')
+            mf_c      = mf_c_map.get(micro_lbl,"#64748b")
+            mf_short  = {"STRONG_BUY_FLOW":"↑↑ BUY","BUY_FLOW":"↑ BUY",
+                         "NEUTRAL_FLOW":"~ NEUT","SELL_FLOW":"↓ SELL",
+                         "STRONG_SELL_FLOW":"↓↓ SELL"}.get(micro_lbl,"~")
+
+            # MTF Alignment
+            mtf_lbl   = r.get("MTFLabel","NEUTRAL")
+            mtf_c_map = {"BULL SYNC":"#22c55e","BULL LEAN":"#86efac","BEAR SYNC":"#ef4444",
+                         "BEAR LEAN":"#fca5a5","DIVERGE":"#f59e0b"}
+            mtf_c     = mtf_c_map.get(mtf_lbl,"#475569")
+            mtf_short = {"BULL SYNC":"BULL⚡","BULL LEAN":"BULL~","BEAR SYNC":"BEAR⚡",
+                         "BEAR LEAN":"BEAR~","DIVERGE":"DIVG"}.get(mtf_lbl,"NEUT")
+
+            # Institutional Activity
+            inst_lbl   = r.get("InstLabel","INST~")
+            inst_c_map = {"INST↑":"#22c55e","INST↓":"#ef4444","INST~":"#475569"}
+            inst_c     = inst_c_map.get(inst_lbl,"#475569")
+            inst_short = {"INST↑":"↑ BUY","INST↓":"↓ SELL","INST~":"~ NEUT"}.get(inst_lbl,"~")
+
+            # ── Unified 3×2 intelligence grid ─────────────────────────────────
+            def _intel_cell(label, value, color, dim=False):
+                val_opacity = "55" if dim else "cc"
+                bg = f"{color}18" if not dim else "#37415118"
+                brd = f"{color}40" if not dim else "#37415130"
+                return (
+                    f'<div style="background:{bg};border:1px solid {brd};border-radius:6px;'
+                    f'padding:4px 6px;min-width:0;">'
+                    f'<div style="color:#475569;font-size:7.5px;letter-spacing:.05em;'
+                    f'text-transform:uppercase;margin-bottom:2px;">{label}</div>'
+                    f'<div style="color:{color}{val_opacity};font-family:JetBrains Mono,monospace;'
+                    f'font-size:10px;font-weight:700;white-space:nowrap;overflow:hidden;'
+                    f'text-overflow:ellipsis;">{value}</div>'
+                    f'</div>'
+                )
+
+            intel_grid = (
+                f'<div style="padding:6px 10px 7px;border-top:1px solid #1e1e40;">'
+                f'<div style="color:#334155;font-size:7.5px;letter-spacing:.08em;'
+                f'text-transform:uppercase;margin-bottom:5px;">Intelligence</div>'
+                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;">'
+                + _intel_cell("Smart $", sm_short, sm_c, dim=(sm_verdict=="NEUTRAL"))
+                + _intel_cell("Stage",   as_disp,  as_c, dim=(accum_stage=="NONE"))
+                + _intel_cell("RS Lead", rl_short,  rl_c, dim=(rl_label=="NEUTRAL"))
+                + _intel_cell("Flow",    mf_short,  mf_c, dim=(micro_lbl=="NEUTRAL_FLOW"))
+                + _intel_cell("MTF",     mtf_short, mtf_c, dim=(mtf_lbl not in mtf_c_map))
+                + _intel_cell("Inst",    inst_short, inst_c, dim=(inst_lbl=="INST~"))
+                + f'</div></div>'
+            )
 
             # ── Compact 4-cell metrics grid (RSI · RS Rank · ATR · ADX) ───────
             rsi_val = r.get("RSI","—"); rs_rank = r.get("RS_Rank", 50)
@@ -5386,15 +5500,14 @@ with tab_scanner:
                 f'<span style="background:{act_bg};border:1px solid {act_brd};color:{act_txt};'
                 f'padding:1px 5px;border-radius:3px;font-size:9px;font-weight:600;">{act}</span>'
                 f'</div></div></div>'
-                # ── Price row + auxiliary badges ───────────────────────────────
+                # ── Price row + SQZ/VC strip ───────────────────────────────────
                 f'<div style="padding:8px 12px 5px;display:flex;justify-content:space-between;align-items:center;">'
                 f'<div>'
                 f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:18px;font-weight:600;">₹{ltp:,.2f}</div>'
                 f'<div style="font-family:JetBrains Mono,monospace;color:{chg_col};font-size:10px;">{chg_arr} {chg_str}</div>'
                 f'</div>'
-                f'<div style="text-align:right;">'
-                f'{sqz_badge}{vc_badge}{mtf_badge}{inst_badge}'
-                f'</div></div>'
+                f'<div style="text-align:right;">{sqz_badge}{vc_badge}</div>'
+                f'</div>'
                 # ── Readiness bar ──────────────────────────────────────────────
                 f'<div style="padding:2px 12px 6px;">'
                 f'<div style="display:flex;justify-content:space-between;margin-bottom:2px;">'
@@ -5405,17 +5518,16 @@ with tab_scanner:
                 f'<div style="background:linear-gradient(90deg,{em_c},{pca_c});'
                 f'width:{min(readiness,100):.0f}%;height:5px;border-radius:3px;"></div></div></div>'
                 # ── Compact metrics grid ───────────────────────────────────────
-                + metrics_grid +
-                # ── Intelligence row: SM · Stage · RS · Flow ──────────────────
-                f'<div style="padding:5px 12px 6px;border-top:1px solid #1e1e40;'
-                f'display:flex;flex-wrap:wrap;gap:3px;align-items:center;">'
-                f'{sm_badge}{accum_badge}{rs_lead_badge}{micro_badge}'
-                f'</div>'
-                # ── Footer: SL ─────────────────────────────────────────────────
+                + metrics_grid
+                # ── 3×2 Intelligence grid ─────────────────────────────────────
+                + intel_grid +
+                # ── Footer: SL + stage label ───────────────────────────────────
                 f'<div style="background:#07070f;border-top:1px solid #1e1e40;padding:5px 12px;'
                 f'display:flex;justify-content:space-between;align-items:center;">'
-                f'<span style="color:#475569;font-size:9px;font-family:JetBrains Mono,monospace;">'
-                f'SL ₹{r.get("SL",0):,.0f}</span>'
+                f'<div>'
+                f'<div style="color:#334155;font-size:7.5px;text-transform:uppercase;letter-spacing:.05em;">If it breaks down, exit at</div>'
+                f'<div style="color:#f87171;font-family:JetBrains Mono,monospace;font-size:10px;font-weight:600;">SL ₹{r.get("SL",0):,.0f}</div>'
+                f'</div>'
                 f'<span style="color:{em_c};font-size:9px;font-weight:600;">'
                 f'{lbl} · {pca_lbl}</span>'
                 f'</div>'
