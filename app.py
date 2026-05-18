@@ -4033,45 +4033,45 @@ def run_scan(symbols, mode, progress_bar, status_text,
                            else "QUIET")
     # ─────────────────────────────────────────────────────────────────────────
 
-    # ── v15.7: Post-hoc cross-field enrichment ────────────────────────────
-    # Now that PCA, Em, AccumSeq, SmartMoney are all computed, fill the
-    # fields that depend on each other (circular dependencies resolved here).
-    _sec_avg_2 = breadth_pulse.get("sector_avg", {})
-    _ovl_avg_2 = float(np.mean(list(_sec_avg_2.values()))) if _sec_avg_2 else 50.0
+    # ── v15.9: Post-hoc cross-field enrichment — single-pass, cached lookups ──
+    # Resolves circular dependencies: PCA→SmartMoney→AccumSeq→RSLead→PRE-CONFIRM
+    # Each function called ONCE per stock with real values. No duplicate calls.
+    _sec_avg_2  = breadth_pulse.get("sector_avg", {})
+    _ovl_avg_2  = float(np.mean(list(_sec_avg_2.values()))) if _sec_avg_2 else 50.0
+    _vd_cache   = valid_data  # already in memory — no re-fetch needed
 
     for _res in results:
+        _sym  = _res.get("Symbol", "")
         _pca  = _res.get("PCAScore", 0.0)
         _em   = _res.get("EmScore",  0.0)
         _ph   = _res.get("Phase",    PHASE_IDLE)
         _sec  = _res.get("Sector",   "Other")
         _sec_score = _sec_avg_2.get(_sec, _ovl_avg_2)
+        # Retrieve df once — used by all three re-computations below
+        _df   = _vd_cache.get(_sym, pd.DataFrame())
 
-        # ── Re-compute SmartMoney with real PCA score ──────────────────────
+        # Step 1: SmartMoney (needs real PCA)
         _sm = compute_smart_money_model(
-            valid_data.get(_res.get("Symbol",""), pd.DataFrame()),
-            mode,
+            _df, mode,
             pca_score  = _pca,
             inst_score = _res.get("InstScore", 50.0),
             obv_trend  = _res.get("InstOBV",   True),
         )
         _res.update(_sm)
 
-        # ── Re-compute AccumSequence with real PCA + Em + SmartMoney ──────
-        _rl_high = _res.get("RSLineHigh", False)
+        # Step 2: AccumSequence (needs real PCA + Em + SmartMoney from Step 1)
         _as = compute_accumulation_sequence(
-            valid_data.get(_res.get("Symbol",""), pd.DataFrame()),
-            mode,
+            _df, mode,
             pca_score           = _pca,
             em_score            = _em,
             phase               = _ph,
             smart_money_verdict = _res.get("SmartMoneyVerdict", "NEUTRAL"),
-            rs_line_high        = _rl_high,
+            rs_line_high        = _res.get("RSLineHigh", False),
         )
         _res.update(_as)
 
-        # ── Re-compute RSLeadership with real sector avg ───────────────────
-        _close_ser = (valid_data[_res["Symbol"]]["Close"]
-                      if _res.get("Symbol") in valid_data else pd.Series(dtype=float))
+        # Step 3: RSLeadership (needs real sector avg — no df re-fetch)
+        _close_ser = _df["Close"] if not _df.empty else pd.Series(dtype=float)
         _rl = compute_rs_leadership(
             close            = _close_ser,
             nifty_close      = nifty,
@@ -4081,16 +4081,16 @@ def run_scan(symbols, mode, progress_bar, status_text,
         )
         _res.update(_rl)
 
-        # ── GAP-5: Apply PRE-CONFIRM action tier ──────────────────────────
+        # Step 4: PRE-CONFIRM action tier (all upstream values now resolved)
         _cur_action = _res.get("Action", "SKIP")
-        if _cur_action not in ("STRONG BUY", "BUY"):   # don't downgrade confirmed signals
+        if _cur_action not in ("STRONG BUY", "BUY"):
             _pc_action = action_label_with_preconfirm(
-                norm_score           = _res.get("Score", 0.0),
-                pca_score            = _pca,
-                em_score             = _em,
-                phase                = _ph,
-                smart_money_verdict  = _res.get("SmartMoneyVerdict", "NEUTRAL"),
-                accum_stage          = _res.get("AccumStage", "NONE"),
+                norm_score          = _res.get("Score", 0.0),
+                pca_score           = _pca,
+                em_score            = _em,
+                phase               = _ph,
+                smart_money_verdict = _res.get("SmartMoneyVerdict", "NEUTRAL"),
+                accum_stage         = _res.get("AccumStage", "NONE"),
             )
             _res["Action"] = _pc_action
 
@@ -4693,7 +4693,7 @@ st.markdown(
     letter-spacing:-1px;color:#e8e8f4;padding:8px 0 4px;">
     <span style="color:#f59e0b;">&#x1F402;</span> BULL SUTRA
     <span style="font-size:13px;color:#cbd5e1;font-family:JetBrains Mono,monospace;
-    font-weight:400;">PRO · v15.7 ⚡</span></div>''',
+    font-weight:400;">PRO · v15.9 ⚡</span></div>''',
     unsafe_allow_html=True,
 )
 
@@ -5077,7 +5077,60 @@ with tab_scanner:
             return None
 
         # ══════════════════════════════════════════════════════════════════════
-        # PHASE-AWARE INTELLIGENCE SYSTEM (v15.7+)
+        # v15.9: HUMAN LABEL TRANSLATIONS
+        # Internal names → plain English shown in every card
+        # ══════════════════════════════════════════════════════════════════════
+        _HUMAN_LABELS = {
+            # Scores
+            "PCAScore":          "Accumulation Strength",
+            "EmScore":           "Momentum Build-Up",
+            "SmartMoneyVerdict": "Institutional Activity",
+            "RSLeaderLabel":     "Market Leadership",
+            "MicroLabel":        "Order Flow",
+            "AccumStage":        "Base Stage",
+            "EmRSAccel":         "Leadership Improving",
+            "EmATRCompress":     "Volatility Tightening",
+            "EmRVolAccel":       "Volume Building",
+            "EmEMAConv":         "Trend Aligning",
+            "EmSqzPressure":     "Coil Pressure",
+            "EmSectorMom":       "Sector Strength",
+            # Verdicts
+            "MARKUP_READY":      "Ready to Run ▲",
+            "ACCUMULATING":      "Institutions Buying",
+            "ABSORBING":         "Buyers Absorbing",
+            "NEUTRAL":           "No Clear Bias",
+            "DISTRIBUTING":      "Selling Pressure ▼",
+            # Stages
+            "NONE":  "No Base",
+            "1A":    "Building Base",
+            "1B":    "Testing Support",
+            "1C":    "Ready to Break Out",
+            "2A":    "Early Uptrend",
+            "2B":    "Trending Up",
+            # RS Leadership
+            "LEADER":    "Market Leader ⭐",
+            "IMPROVING": "Gaining Strength ↑",
+            "LAGGARD":   "Underperforming ↓",
+            # Flow
+            "STRONG_BUY_FLOW":  "Strong Buying",
+            "BUY_FLOW":         "More Buyers",
+            "NEUTRAL_FLOW":     "Balanced",
+            "SELL_FLOW":        "More Sellers",
+            "STRONG_SELL_FLOW": "Heavy Selling",
+            # MTF
+            "BULL SYNC":  "All Timeframes Up ↑",
+            "BULL LEAN":  "Mostly Bullish",
+            "BEAR SYNC":  "All Timeframes Down",
+            "BEAR LEAN":  "Mostly Bearish",
+            "DIVERGE":    "Mixed Signals",
+            # Institutional
+            "INST↑": "Institutions Buying",
+            "INST↓": "Institutions Selling",
+            "INST~": "Neutral",
+        }
+        def _hl(key):
+            """Translate internal key to human label."""
+            return _HUMAN_LABELS.get(key, key)
         # Design: shared core (Price · % chg · Action · Phase · SL) +
         #         dynamic intelligence section swapped per lifecycle group.
         # ══════════════════════════════════════════════════════════════════════
@@ -5109,12 +5162,12 @@ with tab_scanner:
 
         # ── Group meta: label + accent color ──────────────────────────────────
         _UI_GROUP_META = {
-            "ACCUMULATING":      ("🛡 Accumulating",     "#38bdf8"),
-            "EMERGING_MOMENTUM": ("🌱 Emerging Momentum", "#a78bfa"),
-            "BREAKOUT_READY":    ("⚡ Breakout Ready",    "#f59e0b"),
-            "STRONG_BUY":        ("🚀 Strong Buy",        "#22c55e"),
-            "EXTENDED_RISKY":    ("⚠ Extended/Risky",    "#ef4444"),
-            "SHORT_SELL":        ("🔻 Short Sell",        "#cc2244"),
+            "ACCUMULATING":      ("🛡 Quietly Building",     "#38bdf8"),
+            "EMERGING_MOMENTUM": ("🌱 Momentum Building",    "#a78bfa"),
+            "BREAKOUT_READY":    ("⚡ Ready to Enter",       "#f59e0b"),
+            "STRONG_BUY":        ("🚀 Strong Buy Signal",    "#22c55e"),
+            "EXTENDED_RISKY":    ("⚠ Overextended — Caution","#ef4444"),
+            "SHORT_SELL":        ("🔻 Bearish Setup",        "#cc2244"),
         }
 
         def _phase_intel_cell(label, value, color, dim=False):
@@ -5173,12 +5226,12 @@ with tab_scanner:
                 seq_c  = "#22c55e" if aseq >= 60 else "#38bdf8" if aseq >= 35 else "#64748b"
 
                 cells_html = (
-                    _phase_intel_cell("PCA Label",   pca_lbl,                                 pca_c,  dim=pca_lbl=="NONE")
-                    + _phase_intel_cell("Accum Stage", f"{ast} · {ast_lbl[:14]}",             ast_c,  dim=ast=="NONE")
-                    + _phase_intel_cell("Smart Money", smv[:10],                               smv_c,  dim=smv=="DISTRIBUTING")
-                    + _phase_intel_cell("Base Dur",    f"{base_b}d" if base_b else "—",       base_c, dim=base_b < 5)
-                    + _phase_intel_cell("RS Trend",    "Rising" if rs_sl > 0 else ("Flat" if rs_sl == 0 else "Falling"), rs_c, dim=rs_sl <= 0)
-                    + _phase_intel_cell("Seq Score",   f"{aseq:.0f}",                          seq_c,  dim=aseq < 20)
+                    _phase_intel_cell("Buying Pressure", _hl(pca_lbl),                          pca_c,  dim=pca_lbl=="NONE")
+                    + _phase_intel_cell("Base Stage",    _hl(ast),                               ast_c,  dim=ast=="NONE")
+                    + _phase_intel_cell("Big Money",     _hl(smv),                               smv_c,  dim=smv=="DISTRIBUTING")
+                    + _phase_intel_cell("Days in Base",  f"{base_b}d" if base_b else "—",       base_c, dim=base_b < 5)
+                    + _phase_intel_cell("RS Trend",      "Rising ↑" if rs_sl > 0 else ("Flat" if rs_sl == 0 else "Falling ↓"), rs_c, dim=rs_sl <= 0)
+                    + _phase_intel_cell("Setup Quality", f"{aseq:.0f}/100",                      seq_c,  dim=aseq < 20)
                 )
 
             elif group == "EMERGING_MOMENTUM":
@@ -5201,12 +5254,12 @@ with tab_scanner:
                 smv_c  = "#22c55e" if smv in ("ACCUMULATING","MARKUP_READY") else "#38bdf8" if smv=="ABSORBING" else "#64748b"
 
                 cells_html = (
-                    _phase_intel_cell("EM Score",    f"{em_s:.0f}",     em_c,  dim=em_s < 20)
-                    + _phase_intel_cell("PRE-CONFIRM", preconf_val,      pc_c,  dim=act_em != "PRE-CONFIRM")
-                    + _phase_intel_cell("Squeeze",     sqz_val,          sqz_c, dim=not sqz)
-                    + _phase_intel_cell("RS Accel",    f"+{rs_ac:.0f}",  rs_c,  dim=rs_ac < 3)
-                    + _phase_intel_cell("Sector Str",  f"{sec_m:.0f}",   sm_c,  dim=sec_m < 2)
-                    + _phase_intel_cell("Smart Money", smv[:10],         smv_c, dim=smv in ("DISTRIBUTING","NEUTRAL"))
+                    _phase_intel_cell("Momentum Build",  f"{em_s:.0f}/100",  em_c,   dim=em_s < 20)
+                    + _phase_intel_cell("Early Entry",   preconf_val,         pc_c,   dim=act_em != "PRE-CONFIRM")
+                    + _phase_intel_cell("Price Coiling", "Yes 🔄" if sqz else "No",  sqz_c, dim=not sqz)
+                    + _phase_intel_cell("Leadership ↑",  f"+{rs_ac:.0f}",     rs_c,   dim=rs_ac < 3)
+                    + _phase_intel_cell("Sector Boost",  f"{sec_m:.0f}/10",   sm_c,   dim=sec_m < 2)
+                    + _phase_intel_cell("Big Money",     _hl(smv),            smv_c,  dim=smv in ("DISTRIBUTING","NEUTRAL"))
                 )
 
             elif group == "BREAKOUT_READY":
@@ -5229,12 +5282,12 @@ with tab_scanner:
                 brk_c    = "#22c55e" if brk_dist < 1.0 else "#f59e0b" if brk_dist < 3 else "#ef4444"
 
                 cells_html = (
-                    _phase_intel_cell("Entry Trigger", f"₹{entry:,.0f}",                   entry_c, dim=entry == ltp)
-                    + _phase_intel_cell("Vol Confirm",  "YES ✓" if vol_conf else "NO ✗",   vol_c,   dim=not vol_conf)
-                    + _phase_intel_cell("HTF Align",    "Aligned ✓" if htf_up else "Against ✗", htf_c, dim=not htf_up)
-                    + _phase_intel_cell("Risk:Reward",  f"{rr:.1f}×" if rr else "—",       rr_c,    dim=rr < 1)
-                    + _phase_intel_cell("Confidence",   f"{conf}%",                         conf_c,  dim=conf < 40)
-                    + _phase_intel_cell("Brk Dist %",   f"{brk_dist:.1f}% away",            brk_c,   dim=brk_dist > 5)
+                    _phase_intel_cell("Entry Price",   f"₹{entry:,.0f}",                       entry_c, dim=entry == ltp)
+                    + _phase_intel_cell("Volume OK",   "Confirmed ✓" if vol_conf else "Not yet", vol_c,   dim=not vol_conf)
+                    + _phase_intel_cell("Weekly Trend","Aligned ✓" if htf_up else "Against ✗",  htf_c,   dim=not htf_up)
+                    + _phase_intel_cell("Reward:Risk",  f"{rr:.1f}× " + ("✓" if rr>=2 else ""),rr_c,    dim=rr < 1)
+                    + _phase_intel_cell("Confidence",   f"{conf}%",                             conf_c,  dim=conf < 40)
+                    + _phase_intel_cell("Distance",    f"{brk_dist:.1f}% away",                brk_c,   dim=brk_dist > 5)
                 )
 
             elif group == "STRONG_BUY":
@@ -5258,12 +5311,12 @@ with tab_scanner:
                 td_c   = "#22c55e" if trend_up and ema_stk else "#f59e0b" if trend_up else "#ef4444"
 
                 cells_html = (
-                    _phase_intel_cell("Score",        f"{score:.0f}",    sc_c,  dim=score < 50)
-                    + _phase_intel_cell("Confidence",  f"{conf}%",        cf_c,  dim=conf < 40)
-                    + _phase_intel_cell("ADX",         f"{adx:.0f}",      adx_c, dim=adx < 18)
-                    + _phase_intel_cell("RS Rank",     f"{rs_rk}",        rs_c,  dim=rs_rk < 40)
-                    + _phase_intel_cell("Breadth",     "Strong" if not gated else "Gated ⚠", br_c, dim=gated)
-                    + _phase_intel_cell("Trend Phase",  f"{phase_sb} · {trend_desc[:8]}", td_c, dim=not trend_up)
+                    _phase_intel_cell("Signal Score",  f"{score:.0f}/100",  sc_c,  dim=score < 50)
+                    + _phase_intel_cell("Confidence",  f"{conf}%",           cf_c,  dim=conf < 40)
+                    + _phase_intel_cell("Trend Strength",f"{adx:.0f}/100",   adx_c, dim=adx < 18)
+                    + _phase_intel_cell("Market Rank", f"Top {100-rs_rk}%",  rs_c,  dim=rs_rk < 40)
+                    + _phase_intel_cell("Market Mood", "Healthy ✓" if not gated else "Weak ⚠", br_c, dim=gated)
+                    + _phase_intel_cell("Price Phase",  f"{phase_sb} · {trend_desc[:8]}", td_c, dim=not trend_up)
                 )
 
             elif group == "EXTENDED_RISKY":
@@ -5284,12 +5337,12 @@ with tab_scanner:
 
                 ext_tag = " · ".join(ext_lb[:2]) if ext_lb else "—"
                 cells_html = (
-                    _phase_intel_cell("Ext Count",  f"{ext_n} flags",         ex_c,   dim=ext_n < 1)
-                    + _phase_intel_cell("Ext Type",   ext_tag[:14],            ex_c,   dim=ext_n < 1)
-                    + _phase_intel_cell("RSI Stretch", f"{rsi:.0f}",           rsi_c,  dim=rsi < 65)
-                    + _phase_intel_cell("Vol Climax",  f"RVOL {rvol:.1f}x",    rv_c,   dim=rvol < 1.5)
-                    + _phase_intel_cell("Dist EMA",    f"{dist_em:.1f}% ext",  dist_c, dim=dist_em < 8)
-                    + _phase_intel_cell("ATR Expan",   f"{atr:.2f}" if atr else "—", "#f59e0b", dim=not atr)
+                    _phase_intel_cell("Warning Count", f"{ext_n} signals",      ex_c,   dim=ext_n < 1)
+                    + _phase_intel_cell("Warning Type", ext_tag[:14],            ex_c,   dim=ext_n < 1)
+                    + _phase_intel_cell("Overbought",   f"RSI {rsi:.0f}",        rsi_c,  dim=rsi < 65)
+                    + _phase_intel_cell("Vol Spike",    f"{rvol:.1f}× avg",      rv_c,   dim=rvol < 1.5)
+                    + _phase_intel_cell("Extended %",   f"{dist_em:.1f}% above", dist_c, dim=dist_em < 8)
+                    + _phase_intel_cell("Volatility",   f"{atr:.2f}" if atr else "—", "#f59e0b", dim=not atr)
                 )
 
             elif group == "SHORT_SELL":
@@ -5310,12 +5363,12 @@ with tab_scanner:
                 mtf_c  = "#cc2244" if mtf_s <= 38 else "#f59e0b" if mtf_s <= 48 else "#64748b"
 
                 cells_html = (
-                    _phase_intel_cell("Short Score", f"{ss_s:.0f}",           ss_c, dim=ss_s < 25)
-                    + _phase_intel_cell("Short Sig",   ss_v[:8],              ss_c, dim=ss_s < 25)
-                    + _phase_intel_cell("RSI Weak",    f"{rsi:.0f}",          rsi_c, dim=rsi > 55)
-                    + _phase_intel_cell("RS Rank",     f"{rs_rk}",            rs_c, dim=rs_rk >= 50)
-                    + _phase_intel_cell("MTF Bear",    f"{mtf_s:.0f}",        mtf_c, dim=mtf_s > 50)
-                    + _phase_intel_cell("SM Dist",     sm_v[:8],              sm_c, dim=sm_v != "DISTRIBUTING")
+                    _phase_intel_cell("Short Score",   f"{ss_s:.0f}/100",    ss_c,  dim=ss_s < 25)
+                    + _phase_intel_cell("Short Signal",  ss_v[:8],            ss_c,  dim=ss_s < 25)
+                    + _phase_intel_cell("Momentum Weak", f"RSI {rsi:.0f}",    rsi_c, dim=rsi > 55)
+                    + _phase_intel_cell("Market Rank",   f"Bottom {rs_rk}%",  rs_c,  dim=rs_rk >= 50)
+                    + _phase_intel_cell("Bear Timeframes",f"{mtf_s:.0f}/100", mtf_c, dim=mtf_s > 50)
+                    + _phase_intel_cell("Institutions",  _hl(sm_v)[:14],      sm_c,  dim=sm_v != "DISTRIBUTING")
                 )
 
             return (
@@ -5498,18 +5551,15 @@ with tab_scanner:
                    f'<div style="background:{rr_col};width:{min(int((rr/3)*100),100) if rr else 0}%;height:2px;border-radius:2px;"></div></div>'
                    f'</div>' if (t2 or t3) else '')
 
-                # ── Caution alert only (RSI extended, etc.) ──────────────────
+                # ── Caution alert ─────────────────────────────────────────────
                 + (f'<div style="padding:3px 12px 2px;border-top:1px solid #1e2a3a;">'
                    + caution_html
                    + f'</div>' if caution else '')
 
-                # ── Intelligence grid ─────────────────────────────────────────
+                # ── Phase-aware intelligence (ONLY relevant signals) ──────────
                 + intel_grid
 
-                # ── Compact metrics strip (RSI · RS RNK · ATR · ADX) ─────────
-                + conf_metrics_grid
-
-                # ── Exhaustion warning ────────────────────────────────────────
+                # ── Exhaustion warning (prominent at bottom) ──────────────────
                 + ext_html +
 
                 f'</div>'
