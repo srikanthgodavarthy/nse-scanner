@@ -5240,6 +5240,25 @@ with tab_scanner:
             # ── R:R visual bar ────────────────────────────────────────────────
             rr_bar_pct = min(int((rr / 4) * 100), 100) if rr else 0
 
+            # ── Compact metrics strip (RSI · RS RNK · ATR · ADX) ─────────────
+            c_rsi_val = r.get("RSI", "—")
+            c_rs_rank = r.get("RS_Rank", 50)
+            c_atr_val = r.get("ATR", "—")
+            c_adx_val = r.get("ADX", "—")
+            conf_metrics_grid = (
+                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;'
+                f'gap:0;padding:6px 12px;border-top:1px solid #1e2a3a;">'
+                f'<div><div style="color:#475569;font-size:8px;">RSI</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{c_rsi_val}</div></div>'
+                f'<div><div style="color:#475569;font-size:8px;">RS RNK</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{c_rs_rank}</div></div>'
+                f'<div><div style="color:#475569;font-size:8px;">ATR</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{c_atr_val}</div></div>'
+                f'<div><div style="color:#475569;font-size:8px;">ADX</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{c_adx_val}</div></div>'
+                f'</div>'
+            )
+
             return (
                 f'<div style="background:#07101e;border:1px solid {border_color};'
                 f'border-top:3px solid {border_color};border-radius:10px;'
@@ -5322,6 +5341,9 @@ with tab_scanner:
 
                 # ── Intelligence grid ─────────────────────────────────────────
                 + intel_grid
+
+                # ── Compact metrics strip (RSI · RS RNK · ATR · ADX) ─────────
+                + conf_metrics_grid
 
                 # ── Exhaustion warning ────────────────────────────────────────
                 + ext_html +
