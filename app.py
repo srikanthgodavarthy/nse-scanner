@@ -5154,114 +5154,116 @@ with tab_scanner:
             cells_html = ""
 
             if group == "ACCUMULATING":
-                # ── Accumulating: buying pressure + base-building quality ──────
-                pca_s  = r.get("PCAScore", 0)
-                vol_r  = r.get("VolRatio", 1.0)
-                cmf    = r.get("CMF", r.get("InstCMF", 0))
-                sqz_b  = r.get("SqzBars", 0)
-                fbkd   = r.get("SMAbsorptionScore", r.get("PCAScore", 0)) * 0.3
-                base_b = r.get("AccumBarsInBase", 0)
-                rs_sl  = r.get("RSLineSlope", r.get("EmRSAccel", 0))
-                atr_cm = r.get("EmATRCompress", 0)
+                # ── Accumulating: base quality — hide ADX/ATR/Confidence/RSI ──────
+                pca_s   = r.get("PCAScore", 0)
+                pca_lbl = r.get("PCALabel", "NONE")
+                ast     = r.get("AccumStage", "NONE")
+                ast_lbl = r.get("AccumStageLabel", "No base detected")
+                smv     = r.get("SmartMoneyVerdict", "NEUTRAL")
+                base_b  = r.get("AccumBarsInBase", 0)
+                rs_sl   = r.get("RSLineSlope", r.get("EmRSAccel", 0))
+                aseq    = r.get("AccumSequenceScore", 0)
 
-                pca_c  = "#22c55e" if pca_s >= 55 else "#38bdf8" if pca_s >= 35 else "#64748b"
-                vol_c  = "#22c55e" if vol_r < 0.65 else "#38bdf8" if vol_r < 0.80 else "#64748b"
-                cmf_c  = "#22c55e" if cmf > 0.05 else "#ef4444" if cmf < -0.05 else "#64748b"
-                rs_c   = "#22c55e" if rs_sl > 0 else "#ef4444" if rs_sl < 0 else "#64748b"
-                atr_c  = "#22c55e" if atr_cm > 8 else "#38bdf8" if atr_cm > 4 else "#64748b"
+                pca_c  = {"ACCUMULATING":"#22c55e","BUILDING":"#38bdf8","FORMING":"#a78bfa",
+                           "WEAK":"#64748b","NONE":"#374151"}.get(pca_lbl,"#374151")
+                ast_c  = "#22c55e" if ast in ("2A","2B") else "#38bdf8" if ast in ("1B","1C") else "#f59e0b" if ast == "1A" else "#374151"
+                smv_c  = "#22c55e" if smv in ("ACCUMULATING","MARKUP_READY") else "#38bdf8" if smv=="ABSORBING" else "#ef4444" if smv=="DISTRIBUTING" else "#64748b"
                 base_c = "#f59e0b" if base_b >= 20 else "#38bdf8" if base_b >= 10 else "#64748b"
+                rs_c   = "#22c55e" if rs_sl > 0 else "#ef4444" if rs_sl < 0 else "#64748b"
+                seq_c  = "#22c55e" if aseq >= 60 else "#38bdf8" if aseq >= 35 else "#64748b"
 
                 cells_html = (
-                    _phase_intel_cell("PCA Score",   f"{pca_s:.0f}",           pca_c,  dim=pca_s < 25)
-                    + _phase_intel_cell("Vol Cmprss", f"{(1-min(vol_r,1))*100:.0f}% tight", vol_c, dim=vol_r > 0.9)
-                    + _phase_intel_cell("CMF/OBV",   f"{cmf:+.3f}",           cmf_c,  dim=abs(cmf) < 0.02)
-                    + _phase_intel_cell("NR Persist", f"{sqz_b}d sqz" if sqz_b else "—", "#a78bfa", dim=sqz_b < 3)
-                    + _phase_intel_cell("RS Improv",  "Rising" if rs_sl > 0 else "Flat" if rs_sl == 0 else "Falling", rs_c, dim=rs_sl <= 0)
-                    + _phase_intel_cell("Base Dur",   f"{base_b}d" if base_b else "—", base_c, dim=base_b < 5)
+                    _phase_intel_cell("PCA Label",   pca_lbl,                                 pca_c,  dim=pca_lbl=="NONE")
+                    + _phase_intel_cell("Accum Stage", f"{ast} · {ast_lbl[:14]}",             ast_c,  dim=ast=="NONE")
+                    + _phase_intel_cell("Smart Money", smv[:10],                               smv_c,  dim=smv=="DISTRIBUTING")
+                    + _phase_intel_cell("Base Dur",    f"{base_b}d" if base_b else "—",       base_c, dim=base_b < 5)
+                    + _phase_intel_cell("RS Trend",    "Rising" if rs_sl > 0 else ("Flat" if rs_sl == 0 else "Falling"), rs_c, dim=rs_sl <= 0)
+                    + _phase_intel_cell("Seq Score",   f"{aseq:.0f}",                          seq_c,  dim=aseq < 20)
                 )
 
             elif group == "EMERGING_MOMENTUM":
-                # ── Emerging: coil mechanics surfacing before breakout ─────────
+                # ── Emerging: coil mechanics — hide ADX/ATR/T1/T2/T3 ─────────────
                 em_s   = r.get("EmScore", 0)
+                act_em = r.get("Action", "SKIP")
+                sqz    = r.get("Squeeze", False)
                 rs_ac  = r.get("EmRSAccel", 0)
-                rv_ac  = r.get("EmRVolAccel", 0)
-                ema_c  = r.get("EmEMAConv", 0)
-                sqz_p  = r.get("EmSqzPressure", 0)
                 sec_m  = r.get("EmSectorMom", 0)
-                rng_e  = r.get("EmORExpansion", 0)
-                rvol   = r.get("RVOL", 1.0)
+                smv    = r.get("SmartMoneyVerdict", "NEUTRAL")
+
+                preconf_val = "PRE-CONFIRM ✓" if act_em == "PRE-CONFIRM" else "—"
+                sqz_val     = "ON 🔄" if sqz else "OFF"
 
                 em_c   = "#f59e0b" if em_s >= 70 else "#22c55e" if em_s >= 50 else "#38bdf8"
+                pc_c   = "#a78bfa" if act_em == "PRE-CONFIRM" else "#374151"
+                sqz_c  = "#a78bfa" if sqz else "#374151"
                 rs_c   = "#22c55e" if rs_ac >= 8 else "#38bdf8" if rs_ac >= 4 else "#64748b"
-                rv_c   = "#22c55e" if rv_ac >= 8 else "#38bdf8" if rv_ac >= 4 else "#64748b"
-                ec_c   = "#22c55e" if ema_c >= 8 else "#38bdf8" if ema_c >= 4 else "#64748b"
-                sp_c   = "#a78bfa" if sqz_p >= 8 else "#38bdf8" if sqz_p >= 4 else "#64748b"
-                sm_c   = "#22c55e" if sec_m >= 6 else "#64748b"
+                sm_c   = "#22c55e" if sec_m >= 6 else "#38bdf8" if sec_m >= 3 else "#64748b"
+                smv_c  = "#22c55e" if smv in ("ACCUMULATING","MARKUP_READY") else "#38bdf8" if smv=="ABSORBING" else "#64748b"
 
                 cells_html = (
-                    _phase_intel_cell("EM Score",  f"{em_s:.0f}",           em_c, dim=em_s < 30)
-                    + _phase_intel_cell("RS Accel",  f"+{rs_ac:.0f}",       rs_c, dim=rs_ac < 3)
-                    + _phase_intel_cell("RVOL Accel", f"{rv_ac:.0f}",       rv_c, dim=rv_ac < 3)
-                    + _phase_intel_cell("EMA Conv",  f"{ema_c:.0f}",        ec_c, dim=ema_c < 3)
-                    + _phase_intel_cell("Sqz Press", f"{sqz_p:.0f}",        sp_c, dim=sqz_p < 3)
-                    + _phase_intel_cell("Sec Mom",   f"{sec_m:.0f}",        sm_c, dim=sec_m < 3)
+                    _phase_intel_cell("EM Score",    f"{em_s:.0f}",     em_c,  dim=em_s < 20)
+                    + _phase_intel_cell("PRE-CONFIRM", preconf_val,      pc_c,  dim=act_em != "PRE-CONFIRM")
+                    + _phase_intel_cell("Squeeze",     sqz_val,          sqz_c, dim=not sqz)
+                    + _phase_intel_cell("RS Accel",    f"+{rs_ac:.0f}",  rs_c,  dim=rs_ac < 3)
+                    + _phase_intel_cell("Sector Str",  f"{sec_m:.0f}",   sm_c,  dim=sec_m < 2)
+                    + _phase_intel_cell("Smart Money", smv[:10],         smv_c, dim=smv in ("DISTRIBUTING","NEUTRAL"))
                 )
 
             elif group == "BREAKOUT_READY":
-                # ── Breakout Ready: proximity + volume + confirmation quality ──
-                ltp    = r.get("LTP", 0)
-                entry  = r.get("Entry") or ltp
-                conf   = r.get("Confidence", 0)
-                mtf_s  = r.get("MTFScore", 50)
-                atr    = r.get("ATR", 0)
-                rvol   = r.get("RVOL", 1.0)
-                htf_up = r.get("HTFUp", True)
-                sl     = r.get("SL") or 0
-                t1     = r.get("T1") or 0
-                rr     = ((t1 - entry) / (entry - sl)) if (entry and sl and t1 and (entry - sl) > 0) else 0
-                prox   = abs(entry - ltp) / ltp * 100 if ltp else 0
+                # ── Breakout Ready: Entry trigger · Vol confirm · HTF · R:R · Confidence · Brk dist ──
+                ltp      = r.get("LTP", 0)
+                entry    = r.get("Entry") or ltp
+                conf     = r.get("Confidence", 0)
+                vol_conf = r.get("VolConf", False)
+                htf_up   = r.get("HTFUp", True)
+                sl       = r.get("SL") or 0
+                t1       = r.get("T1") or 0
+                rr       = ((t1 - entry) / (entry - sl)) if (entry and sl and t1 and (entry - sl) > 0) else 0
+                brk_dist = abs(entry - ltp) / ltp * 100 if ltp else 0
 
-                prx_c  = "#22c55e" if prox < 1.5 else "#f59e0b" if prox < 3 else "#64748b"
-                vol_c  = "#22c55e" if rvol >= 1.5 else "#38bdf8" if rvol >= 1.1 else "#64748b"
-                conf_c = "#22c55e" if conf >= 70 else "#f59e0b" if conf >= 50 else "#64748b"
-                mtf_c  = "#22c55e" if mtf_s >= 65 else "#f59e0b" if mtf_s >= 50 else "#ef4444"
-                rr_c   = "#22c55e" if rr >= 2 else "#f59e0b" if rr >= 1.5 else "#64748b"
-                htf_c  = "#22c55e" if htf_up else "#ef4444"
+                entry_c  = "#22c55e" if brk_dist < 1.0 else "#f59e0b" if brk_dist < 2.5 else "#64748b"
+                vol_c    = "#22c55e" if vol_conf else "#ef4444"
+                htf_c    = "#22c55e" if htf_up else "#ef4444"
+                rr_c     = "#22c55e" if rr >= 2 else "#f59e0b" if rr >= 1.5 else "#64748b"
+                conf_c   = "#22c55e" if conf >= 70 else "#f59e0b" if conf >= 50 else "#64748b"
+                brk_c    = "#22c55e" if brk_dist < 1.0 else "#f59e0b" if brk_dist < 3 else "#ef4444"
 
                 cells_html = (
-                    _phase_intel_cell("Prox Entry", f"{prox:.1f}% away",    prx_c,  dim=prox > 5)
-                    + _phase_intel_cell("Vol Conf",   f"RVOL {rvol:.1f}x",  vol_c,  dim=rvol < 1.0)
-                    + _phase_intel_cell("Confidence", f"{conf}%",            conf_c, dim=conf < 40)
-                    + _phase_intel_cell("HTF Align",  "Aligned" if htf_up else "Against", htf_c, dim=not htf_up)
-                    + _phase_intel_cell("MTF Score",  f"{mtf_s:.0f}",        mtf_c,  dim=mtf_s < 50)
-                    + _phase_intel_cell("R:R Ratio",  f"{rr:.1f}×" if rr else "—", rr_c, dim=rr < 1)
+                    _phase_intel_cell("Entry Trigger", f"₹{entry:,.0f}",                   entry_c, dim=entry == ltp)
+                    + _phase_intel_cell("Vol Confirm",  "YES ✓" if vol_conf else "NO ✗",   vol_c,   dim=not vol_conf)
+                    + _phase_intel_cell("HTF Align",    "Aligned ✓" if htf_up else "Against ✗", htf_c, dim=not htf_up)
+                    + _phase_intel_cell("Risk:Reward",  f"{rr:.1f}×" if rr else "—",       rr_c,    dim=rr < 1)
+                    + _phase_intel_cell("Confidence",   f"{conf}%",                         conf_c,  dim=conf < 40)
+                    + _phase_intel_cell("Brk Dist %",   f"{brk_dist:.1f}% away",            brk_c,   dim=brk_dist > 5)
                 )
 
             elif group == "STRONG_BUY":
-                # ── Strong Buy: trend quality + breadth + momentum ─────────────
-                score  = r.get("Score", 0)
-                conf   = r.get("Confidence", 0)
-                adx    = r.get("ADX", 0)
-                rs_rk  = r.get("RS_Rank", 50)
-                rvol   = r.get("RVOL", 1.0)
-                gated  = r.get("BreadthGated", False)
-                rsi    = r.get("RSI", 50)
-                mtf_s  = r.get("MTFScore", 50)
+                # ── Strong Buy: Score · Confidence · ADX · RS Rank · Breadth · Trend phase ──
+                score    = r.get("Score", 0)
+                conf     = r.get("Confidence", 0)
+                adx      = r.get("ADX", 0)
+                rs_rk    = r.get("RS_Rank", 50)
+                gated    = r.get("BreadthGated", False)
+                phase_sb = r.get("Phase", "")
+                trend_up = r.get("TrendUp", True)
+                ema_stk  = r.get("EMAStack", False)
+
+                trend_desc = ("Full Stack ↑" if ema_stk else "Above EMA ↑") if trend_up else "Weak ↓"
 
                 sc_c   = "#f59e0b" if score >= 80 else "#22c55e" if score >= 65 else "#38bdf8"
                 cf_c   = "#22c55e" if conf >= 75 else "#f59e0b" if conf >= 55 else "#64748b"
                 adx_c  = "#22c55e" if adx >= 30 else "#f59e0b" if adx >= 20 else "#64748b"
                 rs_c   = "#22c55e" if rs_rk >= 70 else "#f59e0b" if rs_rk >= 50 else "#64748b"
-                rv_c   = "#22c55e" if rvol >= 1.5 else "#38bdf8" if rvol >= 1.1 else "#64748b"
                 br_c   = "#22c55e" if not gated else "#ef4444"
+                td_c   = "#22c55e" if trend_up and ema_stk else "#f59e0b" if trend_up else "#ef4444"
 
                 cells_html = (
-                    _phase_intel_cell("Score",      f"{score:.0f}",          sc_c, dim=score < 50)
-                    + _phase_intel_cell("Confidence", f"{conf}%",            cf_c, dim=conf < 40)
-                    + _phase_intel_cell("ADX Trend",  f"{adx:.0f}",          adx_c, dim=adx < 18)
-                    + _phase_intel_cell("RS Rank",    f"{rs_rk}",            rs_c, dim=rs_rk < 40)
-                    + _phase_intel_cell("Vol Expan",  f"RVOL {rvol:.1f}x",   rv_c, dim=rvol < 1.0)
-                    + _phase_intel_cell("Breadth",    "Strong" if not gated else "Weak", br_c, dim=gated)
+                    _phase_intel_cell("Score",        f"{score:.0f}",    sc_c,  dim=score < 50)
+                    + _phase_intel_cell("Confidence",  f"{conf}%",        cf_c,  dim=conf < 40)
+                    + _phase_intel_cell("ADX",         f"{adx:.0f}",      adx_c, dim=adx < 18)
+                    + _phase_intel_cell("RS Rank",     f"{rs_rk}",        rs_c,  dim=rs_rk < 40)
+                    + _phase_intel_cell("Breadth",     "Strong" if not gated else "Gated ⚠", br_c, dim=gated)
+                    + _phase_intel_cell("Trend Phase",  f"{phase_sb} · {trend_desc[:8]}", td_c, dim=not trend_up)
                 )
 
             elif group == "EXTENDED_RISKY":
@@ -5578,22 +5580,57 @@ with tab_scanner:
                 em_ui_group = "EMERGING_MOMENTUM"
             intel_grid = _build_phase_intel(r, em_ui_group)
 
-            # ── Compact 4-cell metrics grid (RSI · RS Rank · ATR · ADX) ───────
-            rsi_val = r.get("RSI","—"); rs_rank = r.get("RS_Rank", 50)
-            atr_val = r.get("ATR","—"); adx_val = r.get("ADX","—")
-            metrics_grid = (
-                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;'
-                f'gap:0;padding:6px 12px;border-top:1px solid #1e1e40;">'
-                f'<div><div style="color:#475569;font-size:8px;">RSI</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{rsi_val}</div></div>'
-                f'<div><div style="color:#475569;font-size:8px;">RS RNK</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{rs_rank}</div></div>'
-                f'<div><div style="color:#475569;font-size:8px;">ATR</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{atr_val}</div></div>'
-                f'<div><div style="color:#475569;font-size:8px;">ADX</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{adx_val}</div></div>'
-                f'</div>'
-            )
+            # ── Compact metrics grid — group-aware (hide ADX/ATR for Accum/Emerging) ──
+            rsi_val  = r.get("RSI","—"); rs_rank = r.get("RS_Rank", 50)
+            atr_val  = r.get("ATR","—"); adx_val = r.get("ADX","—")
+            sm_score = r.get("SmartMoneyScore", 0)
+            pca_v    = r.get("PCAScore", 0)
+            if em_ui_group == "ACCUMULATING":
+                # ACCUMULATING: hide RSI/ATR/ADX — show RS Rank, Smart Money Score, PCA Score, Seq Score
+                seq_val = r.get("AccumSequenceScore", 0)
+                metrics_grid = (
+                    f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;'
+                    f'gap:0;padding:6px 12px;border-top:1px solid #1e1e40;">'
+                    f'<div><div style="color:#475569;font-size:8px;">RS RNK</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{rs_rank}</div></div>'
+                    f'<div><div style="color:#475569;font-size:8px;">SM SCORE</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;color:#38bdf8;font-size:11px;font-weight:600;">{sm_score:.0f}</div></div>'
+                    f'<div><div style="color:#475569;font-size:8px;">PCA</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;color:#a78bfa;font-size:11px;font-weight:600;">{pca_v:.0f}</div></div>'
+                    f'<div><div style="color:#475569;font-size:8px;">SEQ</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;color:#f59e0b;font-size:11px;font-weight:600;">{seq_val}</div></div>'
+                    f'</div>'
+                )
+            elif em_ui_group == "EMERGING_MOMENTUM":
+                # EMERGING: hide ADX/ATR — show RSI, RS Rank, EM Score, Sector Mom
+                sec_m_val = r.get("EmSectorMom", 0)
+                metrics_grid = (
+                    f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;'
+                    f'gap:0;padding:6px 12px;border-top:1px solid #1e1e40;">'
+                    f'<div><div style="color:#475569;font-size:8px;">RSI</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{rsi_val}</div></div>'
+                    f'<div><div style="color:#475569;font-size:8px;">RS RNK</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{rs_rank}</div></div>'
+                    f'<div><div style="color:#475569;font-size:8px;">EM SCORE</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;color:#a78bfa;font-size:11px;font-weight:600;">{r.get("EmScore",0):.0f}</div></div>'
+                    f'<div><div style="color:#475569;font-size:8px;">SEC MOM</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;color:#22c55e;font-size:11px;font-weight:600;">{sec_m_val:.0f}</div></div>'
+                    f'</div>'
+                )
+            else:
+                metrics_grid = (
+                    f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;'
+                    f'gap:0;padding:6px 12px;border-top:1px solid #1e1e40;">'
+                    f'<div><div style="color:#475569;font-size:8px;">RSI</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{rsi_val}</div></div>'
+                    f'<div><div style="color:#475569;font-size:8px;">RS RNK</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{rs_rank}</div></div>'
+                    f'<div><div style="color:#475569;font-size:8px;">ATR</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{atr_val}</div></div>'
+                    f'<div><div style="color:#475569;font-size:8px;">ADX</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{adx_val}</div></div>'
+                    f'</div>'
+                )
 
             return (
                 f'<div style="background:#0e0e1c;border:1.5px solid {em_c}55;border-radius:12px;'
@@ -5668,9 +5705,33 @@ with tab_scanner:
             if _g in _buckets:
                 _buckets[_g].append(_r)
 
-        # Sort each bucket by score descending
-        for _g in _buckets:
-            _buckets[_g].sort(key=lambda x: x.get("Score",0), reverse=True)
+        # Sort each bucket by phase-specific priority signals
+        _buckets["ACCUMULATING"].sort(
+            key=lambda x: (x.get("AccumSequenceScore",0), x.get("SmartMoneyScore",0), x.get("PCAScore",0)),
+            reverse=True
+        )
+        _buckets["EMERGING_MOMENTUM"].sort(
+            key=lambda x: (
+                1 if x.get("Action") == "PRE-CONFIRM" else 0,
+                x.get("EmScore",0),
+                x.get("EmRSAccel",0),
+                x.get("EmSectorMom",0)
+            ),
+            reverse=True
+        )
+        _buckets["BREAKOUT_READY"].sort(
+            key=lambda x: (
+                x.get("Confidence",0),
+                1 if x.get("VolConf") else 0,
+                -(abs((x.get("Entry") or x.get("LTP",0)) - x.get("LTP",0)) / max(x.get("LTP",1),1) * 100)
+            ),
+            reverse=True
+        )
+        _buckets["STRONG_BUY"].sort(
+            key=lambda x: (x.get("Score",0), x.get("ADX",0), x.get("RS_Rank",0)),
+            reverse=True
+        )
+        _buckets["EXTENDED_RISKY"].sort(key=lambda x: x.get("Score",0), reverse=True)
 
         # ── Summary bar: one metric per layer ─────────────────────────────────
         if _all_res:
