@@ -5331,7 +5331,7 @@ with tab_scanner:
                 f'<span style="color:#22c55e;font-family:JetBrains Mono,monospace;font-size:9px;">{_p(t3)}</span>'
                 f'<div style="flex:1;background:#1e2a3a;border-radius:2px;height:3px;margin-left:4px;">'
                 f'<div style="background:{rr_col};width:{rr_bar_pct}%;height:3px;border-radius:2px;"></div></div>'
-                f'</div></div>'
+                f'</div></div></div>'
 
                 # ── Caution alert only (RSI extended, etc.) ──────────────────
                 + (f'<div style="padding:3px 12px 2px;border-top:1px solid #1e2a3a;">'
@@ -5613,38 +5613,6 @@ with tab_scanner:
                         'Wait for phase upgrade to ENTRY/CONT/BREAKOUT before acting.</div>',
                         unsafe_allow_html=True,
                     )
-
-                # Emerging table
-                em_rows = []
-                for i, r in enumerate(em_candidates[:50]):
-                    readiness = round(r.get("EmScore",0)*0.55 + r.get("PCAScore",0)*0.45, 1)
-                    em_rows.append({
-                        "#": i+1, "Symbol": r["Symbol"],
-                        "Ready": readiness,
-                        "EmScore": r.get("EmScore",0), "EmLabel": r.get("EmLabel","—"),
-                        "PCAScore": r.get("PCAScore",0), "PCALabel": r.get("PCALabel","—"),
-                        "Phase": r.get("Phase","—"), "Action": r.get("Action","—"),
-                        "RS↑": r.get("EmRSAccel",0),    "ATR↓": r.get("EmATRCompress",0),
-                        "RVOL↑": r.get("EmRVolAccel",0), "EMAconv": r.get("EmEMAConv",0),
-                        "SqzPrs": r.get("EmSqzPressure",0), "SecMom": r.get("EmSectorMom",0),
-                        "RngExp": r.get("EmORExpansion",0),
-                        "CMFrel": r.get("PCACMFRel",0), "VolSeq": r.get("PCAVolCmpSeq",0),
-                        "HidAcc": r.get("PCAHiddenAccum",0), "EVR": r.get("PCAEffortResult",0),
-                        "NRprs": r.get("PCARangeCont",0), "FBA": r.get("PCAFailedBrkdn",0),
-                        "VolAsym": r.get("PCAVolAsym",0),
-                        "Score": r.get("Score",0), "%Chg": f'{r.get("%Change",0):+.2f}%',
-                        "RSI": r.get("RSI","—"), "RS_Rank": r.get("RS_Rank",50),
-                        "LTP": fmt(r["LTP"]), "SL": fmt(r.get("SL",0)),
-                        "Sector": r.get("Sector","—"),
-                    })
-                if em_rows:
-                    em_df = pd.DataFrame(em_rows)
-                    st.dataframe(em_df, use_container_width=True, hide_index=True, height=360)
-                    em_buy = [r for r in em_candidates if r.get("Action") in ("BUY","STRONG BUY","WATCH")]
-                    if em_buy:
-                        csv = pd.DataFrame(em_buy).drop(columns=["ExtFlags","Patterns","RegimeWeights","MTFTFScores","CandlePatterns"], errors="ignore").to_csv(index=False)
-                        st.download_button("Export Emerging list",csv,
-                                           f"NSE_Emerging_{mode_opt}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv","text/csv")
             else:
                 st.info(f"No emerging stocks found with score ≥ {em_min_score}. "
                         "Try lowering the minimum score or run a scan first.")
@@ -5769,69 +5737,8 @@ with tab_scanner:
                         '<span style="color:#fca5a5;font-weight:600;">Short selling carries elevated risk — always use disciplined SL management.</span>'
                         '</div>',unsafe_allow_html=True)
 
-        # ── Main table ─────────────────────────────────────────────────────────
+        # ── Export BUY results ──────────────────────────────────────────────
         if results:
-            rows=[]
-            for i,r in enumerate(results):
-                chg=r["%Change"]
-                ph_arrow=get_phase_arrow(r["Symbol"])
-                rows.append({
-                    "#":i+1,"Symbol":r["Symbol"],"Score":r["Score"],"Conf%":r.get("Confidence",0),
-                    "Phase":f'{r.get("Phase","")}{" "+ph_arrow if ph_arrow else ""}',
-                    "Setup":{"fib":"Fib","breakout":"BRK","norm":"std","vdu":"VDU"}.get(r.get("Setup","norm"),"std"),
-                    "Action":r["Action"],"B-Gate":"⚠" if r.get("BreadthGated") else "",
-                    "%Chg":f"+{chg}%" if chg>=0 else f"{chg}%",
-                    "RSI":r.get("RSI","—"),"RS_Rank":r.get("RS_Rank",50),
-                    "ADX":r.get("ADX","—"),"SQZ":"◆" if r.get("Squeeze") else "",
-                    "VCP":r.get("VCPGrade","—"),
-                    "AVWAP":"↑" if r.get("AVWAPAbove") else "↓",
-                    "FibQ":r.get("FibGrade","—"),
-                    "VDU":"×"*int(r.get("VDUIntensity",0)) or "—",
-                    "RVol":r.get("RVolLabel","—"),
-                    "Darvas":("BRK" if r.get("DarvasBrk") else ("□" if r.get("DarvasIn") else "—")),
-                    "EmScore":r.get("EmScore",0),"EmLabel":r.get("EmLabel","—"),
-                    "PCAScore":r.get("PCAScore",0),"PCALabel":r.get("PCALabel","—"),
-                    # v15.7 new columns
-                    "SM":r.get("SmartMoneyVerdict","—"),
-                    "AccumStage":r.get("AccumStage","—"),
-                    "RSLead":r.get("RSLeaderLabel","—"),
-                    "MicroFlow":r.get("MicroLabel","—"),
-                    "LTP":fmt(r["LTP"]),"Entry":fmt(r["Entry"])+(" ⚡" if r["Entry"]!=r["LTP"] else ""),
-                    "SL":fmt(r["SL"]),"T1":fmt(r["T1"]),"T2":fmt(r["T2"]),"T3":fmt(r["T3"]),
-                    "Liq₹Cr":r.get("AvgTradedCr","—"),"HTF":"↑" if r.get("HTFUp",True) else "↓",
-                    "ExtN":r.get("ExtN",0),"Ext":" ".join(r.get("ExtLabels",[])) or "—",
-                })
-            df_display=pd.DataFrame(rows)
-            def color_extn(val):
-                if val==0: return "background-color:transparent;color:#cbd5e1"
-                if val==1: return "background-color:#78350f44;color:#f59e0b"
-                if val==2: return "background-color:#9a3412aa;color:#fb923c"
-                return "background-color:#7f1d1d;color:#fca5a5;font-weight:600"
-            def color_action(val):
-                if val=="STRONG BUY": return "color:#f59e0b;font-weight:600"
-                if val=="BUY": return "color:#22c55e"
-                if val=="PRE-CONFIRM": return "color:#a78bfa;font-weight:600"
-                if val=="WATCH": return "color:#d97706"
-                return "color:#cbd5e1"
-            def color_pct(val):
-                if isinstance(val,str) and val.startswith("+"): return "color:#22c55e;font-family:JetBrains Mono,monospace"
-                if isinstance(val,str) and val.startswith("-"): return "color:#ef4444;font-family:JetBrains Mono,monospace"
-                return ""
-            styled=(df_display.style
-                    .map(color_extn,subset=["ExtN"]).map(color_action,subset=["Action"]).map(color_pct,subset=["%Chg"])
-                    .set_properties(**{"font-family":"JetBrains Mono,monospace","font-size":"11px"}))
-            st.dataframe(styled,use_container_width=True,hide_index=True,height=480)
-            st.markdown(
-                '<div style="font-size:10px;color:#3a3a60;font-family:JetBrains Mono,monospace;margin-top:4px;">'
-                'Score 0-100 · Conf% = confidence · ADX = trend strength (≥30=strong) · SQZ = Keltner/BB squeeze · '
-                'RS_Rank = 52w percentile · HTF ↑/↓ = weekly · ExtN 0=clean 3+=skip · '
-                'EmScore = emerging momentum (coil) · PCAScore = pre-confirm accumulation · '
-                'SM = smart money verdict · AccumStage = Wyckoff stage (1A/1B/1C/2A/2B) · '
-                'RSLead = RS leadership (LEADER/IMPROVING/NEUTRAL/LAGGARD) · '
-                'MicroFlow = order-flow microstructure · '
-                'PRE-CONFIRM = accumulating before price confirmation</div>',
-                unsafe_allow_html=True,
-            )
             buy_rows=[r for r in results if r["Action"] in ("BUY","STRONG BUY")]
             if buy_rows:
                 csv=pd.DataFrame(buy_rows).drop(columns=["ExtFlags"],errors="ignore").to_csv(index=False)
@@ -6159,7 +6066,9 @@ with tab_portfolio:
         p1.metric("🟢 Hold",counts[EXIT_HOLD]); p2.metric("🟡 Watch",counts[EXIT_WATCH_LBL])
         p3.metric("🟠 Exit Signal",counts[EXIT_SIGNAL_LBL]); p4.metric("🔴 Exit Now",counts[EXIT_CONFIRM_LBL])
         valid_pos=[p for p in positions if isinstance(p,dict) and p.get("symbol")]
-        for pos in valid_pos:
+
+        # ── Build card HTML for a single position ─────────────────────────────
+        def _pf_card_html(pos):
             sym=pos["symbol"]; er=exit_res.get(sym)
             verdict=er.verdict if er else EXIT_HOLD; ex_score=er.exit_score if er else 0
             triggers=er.triggers if er else []; trail_sl=er.trailing_stop if er else None
@@ -6167,7 +6076,6 @@ with tab_portfolio:
             qty=pos.get("qty",0); mode_p=pos.get("mode","Swing")
             day_pct=er.day_pct if er else 0.0
             pnl_pct=(curr_px-entry_px)/entry_px*100 if entry_px else 0
-            pnl_abs=(curr_px-entry_px)*qty
             pnl_col="#22c55e" if pnl_pct>=0 else "#ef4444"
             day_col="#22c55e" if day_pct>=0 else "#ef4444"
             day_str=f"+{day_pct:.2f}%" if day_pct>=0 else f"{day_pct:.2f}%"
@@ -6176,37 +6084,76 @@ with tab_portfolio:
             trig_rows="".join(
                 f'<div style="padding:3px 0;border-bottom:1px solid #15152a;color:#c8d0e0;font-size:9.5px;">{t}</div>'
                 for t in triggers) or '<div style="color:#3a3a60;font-size:9px;padding:4px 0;">No triggers</div>'
-            trail_row=(f'<div style="display:flex;justify-content:space-between;padding:2px 0;">'
-                       f'<span style="color:#cbd5e1;font-size:9px;">🎯 TRAIL SL</span>'
-                       f'<span style="font-family:JetBrains Mono,monospace;color:#f59e0b;font-size:12px;font-weight:600;">₹{trail_sl:,.2f}</span></div>'
-                       ) if trail_sl else ""
-            st.markdown(
-                f'<div style="background:#111120;border:1.5px solid {vc};border-radius:12px;overflow:hidden;min-width:220px;max-width:320px;flex:1 1 220px;margin-bottom:12px;">'
-                f'<div style="display:flex;justify-content:space-between;align-items:center;padding:11px 14px 9px;'
-                f'border-bottom:1px solid #1e1e40;background:#0e0e1c;">'
+            trail_row=(
+                f'<div style="display:flex;justify-content:space-between;padding:2px 12px;">'
+                f'<span style="color:#cbd5e1;font-size:9px;">🎯 TRAIL SL</span>'
+                f'<span style="font-family:JetBrains Mono,monospace;color:#f59e0b;font-size:12px;font-weight:600;">₹{trail_sl:,.2f}</span></div>'
+            ) if trail_sl else ""
+            return (
+                f'<div style="background:#111120;border:1.5px solid {vc};border-radius:12px;'
+                f'overflow:hidden;min-width:210px;max-width:300px;flex:1 1 210px;">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;'
+                f'padding:10px 12px 8px;border-bottom:1px solid #1e1e40;background:#0e0e1c;">'
                 f'<div><span style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:15px;font-weight:700;">{sym}</span>'
-                f'<div style="color:#6b7280;font-size:9.5px;">{sector} · {mode_p}</div></div>'
-                f'<span style="background:{vc}22;border:1px solid {vc};color:{vc};padding:3px 10px;border-radius:6px;font-size:10px;font-weight:700;">{verdict}</span>'
+                f'<div style="color:#6b7280;font-size:9px;">{sector} · {mode_p}</div></div>'
+                f'<span style="background:{vc}22;border:1px solid {vc};color:{vc};padding:2px 8px;'
+                f'border-radius:5px;font-size:10px;font-weight:700;">{verdict}</span>'
                 f'</div>'
-                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:0;padding:10px 12px;">'
-                f'<div><div style="color:#64748b;font-size:8px;">ENTRY</div><div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:12px;">₹{entry_px:,.2f}</div></div>'
-                f'<div><div style="color:#64748b;font-size:8px;">CURRENT</div><div style="font-family:JetBrains Mono,monospace;color:#e2e8f0;font-size:12px;">₹{curr_px:,.2f}</div></div>'
-                f'<div><div style="color:#64748b;font-size:8px;">DAY</div><div style="font-family:JetBrains Mono,monospace;color:{day_col};font-size:12px;font-weight:600;">{day_str}</div></div>'
-                f'<div><div style="color:#64748b;font-size:8px;">P&L</div><div style="font-family:JetBrains Mono,monospace;color:{pnl_col};font-size:12px;font-weight:700;">{pnl_pct:+.1f}%</div></div>'
+                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:0;padding:8px 12px;">'
+                f'<div><div style="color:#64748b;font-size:8px;">ENTRY</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;">₹{entry_px:,.2f}</div></div>'
+                f'<div><div style="color:#64748b;font-size:8px;">CMP</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#e2e8f0;font-size:11px;">₹{curr_px:,.2f}</div></div>'
+                f'<div><div style="color:#64748b;font-size:8px;">DAY</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:{day_col};font-size:11px;font-weight:600;">{day_str}</div></div>'
+                f'<div><div style="color:#64748b;font-size:8px;">P&L</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:{pnl_col};font-size:11px;font-weight:700;">{pnl_pct:+.1f}%</div></div>'
                 f'</div>'
-                +trail_row+
-                f'<div style="padding:6px 12px;background:#0e0e1c;border-top:1px solid #1a1a30;">'
-                f'<div style="color:#475569;font-size:8px;margin-bottom:4px;">SIGNALS</div>'+trig_rows+f'</div>'
-                f'<div style="padding:6px 14px 5px;border-top:1px solid #1a1a30;">'
+                + trail_row +
+                f'<div style="padding:5px 12px 6px;background:#0e0e1c;border-top:1px solid #1a1a30;">'
+                f'<div style="color:#475569;font-size:8px;margin-bottom:3px;">SIGNALS</div>'
+                + trig_rows +
+                f'</div>'
+                f'<div style="padding:5px 12px 6px;border-top:1px solid #1a1a30;">'
                 f'<div style="background:#1e1e40;border-radius:2px;height:3px;">'
                 f'<div style="background:{vc};width:{bar}%;height:3px;border-radius:2px;"></div></div></div>'
-                f'</div>',
+                f'</div>'
+            )
+
+        # ── Group positions by verdict priority then render each group ─────────
+        _group_order=[EXIT_CONFIRM_LBL, EXIT_SIGNAL_LBL, EXIT_WATCH_LBL, EXIT_HOLD]
+        _group_labels={
+            EXIT_CONFIRM_LBL:"🔴 Exit Now",
+            EXIT_SIGNAL_LBL: "🟠 Exit Signal",
+            EXIT_WATCH_LBL:  "🟡 Watch",
+            EXIT_HOLD:       "🟢 Hold",
+        }
+        for _grp in _group_order:
+            _grp_pos=[p for p in valid_pos
+                      if (exit_res.get(p["symbol"]).verdict if exit_res.get(p["symbol"]) else EXIT_HOLD)==_grp]
+            if not _grp_pos: continue
+            vc_grp=EXIT_COLORS.get(_grp,"#22aa55")
+            st.markdown(
+                f'<div style="color:{vc_grp};font-family:Syne,sans-serif;font-size:12px;'
+                f'font-weight:700;letter-spacing:.06em;margin:14px 0 6px;">'
+                f'{_group_labels[_grp]} · {len(_grp_pos)}</div>',
                 unsafe_allow_html=True,
             )
-            if st.button("🗑 Remove",key=f"rm_{sym}_{pos.get('entry_date','')}",use_container_width=False):
-                st.session_state["open_positions"]=[
-                    p for p in st.session_state["open_positions"]
-                    if not (p.get("symbol")==sym and p.get("entry_date")==pos.get("entry_date"))
-                ]
-                _db_save("bs_positions",st.session_state["open_positions"])
-                st.rerun()
+            grp_html='<div style="display:flex;flex-wrap:wrap;gap:10px;align-items:stretch;">'
+            for p in _grp_pos:
+                grp_html+=_pf_card_html(p)
+            grp_html+="</div>"
+            st.markdown(grp_html, unsafe_allow_html=True)
+
+        # ── Remove positions ───────────────────────────────────────────────────
+        st.markdown("<div style='margin-top:18px;'></div>", unsafe_allow_html=True)
+        sym_options=[f"{p['symbol']} ({p.get('mode','—')})" for p in valid_pos]
+        to_remove=st.multiselect("🗑 Remove positions", sym_options, key="pf_remove_sel")
+        if to_remove and st.button("Remove selected", key="pf_remove_btn", type="primary"):
+            remove_syms={s.split(" (")[0] for s in to_remove}
+            st.session_state["open_positions"]=[
+                p for p in st.session_state["open_positions"]
+                if p.get("symbol") not in remove_syms
+            ]
+            _db_save("bs_positions", st.session_state["open_positions"])
+            st.rerun()
