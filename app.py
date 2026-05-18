@@ -5267,7 +5267,7 @@ with tab_scanner:
             pca   = r.get("PCAScore", 0); pca_lbl = r.get("PCALabel","NONE")
             phase = r.get("Phase", PHASE_IDLE)
             act   = r.get("Action","SKIP"); sector = r.get("Sector","—")
-            # Combined readiness: EmScore (coil mechanics) × 0.55 + PCA (buying pressure) × 0.45
+            # Combined readiness: EmScore × 0.55 + PCA × 0.45
             readiness = round(em * 0.55 + pca * 0.45, 1)
             em_c, em_bg = _EM_COLORS.get(lbl, ("#475569","#47556922"))
             _PCA_COLORS = {
@@ -5282,57 +5282,16 @@ with tab_scanner:
             chg_arr = "▲" if chg >= 0 else "▼"
             chg_str = f"+{chg:.2f}%" if chg >= 0 else f"{chg:.2f}%"
             phase_col = _phase_color(phase)
-            act_bg,act_brd,act_txt = _action_colors(act)
-            # 7-component EmScore breakdown bars
-            bars_html = '<div style="margin-bottom:6px;"><div style="color:#94a3b8;font-size:9px;letter-spacing:.06em;margin-bottom:4px;font-weight:600;">EMERGING MOMENTUM</div>'
-            for comp_name, comp_key, comp_max, comp_icon in _EM_COMPONENTS:
-                val = r.get(comp_key, 0.0)
-                pct = int(val / comp_max * 100)
-                bar_col = "#22c55e" if pct >= 70 else "#f59e0b" if pct >= 40 else "#475569"
-                bars_html += (
-                    f'<div style="margin:2px 0;">'
-                    f'<div style="display:flex;justify-content:space-between;margin-bottom:1px;">'
-                    f'<span style="color:#94a3b8;font-size:9px;">{comp_icon} {comp_name}</span>'
-                    f'<span style="color:{bar_col};font-family:JetBrains Mono,monospace;font-size:9px;font-weight:600;">'
-                    f'{val:.0f}/{comp_max}</span></div>'
-                    f'<div style="background:#1e1e40;border-radius:2px;height:3px;">'
-                    f'<div style="background:{bar_col};width:{pct}%;height:3px;border-radius:2px;"></div></div></div>'
-                )
-            bars_html += '</div>'
-            # 7-component PCA breakdown bars
-            pca_bars_html = '<div style="border-top:1px solid #1e1e40;padding-top:6px;"><div style="color:#94a3b8;font-size:9px;letter-spacing:.06em;margin-bottom:4px;font-weight:600;">PRE-CONFIRM ACCUMULATION</div>'
-            _PCA_COMP_LABELS = [
-                ("Rel CMF",    "PCACMFRel",       15, "💧"),
-                ("Vol Seq",    "PCAVolCmpSeq",    15, "🗜"),
-                ("Hidden Acc", "PCAHiddenAccum",  15, "👻"),
-                ("Effort/Res", "PCAEffortResult", 15, "⚖"),
-                ("NR Persist", "PCARangeCont",    10, "📏"),
-                ("Fail BRK",   "PCAFailedBrkdn",  15, "🛡"),
-                ("Vol Asym",   "PCAVolAsym",      15, "⚖"),
-            ]
-            for comp_name, comp_key, comp_max, comp_icon in _PCA_COMP_LABELS:
-                val = r.get(comp_key, 0.0)
-                pct = int(val / comp_max * 100)
-                bar_col = "#22c55e" if pct >= 70 else "#38bdf8" if pct >= 40 else "#475569"
-                pca_bars_html += (
-                    f'<div style="margin:2px 0;">'
-                    f'<div style="display:flex;justify-content:space-between;margin-bottom:1px;">'
-                    f'<span style="color:#94a3b8;font-size:9px;">{comp_icon} {comp_name}</span>'
-                    f'<span style="color:{bar_col};font-family:JetBrains Mono,monospace;font-size:9px;font-weight:600;">'
-                    f'{val:.0f}/{comp_max}</span></div>'
-                    f'<div style="background:#1e1e40;border-radius:2px;height:3px;">'
-                    f'<div style="background:{bar_col};width:{pct}%;height:3px;border-radius:2px;"></div></div></div>'
-                )
-            pca_bars_html += '</div>'
-            # squeeze + atr badges
+            act_bg, act_brd, act_txt = _action_colors(act)
+
+            # ── Badges (squeeze / vol-contraction / MTF / inst) ──────────────
             sqz_badge = ('<span style="background:#8b5cf622;border:1px solid #8b5cf655;color:#a78bfa;'
                          'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">🔄 SQZ</span>'
                          if r.get("Squeeze") else "")
-            vc_badge = ('<span style="background:#0ea5e922;border:1px solid #0ea5e955;color:#38bdf8;'
-                        'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">VC</span>'
-                        if r.get("VolRatio", 1.0) < 0.75 else "")
-            # MTF badge
-            mtf_lbl = r.get("MTFLabel","NEUTRAL")
+            vc_badge  = ('<span style="background:#0ea5e922;border:1px solid #0ea5e955;color:#38bdf8;'
+                         'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">VC</span>'
+                         if r.get("VolRatio", 1.0) < 0.75 else "")
+            mtf_lbl   = r.get("MTFLabel","NEUTRAL")
             mtf_c_map = {"BULL SYNC":"#22c55e","BULL LEAN":"#86efac","BEAR SYNC":"#ef4444",
                          "BEAR LEAN":"#fca5a5","DIVERGE":"#f59e0b"}
             mtf_badge = ""
@@ -5341,8 +5300,7 @@ with tab_scanner:
                 mtf_badge = (f'<span style="background:{mc}22;border:1px solid {mc}55;color:{mc};'
                              f'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">'
                              f'MTF·{mtf_lbl}</span>')
-            # Inst badge
-            inst_lbl = r.get("InstLabel","INST~")
+            inst_lbl  = r.get("InstLabel","INST~")
             inst_c_map = {"INST↑":"#22c55e","INST↓":"#ef4444"}
             inst_badge = ""
             if inst_lbl in inst_c_map:
@@ -5351,14 +5309,11 @@ with tab_scanner:
                               f'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">'
                               f'{inst_lbl}</span>')
 
-            # v15.7 — Smart Money, Accumulation Stage, RS Leadership, Micro badges
+            # ── v15.7 intelligence badges (SM · Stage · RS · Flow) ────────────
             sm_verdict = r.get("SmartMoneyVerdict","NEUTRAL")
-            sm_c_map = {
-                "MARKUP_READY": "#f59e0b", "ACCUMULATING": "#22c55e",
-                "ABSORBING": "#38bdf8",    "NEUTRAL": "#64748b",
-                "DISTRIBUTING": "#ef4444",
-            }
-            sm_c = sm_c_map.get(sm_verdict, "#64748b")
+            sm_c_map = {"MARKUP_READY":"#f59e0b","ACCUMULATING":"#22c55e",
+                        "ABSORBING":"#38bdf8","NEUTRAL":"#64748b","DISTRIBUTING":"#ef4444"}
+            sm_c = sm_c_map.get(sm_verdict,"#64748b")
             sm_badge = (f'<span style="background:{sm_c}22;border:1px solid {sm_c}55;color:{sm_c};'
                         f'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">'
                         f'SM·{sm_verdict[:4]}</span>')
@@ -5374,17 +5329,15 @@ with tab_scanner:
             )
 
             rl_label = r.get("RSLeaderLabel","NEUTRAL")
-            rl_c_map = {"LEADER":"#f59e0b","IMPROVING":"#22c55e",
-                        "NEUTRAL":"#64748b","LAGGARD":"#ef4444"}
+            rl_c_map = {"LEADER":"#f59e0b","IMPROVING":"#22c55e","NEUTRAL":"#64748b","LAGGARD":"#ef4444"}
             rl_c = rl_c_map.get(rl_label,"#64748b")
             rs_lead_badge = (f'<span style="background:{rl_c}22;border:1px solid {rl_c}55;color:{rl_c};'
                              f'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">'
                              f'RS·{rl_label[:4]}</span>')
 
             micro_lbl = r.get("MicroLabel","NEUTRAL_FLOW")
-            mf_c_map = {"STRONG_BUY_FLOW":"#22c55e","BUY_FLOW":"#86efac",
-                        "NEUTRAL_FLOW":"#64748b","SELL_FLOW":"#fca5a5",
-                        "STRONG_SELL_FLOW":"#ef4444"}
+            mf_c_map  = {"STRONG_BUY_FLOW":"#22c55e","BUY_FLOW":"#86efac",
+                         "NEUTRAL_FLOW":"#64748b","SELL_FLOW":"#fca5a5","STRONG_SELL_FLOW":"#ef4444"}
             mf_c = mf_c_map.get(micro_lbl,"#64748b")
             mf_short = {"STRONG_BUY_FLOW":"↑↑FLOW","BUY_FLOW":"↑FLOW",
                         "NEUTRAL_FLOW":"~FLOW","SELL_FLOW":"↓FLOW",
@@ -5393,33 +5346,39 @@ with tab_scanner:
                            f'padding:1px 5px;border-radius:3px;font-size:9px;">'
                            f'{mf_short}</span>')
 
-            # v15.7 intelligence summary row (SM + AccumStage + RS + Micro)
-            intel_row = (
-                f'<div style="padding:4px 12px 5px;border-top:1px solid #1e1e40;'
-                f'display:flex;flex-wrap:wrap;gap:3px;align-items:center;">'
-                f'<span style="color:#475569;font-size:8px;letter-spacing:.04em;margin-right:2px;">v15.7</span>'
-                f'{sm_badge}{accum_badge}{rs_lead_badge}{micro_badge}'
+            # ── Compact 4-cell metrics grid (RSI · RS Rank · ATR · ADX) ───────
+            rsi_val = r.get("RSI","—"); rs_rank = r.get("RS_Rank", 50)
+            atr_val = r.get("ATR","—"); adx_val = r.get("ADX","—")
+            metrics_grid = (
+                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;'
+                f'gap:0;padding:6px 12px;border-top:1px solid #1e1e40;">'
+                f'<div><div style="color:#475569;font-size:8px;">RSI</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{rsi_val}</div></div>'
+                f'<div><div style="color:#475569;font-size:8px;">RS RNK</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{rs_rank}</div></div>'
+                f'<div><div style="color:#475569;font-size:8px;">ATR</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{atr_val}</div></div>'
+                f'<div><div style="color:#475569;font-size:8px;">ADX</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:11px;font-weight:600;">{adx_val}</div></div>'
                 f'</div>'
             )
+
             return (
                 f'<div style="background:#0e0e1c;border:1.5px solid {em_c}55;border-radius:12px;'
-                f'overflow:hidden;width:360px;min-width:320px;max-width:380px;flex:1 1 360px;">'
-                # Header
+                f'overflow:hidden;width:300px;min-width:260px;max-width:320px;flex:1 1 300px;">'
+                # ── Header: symbol + dual score chips + phase/action ──────────
                 f'<div style="background:{em_bg};border-bottom:1px solid {em_c}33;padding:8px 12px 7px;'
                 f'display:flex;align-items:center;gap:8px;">'
                 f'<div style="flex:1;">'
                 f'<div style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:15px;font-weight:700;">{sym}</div>'
-                f'<div style="font-size:9px;color:#94a3b8;font-family:DM Sans,sans-serif;">{sector}</div>'
+                f'<div style="font-size:9px;color:#94a3b8;">{sector}</div>'
                 f'</div>'
                 f'<div style="text-align:right;">'
-                # Dual score chips
-                f'<div style="display:flex;gap:4px;justify-content:flex-end;flex-wrap:wrap;">'
+                f'<div style="display:flex;gap:3px;justify-content:flex-end;flex-wrap:wrap;">'
                 f'<span style="background:{em_c};color:#0a0a0f;font-family:JetBrains Mono,monospace;'
-                f'font-size:10px;font-weight:700;padding:2px 7px;border-radius:4px;white-space:nowrap;">'
-                f'EM {em:.0f}·{lbl}</span>'
+                f'font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;">EM {em:.0f}</span>'
                 f'<span style="background:{pca_c};color:#0a0a0f;font-family:JetBrains Mono,monospace;'
-                f'font-size:10px;font-weight:700;padding:2px 7px;border-radius:4px;white-space:nowrap;">'
-                f'PCA {pca:.0f}·{pca_lbl}</span>'
+                f'font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;">PCA {pca:.0f}</span>'
                 f'</div>'
                 f'<div style="margin-top:4px;display:flex;gap:3px;justify-content:flex-end;">'
                 f'<span style="background:{phase_col}22;border:1px solid {phase_col}55;color:{phase_col};'
@@ -5427,17 +5386,16 @@ with tab_scanner:
                 f'<span style="background:{act_bg};border:1px solid {act_brd};color:{act_txt};'
                 f'padding:1px 5px;border-radius:3px;font-size:9px;font-weight:600;">{act}</span>'
                 f'</div></div></div>'
-                # Price + badges
-                f'<div style="padding:8px 12px 4px;display:flex;justify-content:space-between;align-items:center;">'
+                # ── Price row + auxiliary badges ───────────────────────────────
+                f'<div style="padding:8px 12px 5px;display:flex;justify-content:space-between;align-items:center;">'
                 f'<div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:20px;font-weight:600;">₹{ltp:,.2f}</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:{chg_col};font-size:11px;">{chg_arr} {chg_str}</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:18px;font-weight:600;">₹{ltp:,.2f}</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:{chg_col};font-size:10px;">{chg_arr} {chg_str}</div>'
                 f'</div>'
                 f'<div style="text-align:right;">'
                 f'{sqz_badge}{vc_badge}{mtf_badge}{inst_badge}'
-                f'<div style="color:#475569;font-size:8px;margin-top:3px;">RSI {r.get("RSI","—")} · RS{r.get("RS_Rank",50)}</div>'
                 f'</div></div>'
-                # Combined readiness bar
+                # ── Readiness bar ──────────────────────────────────────────────
                 f'<div style="padding:2px 12px 6px;">'
                 f'<div style="display:flex;justify-content:space-between;margin-bottom:2px;">'
                 f'<span style="color:#475569;font-size:8px;letter-spacing:.06em;">READINESS</span>'
@@ -5446,19 +5404,20 @@ with tab_scanner:
                 f'<div style="background:#1e1e40;border-radius:3px;height:5px;">'
                 f'<div style="background:linear-gradient(90deg,{em_c},{pca_c});'
                 f'width:{min(readiness,100):.0f}%;height:5px;border-radius:3px;"></div></div></div>'
-                # Component breakdowns
-                f'<div style="padding:4px 12px 8px;">'
-                + bars_html + pca_bars_html +
+                # ── Compact metrics grid ───────────────────────────────────────
+                + metrics_grid +
+                # ── Intelligence row: SM · Stage · RS · Flow ──────────────────
+                f'<div style="padding:5px 12px 6px;border-top:1px solid #1e1e40;'
+                f'display:flex;flex-wrap:wrap;gap:3px;align-items:center;">'
+                f'{sm_badge}{accum_badge}{rs_lead_badge}{micro_badge}'
                 f'</div>'
-                # v15.7 intelligence intelligence row
-                + intel_row +
-                # Footer
+                # ── Footer: SL ─────────────────────────────────────────────────
                 f'<div style="background:#07070f;border-top:1px solid #1e1e40;padding:5px 12px;'
                 f'display:flex;justify-content:space-between;align-items:center;">'
                 f'<span style="color:#475569;font-size:9px;font-family:JetBrains Mono,monospace;">'
-                f'ATR {r.get("ATR","—")} · ADX {r.get("ADX","—")}</span>'
-                f'<span style="color:{em_c};font-size:9px;font-weight:600;">'
                 f'SL ₹{r.get("SL",0):,.0f}</span>'
+                f'<span style="color:{em_c};font-size:9px;font-weight:600;">'
+                f'{lbl} · {pca_lbl}</span>'
                 f'</div>'
                 f'</div>'
             )
