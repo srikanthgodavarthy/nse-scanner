@@ -255,7 +255,7 @@ PHASE_ORDER = {
     PHASE_CONT:3, PHASE_BRK:4, PHASE_EXIT:-1,
 }
 
-VIX_CALM=15; VIX_CAUTION=20; VIX_STRESS=25
+VIX_CALM=15; VIX_CAUTION=20; VIX_STRESS=20  # v15.8-FIX: was 25 — UI said STRESS at 20 but math used 25
 LIQUIDITY_MIN_CR = 5.0
 
 EXIT_HOLD="HOLD"; EXIT_WATCH_LBL="EXIT WATCH"
@@ -4443,7 +4443,44 @@ def _result_hash(r: dict) -> str:
     return hashlib.md5(str(key_fields).encode()).hexdigest()[:8]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OI DATA (unchanged)
+# v15.8-FIX: EARNINGS DATE WARNING
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_earnings_dates(symbols: list) -> dict:
+    """
+    Returns {symbol: "DD Mon"} for stocks with earnings in the next 14 days.
+    Best-effort — silent on any failure. Uses yfinance calendar.
+    """
+    import yfinance as yf
+    from datetime import date as _date, timedelta as _td
+    upcoming: dict = {}
+    today   = _date.today()
+    horizon = today + _td(days=14)
+    for sym in symbols:
+        try:
+            cal = yf.Ticker(sym + ".NS").calendar
+            if cal is None:
+                continue
+            if isinstance(cal, pd.DataFrame) and not cal.empty:
+                if "Earnings Date" in cal.columns:
+                    ed = pd.to_datetime(cal["Earnings Date"].iloc[0]).date()
+                    if today <= ed <= horizon:
+                        upcoming[sym] = ed.strftime("%d %b")
+            elif isinstance(cal, dict):
+                ed_raw = cal.get("Earnings Date")
+                if ed_raw:
+                    ed = (pd.to_datetime(ed_raw[0]).date()
+                          if isinstance(ed_raw, list)
+                          else pd.to_datetime(ed_raw).date())
+                    if today <= ed <= horizon:
+                        upcoming[sym] = ed.strftime("%d %b")
+        except Exception:
+            pass
+    return upcoming
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OI DATA — improved NSE session warm-up (v15.8-FIX)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=180)
@@ -4453,17 +4490,25 @@ def fetch_oi_data(symbol="NIFTY"):
         "User-Agent":("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"),
         "Accept":"application/json, text/plain, */*",
-        "Accept-Language":"en-US,en;q=0.9","Referer":"https://www.nseindia.com/",
+        "Accept-Language":"en-US,en;q=0.9",
+        "Accept-Encoding":"gzip, deflate, br",
+        "Referer":"https://www.nseindia.com/",
         "X-Requested-With":"XMLHttpRequest","Connection":"keep-alive",
+        "Cache-Control":"no-cache",
+        "Sec-Fetch-Site":"same-origin","Sec-Fetch-Mode":"cors","Sec-Fetch-Dest":"empty",
     }
     session=requests.Session(); session.headers.update(HEADERS)
     def _warm():
-        # FIX-9: removed time.sleep() calls that blocked the UI thread for 1.3s;
-        # session warming is best-effort — the retry loop handles 401/403 responses.
+        # v15.8-FIX: proper NSE session warming — needs gap between requests for cookie setup
         try:
-            session.get("https://www.nseindia.com", timeout=5)
-            session.get("https://www.nseindia.com/market-data/equity-derivatives-watch", timeout=5)
-            return True
+            session.get("https://www.nseindia.com", timeout=8,
+                        headers={**HEADERS,
+                                  "Accept":"text/html,application/xhtml+xml,*/*;q=0.8",
+                                  "Sec-Fetch-Mode":"navigate","Sec-Fetch-Dest":"document"})
+            time.sleep(1.5)   # NSE needs this gap to set session cookies
+            session.get("https://www.nseindia.com/market-data/equity-derivatives-watch", timeout=8)
+            time.sleep(1.0)
+            return "nsit" in session.cookies or "nseappid" in session.cookies
         except Exception:
             return False
     _warm()
@@ -4555,9 +4600,9 @@ def fetch_indices(mode="Swing"):
 # ══════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="🐂 BULL SUTRA Pro v15.6",
+    page_title="🐂 BULL SUTRA Pro v15.8",
     page_icon="🐂", layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 st.markdown("""
@@ -4582,6 +4627,7 @@ for key,default in [
     ("exit_results",{}),("_db_error",None),
     # v15 additions
     ("last_scan_stage_a_survivors",0),("live_refresh_enabled",False),
+    ("earnings_map",{}),  # v15.8-FIX: earnings date cache
 ]:
     if key not in st.session_state:
         st.session_state[key]=default
@@ -4597,7 +4643,51 @@ def _prewarm():
     fetch_nifty("Swing")
 _prewarm()
 
-# ── Header ─────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# v15.8-FIX: PRE-ENTRY CHECKLIST SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.markdown(
+        '<div style="font-family:Syne,sans-serif;font-size:13px;font-weight:700;'
+        'color:#f59e0b;margin-bottom:10px;letter-spacing:.05em;'
+        'text-transform:uppercase;">Pre-Entry Checklist</div>',
+        unsafe_allow_html=True,
+    )
+    _checks = [
+        ("ltp_near_entry",    "LTP within 0.5% of Entry price"),
+        ("nifty_flat_rising", "Nifty flat or rising right now"),
+        ("htf_bullish",       "HTFUp = True (check Detail tab)"),
+        ("ext_n_ok",          "ExtN is 0 or 1 (no exhaustion)"),
+        ("no_earnings",       "No earnings in next 7 days"),
+        ("no_resistance",     "No major resistance within 2%"),
+        ("size_checked",      "Position size reviewed"),
+    ]
+    _all_ok = True
+    for _ck, _cl in _checks:
+        _v = st.checkbox(_cl, key=f"chk_{_ck}")
+        if not _v: _all_ok = False
+    if _all_ok:
+        st.success("✅ All clear — proceed")
+    else:
+        _rem = sum(1 for _ck,_ in _checks if not st.session_state.get(f"chk_{_ck}",False))
+        st.warning(f"⚠ {_rem} item{'s' if _rem>1 else ''} unchecked")
+    if st.button("Reset", key="chk_reset", use_container_width=True):
+        for _ck,_ in _checks:
+            st.session_state[f"chk_{_ck}"] = False
+        st.rerun()
+    st.markdown("---")
+    # Show any active earnings alerts from last scan
+    _em = st.session_state.get("earnings_map", {})
+    if _em:
+        st.markdown(
+            '<div style="font-size:11px;font-weight:600;color:#fca5a5;margin-bottom:4px;">'
+            '⚠ Results upcoming (14d)</div>', unsafe_allow_html=True
+        )
+        for _s, _d in list(_em.items())[:8]:
+            st.markdown(
+                f'<div style="font-size:10px;font-family:JetBrains Mono,monospace;'
+                f'color:#f87171;">{_s} · {_d}</div>', unsafe_allow_html=True
+            )
 st.markdown(
     '''<div style="font-family:Syne,sans-serif;font-size:28px;font-weight:700;
     letter-spacing:-1px;color:#e8e8f4;padding:8px 0 4px;">
@@ -4803,6 +4893,11 @@ if scan_btn:
         f"{rejected} Stage-A filtered · {liq_skipped} illiquid · "
         f"⏱ {elapsed:.1f}s"
     )
+    # v15.8-FIX: fetch earnings dates for all scanned symbols (background, cached 1h)
+    with st.spinner("Checking earnings calendar…"):
+        st.session_state["earnings_map"] = get_earnings_dates(
+            [r["Symbol"] for r in results]
+        )
 
 # ── SPEED-8: Live refresh during market hours ──────────────────────────────────
 if (live_refresh and _is_market_open()
@@ -4906,240 +5001,244 @@ with tab_scanner:
             if signal_is_stale(entry["timestamp"],entry.get("mode",scan_mode_now)):
                 stale_syms.add(entry["symbol"])
 
-        def make_card(i,r,border_color,show_entry=True):
+        # ── v15.8-FIX: helpers for unique signal extraction ──────────────────────
+        def _unique_signals(r):
+            """Extract top-4 most differentiated, stock-specific signals with actual values."""
+            sigs = []
+            # Squeeze depth + duration
+            if r.get("Squeeze"):
+                sb = r.get("SqzBars", 0); sd = r.get("SqzDepth", 1.0)
+                sigs.append({"label":f"Squeeze {sb}d","value":f"{int((1-sd)*100)}% tight","color":"#c084fc","rank":90+sb})
+            # Volume dry-up
+            vdu = r.get("Patterns",{}).get("vol_dryup",{})
+            if vdu.get("dry_up") and vdu.get("intensity",0)>=1:
+                sigs.append({"label":f"Vol Dry {vdu.get('bars',0)}b","value":f"{vdu.get('vol_pct',0):.0f}% avg","color":"#38bdf8","rank":80+vdu.get("intensity",0)*5})
+            # ADX
+            adx = r.get("ADX",0)
+            if adx >= 20:
+                ac = "#22c55e" if adx>=30 else "#f59e0b"
+                al = "Very strong" if adx>=40 else "Strong" if adx>=30 else "Building"
+                sigs.append({"label":f"ADX {adx:.0f}","value":al,"color":ac,"rank":55+adx})
+            # MTF sync
+            ms = r.get("MTFScore",50); ml = r.get("MTFLabel","NEUTRAL")
+            if ms>=62 or ms<=38:
+                mc = "#22c55e" if ms>=62 else "#ef4444"
+                sigs.append({"label":f"MTF {ms:.0f}","value":ml,"color":mc,"rank":ms if ms>=50 else 100-ms})
+            # Institutional
+            iv = r.get("InstVerdict","NEUTRAL"); ic = r.get("InstCMF",0); ins = r.get("InstScore",50)
+            if ins>=65 or ins<=35:
+                ic2 = "#22c55e" if ins>=65 else "#ef4444"
+                sigs.append({"label":f"Inst {ins:.0f}","value":f"CMF {ic:+.3f}","color":ic2,"rank":abs(ins-50)+50})
+            # VCP
+            vcp = r.get("Patterns",{}).get("vcp",{})
+            if vcp.get("detected") and vcp.get("n_contractions",0)>=2:
+                nc=vcp.get("n_contractions",0); tp=vcp.get("tightest_pct",0)
+                sigs.append({"label":f"VCP {nc}×","value":f"{tp:.1f}% tight","color":"#a78bfa","rank":70+nc*5})
+            # AVWAP
+            av_d = r.get("Patterns",{}).get("avwap",{}); av=av_d.get("avwap"); pa=av_d.get("pct_above",0)
+            if av and av_d.get("price_above"):
+                avc = "#38bdf8" if av_d.get("near_support") else "#64748b"
+                sigs.append({"label":f"AVWAP ₹{av:,.0f}","value":f"+{pa:.1f}% above","color":avc,"rank":60+(5 if av_d.get("near_support") else 0)})
+            # RS rank
+            rsr=r.get("RS_Rank",50); rsv=r.get("RS",0)
+            if rsr>=75 or rsr<=25:
+                rsc="#22c55e" if rsr>=75 else "#ef4444"
+                arr="↑" if rsv>=0 else "↓"
+                sigs.append({"label":f"RS Rank {rsr}","value":f"{arr} {abs(rsv):.1f}% vs Nifty","color":rsc,"rank":rsr if rsr>=50 else 100-rsr})
+            # Harmonic
+            if r.get("HarmonicDetected"):
+                hp=r.get("HarmonicPattern",""); hd=r.get("HarmonicDir",""); hq=r.get("HarmonicQuality",0)
+                hc="#22c55e" if hd=="BULL" else "#ef4444"
+                sigs.append({"label":f"{hp}","value":f"{hq}% · {hd}","color":hc,"rank":hq})
+            # Candle pattern
+            cp=r.get("CandlePatterns",[]); cs_=r.get("CandleScore",0)
+            if r.get("CandleSignal") in ("BULL","BULL LEAN") and cp:
+                sigs.append({"label":cp[0],"value":f"Score +{cs_}","color":"#86efac","rank":50+cs_*3})
+            # Darvas breakout
+            dv=r.get("Patterns",{}).get("darvas",{})
+            if dv.get("breakout"):
+                sigs.append({"label":"Darvas Break","value":f"Box {dv.get('box_width_pct',0):.1f}%","color":"#f87171","rank":88})
+            # Fib quality
+            fq=r.get("Patterns",{}).get("fib_quality",{})
+            if fq.get("quality",0)>=60:
+                sigs.append({"label":f"Fib {fq.get('fib_level','—')}","value":f"{fq.get('grade','—')} retracement","color":"#fb923c","rank":fq.get("quality",0)})
+            # 1M momentum (specific %)
+            m1=r.get("Mom1",0)
+            if abs(m1)>=5:
+                mc2="#22c55e" if m1>0 else "#ef4444"
+                sigs.append({"label":"1M Mom","value":f"{m1:+.1f}%","color":mc2,"rank":40+abs(m1)})
+            # Fresh EMA cross
+            if r.get("FreshCross"):
+                sigs.append({"label":"Golden Cross","value":"EMA cross <5 bars","color":"#fbbf24","rank":82})
+            # NR7
+            if r.get("NR7"):
+                sigs.append({"label":"NR7","value":"Narrowest range 7d","color":"#c084fc","rank":72})
+            # Smart money (v15.7)
+            smv=r.get("SmartMoneyVerdict",""); sms=r.get("SmartMoneyScore",50)
+            if smv in ("ACCUMULATING","MARKUP_READY","ABSORBING"):
+                smc="#22c55e" if smv in ("ACCUMULATING","MARKUP_READY") else "#38bdf8"
+                sigs.append({"label":f"SM {smv[:6]}","value":f"Score {sms:.0f}","color":smc,"rank":85})
+            # Accum stage (v15.7)
+            ast=r.get("AccumStage","")
+            if ast in ("1C","2A","2B"):
+                sigs.append({"label":f"Stage {ast}","value":r.get("AccumStageLabel","")[:18],"color":"#22c55e","rank":88 if ast=="2A" else 78})
+            sigs.sort(key=lambda x:x["rank"], reverse=True)
+            return sigs[:4]
+
+        def _caution_line(r):
+            ext_n=r.get("ExtN",0); ext_lb=r.get("ExtLabels",[])
+            if r.get("BreadthGated"): return "Breadth weak — size down"
+            if ext_n>=3: return f"{'/ '.join(ext_lb[:2]) or 'Exhaustion'} — avoid entry"
+            if ext_n==2: return f"{ext_lb[0] if ext_lb else 'Ext'} — halve size"
+            if r.get("MTFDiverge"): return "TF divergence — confirm HTF first"
+            if r.get("RSI",50)>=73: return f"RSI {r.get('RSI',50):.0f} — extended, wait"
+            if not r.get("HTFUp",True): return "HTF bearish — reduce size"
+            ed = st.session_state.get("earnings_map",{}).get(r.get("Symbol",""))
+            if ed: return f"Results {ed} — binary risk"
+            return None
+
+        def make_card(i, r, border_color, show_entry=True):
             sym=r["Symbol"]; act=r["Action"]; ltp=r["LTP"]; chg=r["%Change"]
             score=r["Score"]; phase=r.get("Phase",PHASE_IDLE); conf=r.get("Confidence",0)
-            rsi_val=r.get("RSI","—"); rs_rank=r.get("RS_Rank",50)
-            htf_up=r.get("HTFUp",True); vol_conf=r.get("VolConf",False)
             entry=r.get("Entry"); sl=r.get("SL"); t1=r.get("T1"); t2=r.get("T2"); t3=r.get("T3")
             ext_n=r.get("ExtN",0); ext_labels=r.get("ExtLabels",[])
             sector=r.get("Sector",SECTOR_MAP.get(sym,"—"))
-            breadth_gated=r.get("BreadthGated",False); in_golden=r.get("InGolden",False)
             is_stale=sym in stale_syms
-            # v15 extras
             adx_val=r.get("ADX",0); squeeze=r.get("Squeeze",False); vol_ratio=r.get("VolRatio",1.0)
-
+            # ── computed values shared across both sections ────────────────────
             chg_str=f"+{chg:.2f}%" if chg>=0 else f"{chg:.2f}%"
             chg_col="#22c55e" if chg>=0 else "#ef4444"
-            chg_arr="▲" if chg>=0 else "▼"
             act_bg,act_brd,act_txt=_action_colors(act)
-            phase_col=_phase_color(phase); conf_col=_conf_color(conf)
-            rs_col=_rs_color(rs_rank); trend_col=_trend_color(htf_up)
-            vol_label="High" if vol_conf else "Avg"
+            phase_col=_phase_color(phase)
+            conf_col=_conf_color(conf)
             phase_icon={"BREAKOUT":"🚀","CONT":"↗","ENTRY":"⚡","SETUP":"◎","IDLE":"–","EXIT":"↘"}.get(phase,"")
             ph_arrow=get_phase_arrow(sym)
-            conf_sym=("◆◆◆" if conf>=75 else "◆◆◇" if conf>=50 else "◆◇◇" if conf>=25 else "◇◇◇")
-            num_bg="#22c55e" if act in ("BUY","STRONG BUY") else "#d97706" if act=="WATCH" else "#3a3a60"
-            num_txt="#064e3b" if act in ("BUY","STRONG BUY") else "#431407" if act=="WATCH" else "#c4c6d0"
-            def _fmt_int(v):
+            num_bg="#22c55e" if act in ("BUY","STRONG BUY") else "#f59e0b" if act=="PRE-CONFIRM" else "#d97706" if act=="WATCH" else "#3a3a60"
+            num_txt="#064e3b" if act in ("BUY","STRONG BUY") else "#1a0a00" if act=="PRE-CONFIRM" else "#431407" if act=="WATCH" else "#c4c6d0"
+            score_col="#f59e0b" if act=="STRONG BUY" else "#22c55e" if act in ("BUY","PRE-CONFIRM") else "#3b82f6"
+            def _p(v):
                 if v is None: return "—"
                 try: return f"₹{int(round(v)):,}"
                 except: return "—"
-            def _fmt_entry(v):
-                if v is None: return "—"
-                try: return f"₹{v:,.0f}"
-                except: return "—"
-            entry_str=_fmt_entry(entry) if (show_entry and entry and entry!=ltp) else "—"
-            breadth_badge=('<span style="background:#1e2a40;border:1px solid #3b5998;color:#93b4ff;'
-                           'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:4px;">B-GATE</span>'
-                           if breadth_gated else "")
-            golden_badge=('<span style="background:#f59e0b22;border:1px solid #f59e0b55;color:#f59e0b;'
-                          'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:4px;">GOLDEN</span>'
-                          if in_golden else "")
-            stale_html=('<span style="color:#cbd5e1;font-size:10px;margin-left:6px;">⏱ stale</span>'
-                        if is_stale else "")
-            phase_chip_html=(
-                f'<span style="background:{phase_col}22;border:1px solid {phase_col}66;'
-                f'color:{phase_col};padding:2px 6px;border-radius:4px;'
-                f'font-size:9px;font-weight:700;font-family:DM Sans,sans-serif;'
-                f'letter-spacing:.04em;white-space:nowrap;">'
-                f'{phase_icon} {phase}'+(f' {ph_arrow}' if ph_arrow else '')+f'</span>'
-            )
-            # v15: ADX + squeeze badges
-            adx_col="#22c55e" if adx_val>=30 else "#d97706" if adx_val>=20 else "#ef4444"
-            adx_badge=(f'<span style="background:{adx_col}22;border:1px solid {adx_col}55;'
-                       f'color:{adx_col};padding:1px 5px;border-radius:3px;font-size:9px;'
-                       f'margin-left:3px;">ADX {adx_val:.0f}</span>')
-            squeeze_badge=(
-                '<span style="background:#8b5cf622;border:1px solid #8b5cf655;color:#8b5cf6;'
-                'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">🔄 SQZ</span>'
-                if squeeze else ""
-            )
-            vc_badge=(
-                '<span style="background:#0ea5e922;border:1px solid #0ea5e955;color:#0ea5e9;'
-                'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">VC</span>'
-                if vol_ratio<0.75 else ""
-            )
-            # v15.1/15.3 pattern badges
-            vcp_grade   = r.get("VCPGrade","NONE")
-            avwap_above = r.get("AVWAPAbove",False)
-            fib_grade   = r.get("FibGrade","POOR")
-            vdu_int     = r.get("VDUIntensity",0)
-            rvol_label  = r.get("RVolLabel","NORMAL")
-            darvas_brk  = r.get("DarvasBrk",False)
-            darvas_in   = r.get("DarvasIn",False)
-            vcp_badge=(
-                f'<span style="background:#7c3aed22;border:1px solid #7c3aed88;color:#a78bfa;'
-                f'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
-                f'VCP·{vcp_grade}</span>'
-            ) if vcp_grade not in ("NONE","") else ""
-            avwap_badge=(
-                '<span style="background:#0369a122;border:1px solid #0369a155;color:#38bdf8;'
-                'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">AVWAP↑</span>'
-            ) if avwap_above else ""
-            fib_q_badge=(
-                f'<span style="background:#d9770622;border:1px solid #d9770688;color:#fb923c;'
-                f'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
-                f'FIB·{fib_grade}</span>'
-            ) if fib_grade in ("EXCELLENT","GOOD") else ""
-            vdu_badge=(
-                f'<span style="background:#16213022;border:1px solid #0ea5e955;color:#67e8f9;'
-                f'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
-                f'VDU{"×"*int(vdu_int)}</span>'
-            ) if vdu_int>=1 else ""
-            _rl_colors={"SURGE":("#22c55e","#22c55e22"),"HIGH":("#84cc16","#84cc1622"),
-                        "DRY":("#64748b","#64748b22")}
-            rvol_badge=""
-            if rvol_label in _rl_colors:
-                _rc,_rb=_rl_colors[rvol_label]
-                rvol_badge=(f'<span style="background:{_rb};border:1px solid {_rc}55;color:{_rc};'
-                            f'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
-                            f'RVOL·{rvol_label}</span>')
-            darvas_badge=(
-                '<span style="background:#a3284322;border:1px solid #f4386988;color:#f87171;'
-                'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">DARVAS↑</span>'
-                if darvas_brk else
-                '<span style="background:#78350f22;border:1px solid #f59e0b55;color:#fbbf24;'
-                'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">DARVAS□</span>'
-                if darvas_in else ""
-            )
-            # ── v15.4 engine badges ────────────────────────────────────────────
-            _mtf_lbl = r.get("MTFLabel","NEUTRAL")
-            _mtf_colors = {
-                "BULL SYNC": ("#22c55e","#22c55e22"), "BULL LEAN": ("#86efac","#86efac22"),
-                "BEAR SYNC": ("#ef4444","#ef444422"), "BEAR LEAN": ("#fca5a5","#fca5a522"),
-                "DIVERGE":   ("#f59e0b","#f59e0b22"), "NEUTRAL":   None,
-            }
-            mtf_badge = ""
-            if _mtf_lbl in _mtf_colors and _mtf_colors[_mtf_lbl]:
-                _mc, _mb = _mtf_colors[_mtf_lbl]
-                mtf_badge = (f'<span style="background:{_mb};border:1px solid {_mc}55;color:{_mc};'
-                             f'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
-                             f'MTF·{_mtf_lbl}</span>')
-
-            _inst_lbl = r.get("InstLabel","INST~")
-            _inst_colors = {"INST↑":("#22c55e","#22c55e22"), "INST↓":("#ef4444","#ef444422")}
-            inst_badge = ""
-            if _inst_lbl in _inst_colors:
-                _ic, _ib = _inst_colors[_inst_lbl]
-                inst_badge = (f'<span style="background:{_ib};border:1px solid {_ic}55;color:{_ic};'
-                              f'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
-                              f'{_inst_lbl}</span>')
-
-            harm_badge = ""
-            if r.get("HarmonicDetected"):
-                _hp = r.get("HarmonicPattern","?")
-                _hd = r.get("HarmonicDir","?")
-                _hc = "#22c55e" if _hd=="BULL" else "#ef4444"
-                harm_badge = (f'<span style="background:{_hc}22;border:1px solid {_hc}55;color:{_hc};'
-                              f'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
-                              f'{_hp}</span>')
-
-            _cs = r.get("CandleSignal","NEUTRAL")
-            _candle_colors = {
-                "BULL":("#22c55e","#22c55e22"),"BULL LEAN":("#86efac","#86efac22"),
-                "BEAR":("#ef4444","#ef444422"),"BEAR LEAN":("#fca5a5","#fca5a522"),
-            }
-            candle_badge = ""
-            if _cs in _candle_colors:
-                _cc, _cb = _candle_colors[_cs]
-                _cpats = r.get("CandlePatterns",[])
-                _cpat_str = _cpats[0] if _cpats else _cs
-                candle_badge = (f'<span style="background:{_cb};border:1px solid {_cc}55;color:{_cc};'
-                                f'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">'
-                                f'🕯 {_cpat_str}</span>')
-            if r.get("NR7"):
-                candle_badge += ('<span style="background:#7c3aed22;border:1px solid #7c3aed55;color:#a78bfa;'
-                                 'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">NR7</span>')
-            metrics=[
-                ("Trend",f'<span style="color:{trend_col};font-weight:600;">{"+ Bullish" if htf_up else "− Bearish"}</span>'),
-                ("RSI",  f'<span style="color:#e8e8f4;">{rsi_val}</span>'),
-                ("RS",   f'<span style="color:{rs_col};font-weight:600;">RS {rs_rank}</span>'),
-                ("HTF",  f'<span style="color:{trend_col};font-weight:700;">{"↑ Bull" if htf_up else "↓ Bear"}</span>'),
-                ("Vol",  f'<span style="color:#e8e8f4;">{vol_label}</span>'),
-                ("Conf", f'<span style="color:{conf_col};font-family:JetBrains Mono,monospace;letter-spacing:.1em;">{conf_sym}</span>'),
-                ("Regime", f'<span style="color:#94a3b8;font-size:9px;">{r.get("RegimeLabel","—")}</span>'),
-                ("Inst",   f'<span style="color:#94a3b8;font-size:9px;">{r.get("InstVerdict","—")}</span>'),
-            ]
-            metric_grid_html=(
-                '<div style="display:grid;grid-template-columns:1fr 1fr;gap:0;'
-                'margin-top:8px;border:1px solid #1e1e40;border-radius:6px;overflow:hidden;">'
-                +"".join(
-                    f'<div style="display:flex;justify-content:space-between;align-items:center;'
-                    f'padding:3px 8px;border-bottom:1px solid #15152a;'
-                    f'{"border-right:1px solid #15152a;" if idx%2==0 else ""}">'
-                    f'<span style="color:#475569;font-size:9px;letter-spacing:.06em;text-transform:uppercase;">{label}</span>'
-                    f'<span style="font-family:JetBrains Mono,monospace;font-size:11px;">{val}</span></div>'
-                    for idx,(label,val) in enumerate(metrics))
-                +'</div>'
-            )
-            ext_pills_html=""
+            ref = entry if (show_entry and entry and entry!=ltp) else ltp
+            risk_pct = reward_pct = rr = None
+            if ref and sl:
+                risk = ref-sl
+                if risk>0:
+                    risk_pct = risk/ref*100
+                    tgt = t2 or t1
+                    if tgt:
+                        reward_pct = (tgt-ref)/ref*100
+                        rr = reward_pct/risk_pct
+            rr_col="#22c55e" if (rr and rr>=2) else "#f59e0b" if (rr and rr>=1.5) else "#475569"
+            rr_str=f"{rr:.1f}×" if rr else "—"
+            entry_disp = f"₹{entry:,.0f}" if (show_entry and entry and entry!=ltp) else f"₹{ltp:,.2f}"
+            stale_dot = ' <span style="color:#475569;font-size:9px;">⏱</span>' if is_stale else ""
+            # earnings badge
+            ed = st.session_state.get("earnings_map",{}).get(sym)
+            earn_html = (f'<span style="background:#7f1d1d;border:1px solid #ef4444;color:#fca5a5;'
+                         f'padding:1px 5px;border-radius:3px;font-size:9px;font-weight:700;margin-left:4px;">'
+                         f'⚠ RESULTS {ed}</span>') if ed else ""
+            # unique signal rows
+            sigs = _unique_signals(r)
+            sig_rows = "".join(
+                f'<div style="display:flex;align-items:center;justify-content:space-between;'
+                f'padding:4px 0;border-bottom:1px solid #0c1222;">'
+                f'<span style="color:#475569;font-family:JetBrains Mono,monospace;font-size:9px;'
+                f'width:90px;flex-shrink:0;">{s["label"]}</span>'
+                f'<div style="flex:1;margin:0 6px;background:#0c1222;border-radius:2px;height:3px;">'
+                f'<div style="background:{s["color"]};width:{min(s["rank"],100)}%;height:3px;border-radius:2px;"></div></div>'
+                f'<span style="color:{s["color"]};font-family:JetBrains Mono,monospace;font-size:9px;'
+                f'font-weight:600;text-align:right;min-width:70px;">{s["value"]}</span>'
+                f'</div>'
+                for s in sigs
+            ) if sigs else '<div style="color:#1e293b;font-size:9px;padding:4px 0;">No dominant signals</div>'
+            caution = _caution_line(r)
+            caution_html = (
+                f'<div style="display:flex;gap:4px;align-items:flex-start;'
+                f'padding:4px 6px;margin-top:4px;background:#1c0700;border-left:2px solid #f59e0b;border-radius:2px;">'
+                f'<span style="color:#f59e0b;font-size:9px;flex-shrink:0;">⚠</span>'
+                f'<span style="color:#fbbf24;font-size:9px;">{caution}</span></div>'
+            ) if caution else ""
+            # exhaustion strip
+            ext_html = ""
             if ext_n>0:
-                pills=[]
-                for lbl in ext_labels[:2]:
-                    ec_bg="#3b1a0a" if ext_n>=3 else "#2a1e00"
-                    ec_brd="#ef444466" if ext_n>=3 else "#f59e0b66"
-                    ec_txt="#fca5a5" if ext_n>=3 else "#fbbf24"
-                    pills.append(f'<span style="background:{ec_bg};border:1px solid {ec_brd};color:{ec_txt};'
-                                  f'padding:3px 8px;border-radius:5px;font-size:10px;margin-right:4px;">⚠ {lbl}</span>')
-                ext_pills_html=('<div style="padding:5px 14px 8px;background:#0d0d1a;display:flex;flex-wrap:wrap;gap:4px;">'
-                                +"".join(pills)+'</div>')
-            sector_row_html=(
-                f'<div style="padding:4px 14px 5px;border-top:1px solid #1e1e40;background:#0d0d1a;'
-                f'display:flex;align-items:center;justify-content:space-between;">'
-                f'<span style="color:#475569;font-size:8px;letter-spacing:.06em;text-transform:uppercase;">SECTOR</span>'
-                f'<span style="color:#94a3b8;font-size:9px;font-family:DM Sans,sans-serif;">{sector}</span></div>'
-            )
-            footer_items=[("ENTRY",entry_str),("T1",_fmt_int(t1)),("T2",_fmt_int(t2)),("T3",_fmt_int(t3)),("SL",_fmt_int(sl))]
-            footer_cells="".join(
-                f'<div><div style="color:#475569;font-size:8px;letter-spacing:.06em;">{lbl}</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#e2e8f0;font-size:11px;">{val}</div></div>'
-                for lbl,val in footer_items)
+                ec="#fca5a5" if ext_n>=3 else "#fbbf24"
+                eb="#3b1a0a" if ext_n>=3 else "#2a1e00"
+                pills="  ".join(f'⚠ {lb}' for lb in ext_labels[:2])
+                ext_html=(f'<div style="padding:3px 10px;background:{eb};'
+                          f'border-top:1px solid #1e293b;">'
+                          f'<span style="color:{ec};font-size:9px;">{pills}</span></div>')
+
             return (
-                f'<div style="background:#111120;border:1px solid {border_color};border-radius:12px;'
-                f'overflow:hidden;width:360px;min-width:320px;max-width:380px;flex:1 1 360px;">'
-                f'<div style="display:flex;align-items:center;padding:8px 12px 7px;'
-                f'border-bottom:1px solid #1e1e40;gap:7px;background:#0e0e1c;flex-wrap:nowrap;">'
+                f'<div style="background:#080d16;border:1px solid {border_color};'
+                f'border-top:2px solid {border_color};border-radius:8px;'
+                f'overflow:hidden;width:340px;min-width:310px;max-width:360px;flex:1 1 340px;">'
+                # Header
+                f'<div style="display:flex;align-items:center;padding:9px 11px 7px;'
+                f'gap:7px;background:#0b1120;border-bottom:1px solid #0c1222;">'
                 f'<div style="background:{num_bg};color:{num_txt};font-family:JetBrains Mono,monospace;'
-                f'font-size:12px;font-weight:700;padding:3px 7px;border-radius:5px;min-width:28px;text-align:center;flex-shrink:0;">{i+1:02d}</div>'
+                f'font-size:11px;font-weight:700;padding:2px 6px;border-radius:4px;'
+                f'min-width:24px;text-align:center;flex-shrink:0;">{i+1:02d}</div>'
                 f'<div style="flex:1;min-width:0;">'
-                f'<div style="display:flex;align-items:center;gap:5px;flex-wrap:nowrap;">'
-                f'<span style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:15px;font-weight:700;letter-spacing:-.02em;white-space:nowrap;">{sym}</span>'
-                f'{golden_badge}{breadth_badge}</div>'
-                f'<div style="margin-top:3px;display:flex;flex-wrap:wrap;gap:2px;">{phase_chip_html}{adx_badge}{squeeze_badge}{vc_badge}{vcp_badge}{avwap_badge}{fib_q_badge}{vdu_badge}{rvol_badge}{darvas_badge}{mtf_badge}{inst_badge}{harm_badge}{candle_badge}</div>'
-                f'</div>'
+                f'<div style="display:flex;align-items:center;gap:4px;">'
+                f'<span style="font-family:Syne,sans-serif;color:#f1f5f9;font-size:14px;'
+                f'font-weight:700;letter-spacing:-.01em;">{sym}</span>{stale_dot}{earn_html}</div>'
+                f'<div style="display:flex;align-items:center;gap:4px;margin-top:2px;">'
+                f'<span style="background:{phase_col}18;color:{phase_col};font-size:9px;'
+                f'font-weight:600;padding:1px 5px;border-radius:3px;">'
+                f'{phase_icon} {phase}{(" "+ph_arrow) if ph_arrow else ""}</span>'
+                f'<span style="color:#1e293b;font-size:9px;">{sector}</span></div></div>'
                 f'<span style="background:{act_bg};border:1px solid {act_brd};color:{act_txt};'
-                f'padding:3px 8px;border-radius:5px;font-size:10px;font-weight:700;font-family:DM Sans,sans-serif;flex-shrink:0;">{act}</span>'
-                f'<span style="background:{conf_col}22;border:1px solid {conf_col}55;color:{conf_col};'
-                f'font-family:JetBrains Mono,monospace;font-size:11px;padding:3px 7px;border-radius:5px;flex-shrink:0;">{conf}%</span>'
-                +stale_html+
+                f'padding:2px 7px;border-radius:4px;font-size:9px;font-weight:700;flex-shrink:0;">{act}</span>'
                 f'</div>'
-                f'<div style="padding:10px 14px 8px;">'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:24px;font-weight:600;line-height:1;">&#8377;{ltp:,.2f}</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:{chg_col};font-size:12px;margin-top:2px;font-weight:500;">{chg_str} {chg_arr}</div>'
-                +metric_grid_html+
+                # Price + score
+                f'<div style="display:flex;align-items:center;justify-content:space-between;'
+                f'padding:7px 11px;border-bottom:1px solid #0c1222;">'
+                f'<div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#f8fafc;'
+                f'font-size:19px;font-weight:700;line-height:1;">₹{ltp:,.2f}</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:{chg_col};'
+                f'font-size:10px;margin-top:2px;">{chg_str}</div>'
                 f'</div>'
-                f'<div style="display:flex;justify-content:space-between;align-items:flex-end;'
-                f'padding:6px 14px 5px;border-top:1px solid #1e1e40;background:#0d0d1a;flex-wrap:wrap;gap:6px;">'
-                +footer_cells+
+                f'<div style="text-align:right;">'
+                f'<div style="background:#0c1222;border-radius:2px;width:72px;height:3px;'
+                f'margin-bottom:3px;margin-left:auto;">'
+                f'<div style="background:{score_col};width:{min(int(score),100)}%;height:3px;border-radius:2px;"></div></div>'
+                f'<div style="color:{score_col};font-family:JetBrains Mono,monospace;'
+                f'font-size:14px;font-weight:700;">{score:.0f}</div>'
+                f'<div style="color:{conf_col};font-size:9px;">{conf}% conf</div>'
+                f'</div></div>'
+                # Trade levels (compact grid)
+                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;'
+                f'background:#0c1222;border-bottom:1px solid #0c1222;">'
+                f'<div style="background:#080d16;padding:5px 9px;">'
+                f'<div style="color:#1e293b;font-size:8px;text-transform:uppercase;">Entry</div>'
+                f'<div style="color:#e2e8f0;font-family:JetBrains Mono,monospace;font-size:10px;font-weight:600;">{entry_disp}</div>'
                 f'</div>'
-                +sector_row_html+ext_pills_html+
+                f'<div style="background:#080d16;padding:5px 9px;">'
+                f'<div style="color:#1e293b;font-size:8px;text-transform:uppercase;">Stop</div>'
+                f'<div style="color:#f87171;font-family:JetBrains Mono,monospace;font-size:10px;font-weight:600;">{_p(sl)}</div>'
+                f'<div style="color:#7f1d1d;font-size:8px;">{"−"+str(round(risk_pct,1))+"%" if risk_pct else "—"}</div>'
+                f'</div>'
+                f'<div style="background:#080d16;padding:5px 9px;">'
+                f'<div style="color:#1e293b;font-size:8px;text-transform:uppercase;">Target</div>'
+                f'<div style="color:#4ade80;font-family:JetBrains Mono,monospace;font-size:10px;font-weight:600;">{_p(t2 or t1)}</div>'
+                f'<div style="color:{rr_col};font-size:8px;">R:R {rr_str}</div>'
+                f'</div></div>'
+                # Signals section
+                f'<div style="padding:7px 11px 5px;">'
+                f'<div style="color:#1e293b;font-size:8px;letter-spacing:.1em;'
+                f'text-transform:uppercase;margin-bottom:5px;">WHY NOW</div>'
+                + sig_rows + caution_html +
+                f'</div>'
+                + ext_html +
                 f'</div>'
             )
 
         ACTIONABLE_PHASES={PHASE_ENTRY,PHASE_CONT,PHASE_BRK}
         actionable=[r for r in st.session_state.results
-                    if r.get("Phase") in ACTIONABLE_PHASES and r["Action"] in ("BUY","STRONG BUY")]
+                    if r.get("Phase") in ACTIONABLE_PHASES and r["Action"] in ("BUY","STRONG BUY","PRE-CONFIRM")]
         phase_rank={PHASE_BRK:0,PHASE_CONT:1,PHASE_ENTRY:2}
         actionable.sort(key=lambda x:(phase_rank.get(x.get("Phase"),9),-x["Score"]))
         top_act=actionable[:15]
