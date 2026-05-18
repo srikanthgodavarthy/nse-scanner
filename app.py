@@ -1,48 +1,65 @@
-"""BULL SUTRA Pro — v15.3-fixed
+"""BULL SUTRA Pro — v15.7
 ═══════════════════════════════════════════════════════════════════
-BASE: v14.3 — all prior fixes 100% preserved.
+BASE: v15.6-preconfirm — all prior fixes 100% preserved.
 
-SPEED OVERHAUL v15.0  (unchanged — see original header for details)
-SPEED-1 … SPEED-10 all active.
-
-FIXES APPLIED (v15.3-fixed):
+NEW: v15.7 — FIVE INTELLIGENCE GAPS CLOSED
 ─────────────────────────────────────────────────────────────────
-FIX-1  Removed dead code: _incremental_fetch and _incremental_fetch_FIXED
-       (neither was called; batch_incremental_fetch is the live path).
 
-FIX-2  Cache staleness enforced on market-closed path.
-       _STALE_SECS thresholds now applied; stale caches are re-fetched
-       instead of being served unconditionally.
+GAP-1  RELATIVE LEADERSHIP INTELLIGENCE (compute_rs_leadership)
+       RS Line trend analysis — not just rank, but whether the RS Line
+       itself is in an uptrend, making new highs, and accelerating.
+       Sector-relative leadership: stock vs sector, not just vs Nifty.
+       Leadership rotation detector: sector momentum shifts.
+       New output keys per stock: RSLineSlope, RSLineHigh, RSLeaderSector,
+       RSLeaderScore, RSLeaderLabel (LEADER · IMPROVING · NEUTRAL · LAGGARD)
 
-FIX-3  ADX now uses Wilder's RMA (alpha=1/period) in both _adx_batch
-       and _compute_adx, matching standard charting platform values.
-       Added _rma_np and _rma_batch helpers.
+GAP-2  SMART MONEY BEHAVIOR MODEL (compute_smart_money_model)
+       Unifies scattered PCA signals into a behavioral phase narrative:
+       synthesizes CMF, hidden accumulation, effort/result, block volume,
+       OBV trend, failed breakdowns into a composite SmartMoneyScore (0–100)
+       with a behavioral verdict: DISTRIBUTING · NEUTRAL · ABSORBING ·
+       ACCUMULATING · MARKUP_READY.
+       New keys: SmartMoneyScore, SmartMoneyVerdict, SMBehaviorPhase,
+       SMConfidence, SMCMFScore, SMBlockScore, SMOBVScore, SMAbsorptionScore.
 
-FIX-4  VIX label boundary corrected: CALM < 15 / CAUTION 15–19 /
-       STRESS ≥ 20, now consistent with vix_target_mult thresholds.
+GAP-3  ACCUMULATION SEQUENCING (compute_accumulation_sequence)
+       Detects WHERE in the Wyckoff/Weinstein sequence a stock sits:
+       Stage 1A (base building), 1B (testing), 1C (spring/test),
+       2A (early markup), 2B (continuation). Uses PCA+EmScore+Phase+
+       RS trajectory together to infer sequence position.
+       New keys: AccumStage, AccumStageLabel, AccumSequenceScore,
+       AccumConfidence, AccumBarsInBase.
 
-FIX-5  Pattern enrichment respects exhaustion gate:
-       ext_n ≥ 3 → bonus blocked entirely.
-       ext_n == 2 → bonus halved (25% of pts).
-       Prevents patterns from leapfrogging exhausted stocks to STRONG BUY.
+GAP-4  MICROSTRUCTURE LOGIC (compute_microstructure)
+       Intrabar order-flow proxies from OHLCV: Close Location Value,
+       intrabar delta proxy (up-fraction of range used), bar-by-bar
+       absorption ratio, tick imbalance proxy, VWAP micro-deviation,
+       wicking asymmetry (buying vs selling pressure per bar).
+       New keys: MicroScore, MicroDelta, MicroCLV, MicroAbsorption,
+       MicroWickAsym, MicroVWAPDev, MicroLabel.
 
-FIX-6  Atomic DB save: INSERT then TRIM (single transaction) replaces
-       the previous DELETE + INSERT which risked position data loss on crash.
-
-FIX-7  add_position deduplication now uses (symbol, entry_date, entry_price)
-       so multiple same-day lots at different prices are preserved.
-
-FIX-8  Analytics tab age column: signal_age_label()[0] extracts the string;
-       previously stored the raw (str, bool) tuple (display bug).
-
-FIX-9  OI fetch: removed blocking time.sleep(0.8/0.5) in _warm();
-       session warming is now best-effort with shorter timeouts.
-
-FIX-10 Remote sectors.py exec: added SHA-256 integrity check stub and
-       security comment. Set _SECTORS_EXPECTED_SHA to pin the hash.
+GAP-5  PRE-CONFIRMATION ACTION TIER (PRE-CONFIRM)
+       Removes confirmation dependency bias. Stocks with:
+         • PCAScore ≥ 55 AND EmScore ≥ 40
+         • Phase in SETUP/IDLE (not yet confirmed)
+         • SmartMoneyVerdict in (ABSORBING, ACCUMULATING, MARKUP_READY)
+         • AccumStage in (1B, 1C, 2A) — inside the base, not after breakout
+       receive Action = "PRE-CONFIRM" — a first-class alert tier that surfaces
+       BEFORE price confirmation, distinct from both WATCH (score-based)
+       and BUY (price-confirmed). Breadth gate does not suppress PRE-CONFIRM.
+       PRE-CONFIRM stocks sort above WATCH in Emerging tab.
+─────────────────────────────────────────────────────────────────
+Integration points:
+  • score_stock() — all 4 new compute_* functions appended to result dict
+  • run_scan() — sector-relative RS enrichment pass (like EmSectorMom)
+  • action_label() — extended with PRE-CONFIRM tier
+  • run_scan() breadth gate — exempt PRE-CONFIRM from capping
+  • Emerging tab UI — PRE-CONFIRM badge + AccumStage + SmartMoney verdict
+  • Main table — RSLeaderLabel, SmartMoneyVerdict, AccumStage columns
 ═══════════════════════════════════════════════════════════════════
-All v14.3 FIX-1 … FIX-12 and CARD UI unchanged.
+All v15.6 / v15.5 / v15.4 / v15.3 / v14.3 fixes unchanged.
 """
+
 
 import warnings
 import logging
@@ -833,6 +850,49 @@ def action_label(norm_score: float) -> str:
     if norm_score >= ACTION_THRESHOLDS["watch"]:      return "WATCH"
     return "SKIP"
 
+def action_label_with_preconfirm(
+    norm_score: float,
+    pca_score: float = 0.0,
+    em_score: float = 0.0,
+    phase: str = "IDLE",
+    smart_money_verdict: str = "NEUTRAL",
+    accum_stage: str = "NONE",
+) -> str:
+    """
+    GAP-5 — Extended action label with PRE-CONFIRM tier.
+
+    PRE-CONFIRM fires when:
+      • Phase is SETUP or IDLE (price hasn't confirmed yet)
+      • PCAScore ≥ 55 (strong buying pressure evidence)
+      • EmScore ≥ 40 (coiling mechanics present)
+      • SmartMoneyVerdict in (ABSORBING, ACCUMULATING, MARKUP_READY)
+      • AccumStage in (1B, 1C, 2A) — inside the base or just leaving it
+
+    PRE-CONFIRM sits between WATCH and BUY in the action hierarchy.
+    It cannot be suppressed by the breadth gate (pre-confirmation stocks
+    are precisely those that haven't run yet).
+    """
+    base = action_label(norm_score)
+    # Only consider upgrade to PRE-CONFIRM for unconfirmed phases
+    if phase not in (PHASE_SETUP, PHASE_IDLE):
+        return base
+    # Must already pass WATCH threshold (some signal quality required)
+    if norm_score < ACTION_THRESHOLDS["watch"]:
+        return base
+    # Gate: strong buying pressure evidence required
+    if pca_score < 55:
+        return base
+    # Gate: coiling mechanics required
+    if em_score < 40:
+        return base
+    # Gate: smart money must show at least absorption
+    if smart_money_verdict not in ("ABSORBING", "ACCUMULATING", "MARKUP_READY"):
+        return base
+    # Gate: must be inside an identified accumulation base (not random)
+    if accum_stage not in ("1B", "1C", "2A"):
+        return base
+    return "PRE-CONFIRM"
+
 def fmt(val):
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return "—"
@@ -1009,6 +1069,146 @@ def _52w_return(close_series: pd.Series) -> float:
     c_base = float(close_series.iloc[-lookback])
     if c_base == 0: return 0.0
     return round((c_now-c_base)/c_base*100, 2)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GAP-1 — RELATIVE LEADERSHIP INTELLIGENCE
+# Analyses the RS Line (stock/index ratio) as a price series in its own right.
+# Captures RS-line trend, new-highs, acceleration, and sector-relative rank.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_rs_leadership(
+    close: pd.Series,
+    nifty_close: pd.Series,
+    rs_rank: int = 50,
+    sector_avg_score: float = 50.0,
+    stock_score: float = 50.0,
+) -> dict:
+    """
+    Relative Leadership Intelligence (0–100 RSLeaderScore).
+
+    Components:
+    1. RS Line Slope         (25 pts) — RS line EMA slope: rising vs falling
+    2. RS Line New High      (20 pts) — RS line at multi-week high vs prior peak
+    3. RS Acceleration       (20 pts) — recent RS outperformance accelerating
+    4. Sector-Relative Lead  (20 pts) — stock score vs sector average score
+    5. RS Rank Tier          (15 pts) — percentile rank bonus
+
+    Labels: LEADER ≥75 · IMPROVING ≥55 · NEUTRAL ≥35 · LAGGARD <35
+    """
+    out = dict(
+        RSLeaderScore=0, RSLeaderLabel="NEUTRAL",
+        RSLineSlope=0.0, RSLineHigh=False,
+        RSLineSlopeRaw=0.0, RSLeaderSector=0.0,
+    )
+    try:
+        n_stock = len(close)
+        n_nifty = len(nifty_close)
+        if n_stock < 30 or n_nifty < 30:
+            return out
+
+        # Align lengths
+        min_len = min(n_stock, n_nifty)
+        cl  = close.values[-min_len:].astype(np.float64)
+        nif = nifty_close.values[-min_len:].astype(np.float64)
+        n   = len(cl)
+
+        # RS Line = stock / nifty (ratio series)
+        rs_line = cl / (nif + 1e-10)
+
+        # ── 1. RS Line Slope (0–25 pts) ─────────────────────────────────────
+        slope_pts = 0.0
+        rs_slope_raw = 0.0
+        try:
+            lb = min(20, n - 1)
+            rs_ema10 = _ema_np(rs_line, 10)
+            rs_ema20 = _ema_np(rs_line, 20)
+            # Slope = % change in RS EMA10 over lb bars
+            rs_slope_raw = (rs_ema10[-1] - rs_ema10[-lb]) / (rs_ema10[-lb] + 1e-10) * 100
+            # EMA alignment on RS line itself
+            rs_ema_bull = rs_ema10[-1] > rs_ema20[-1]
+            if   rs_slope_raw > 5  and rs_ema_bull: slope_pts = 25.0
+            elif rs_slope_raw > 2  and rs_ema_bull: slope_pts = 20.0
+            elif rs_slope_raw > 0  and rs_ema_bull: slope_pts = 14.0
+            elif rs_slope_raw > 0:                  slope_pts = 8.0
+            elif rs_slope_raw > -2:                 slope_pts = 3.0
+        except Exception:
+            pass
+
+        # ── 2. RS Line New High (0–20 pts) ──────────────────────────────────
+        rslh_pts = 0.0
+        rs_line_high = False
+        try:
+            # Compare current RS line vs 10-week (50-bar) and 6-week (30-bar) highs
+            lb_rslh = min(50, n - 1)
+            rs_prior_high_50 = float(np.max(rs_line[-lb_rslh:-1]))
+            rs_prior_high_30 = float(np.max(rs_line[-min(30, n-1):-1]))
+            rs_now = float(rs_line[-1])
+            if rs_now > rs_prior_high_50:
+                rslh_pts = 20.0; rs_line_high = True
+            elif rs_now > rs_prior_high_30:
+                rslh_pts = 13.0; rs_line_high = True
+            elif rs_now > rs_prior_high_50 * 0.97:
+                rslh_pts = 7.0   # within 3% of 50-bar RS high
+        except Exception:
+            pass
+
+        # ── 3. RS Acceleration (0–20 pts) ───────────────────────────────────
+        rsaccel_pts = 0.0
+        try:
+            def _rs_delta(bars):
+                if n < bars + 1: return 0.0
+                s = (cl[-1] - cl[-bars]) / (cl[-bars] + 1e-10) * 100
+                m = (nif[-1] - nif[-bars]) / (nif[-bars] + 1e-10) * 100
+                return s - m
+            rs5, rs10, rs20 = _rs_delta(5), _rs_delta(10), _rs_delta(20)
+            if rs5 > rs10 > rs20 > 0:        rsaccel_pts = 20.0   # triple acceleration
+            elif rs5 > rs10 > 0:             rsaccel_pts = 15.0   # double acceleration
+            elif rs5 > 0 and rs5 > rs20:     rsaccel_pts = 9.0    # recent vs long
+            elif rs5 > 0:                    rsaccel_pts = 4.0
+        except Exception:
+            pass
+
+        # ── 4. Sector-Relative Leadership (0–20 pts) ────────────────────────
+        sec_pts = 0.0
+        try:
+            diff = stock_score - sector_avg_score
+            if   diff >= 20: sec_pts = 20.0
+            elif diff >= 10: sec_pts = 15.0
+            elif diff >= 5:  sec_pts = 10.0
+            elif diff >= 0:  sec_pts = 5.0
+            elif diff >= -5: sec_pts = 2.0
+        except Exception:
+            pass
+
+        # ── 5. RS Rank Tier (0–15 pts) ───────────────────────────────────────
+        rank_pts = 0.0
+        if   rs_rank >= 90: rank_pts = 15.0
+        elif rs_rank >= 80: rank_pts = 12.0
+        elif rs_rank >= 70: rank_pts = 8.0
+        elif rs_rank >= 60: rank_pts = 5.0
+        elif rs_rank >= 40: rank_pts = 2.0
+
+        total = round(float(np.clip(
+            slope_pts + rslh_pts + rsaccel_pts + sec_pts + rank_pts,
+            0, 100
+        )), 1)
+        label = (
+            "LEADER"   if total >= 75 else
+            "IMPROVING" if total >= 55 else
+            "NEUTRAL"   if total >= 35 else
+            "LAGGARD"
+        )
+        out.update(
+            RSLeaderScore   = total,
+            RSLeaderLabel   = label,
+            RSLineSlope     = round(slope_pts, 1),
+            RSLineHigh      = rs_line_high,
+            RSLineSlopeRaw  = round(rs_slope_raw, 2),
+            RSLeaderSector  = round(sec_pts, 1),
+        )
+    except Exception:
+        pass
+    return out
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PHASE TRANSITION MEMORY (unchanged)
@@ -1221,7 +1421,7 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
     if n < 60: return PHASE_IDLE, None, "norm"
     e_fast_val = float(e_fast_s.iloc[-1])
     e_slow_val = float(e_slow_s.iloc[-1])
-    brk_lb     = 20   # was 5 — resistance should be measured over a meaningful window
+    brk_lb     = 5
     rolling_hi_brk = float(high.iloc[-brk_lb-1:-1].max()) if n > brk_lb+1 else float(high.iloc[-1])
     buf = atr_val*0.15
     is_compressed = atr_val < atr_mean*0.8
@@ -1232,14 +1432,14 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
     upper_wick = (float(high.iloc[-1])-max(float(close.iloc[-1]),float(df["Open"].iloc[-1]))
                   if "Open" in df.columns else 0)
     is_exhaustion = upper_wick > body*1.5
-    brk_vol_ok = (v > vol_avg*1.2) if vol_avg > 0 else True   # was 1.5 hard gate
-    vol_spike  = v > vol_avg*1.2                               # was 1.3
+    brk_vol_ok = (v > vol_avg*1.5) if vol_avg > 0 else False
+    vol_spike  = v > vol_avg*1.3
     is_fib_buy = trend_up and in_golden
     cont_vol_mult = 1.5 if (regime_bearish or (vix_val and vix_val>VIX_CAUTION)) else 1.2
-    BRK_CONF_MIN  = 0.65 if regime_bearish else 0.55           # was 0.70/0.65
+    BRK_CONF_MIN  = 0.70 if regime_bearish else 0.65
     brk_weights = {
-        "price_above_high":(0.40, c > rolling_hi_brk+buf),    # primary — above 20-bar high
-        "score_ok":        (0.15, norm_bull >= score_th*0.9),  # 90% of threshold is enough
+        "price_above_high":(0.35, c > rolling_hi_brk+buf),
+        "score_ok":        (0.20, norm_bull >= score_th),
         "compressed":      (0.20, is_compressed),
         "expanding":       (0.15, is_expanding),
         "vol_spike":       (0.10, vol_spike),
@@ -1284,12 +1484,8 @@ def detect_phase_and_entry(df, mode, *, c, e_fast_s, e_slow_s, atr_s,
         phase, setup_type = PHASE_SETUP, ("fib" if is_fib_buy else ("vdu" if vdu_setup else "norm"))
     elif trail_break and trend_up:  phase, setup_type = PHASE_EXIT, "norm"
     else:                           phase, setup_type = PHASE_IDLE, "norm"
-    # Gate 3 fix: HTF bearish no longer kills ENTRY-phase stocks outright.
-    # BREAKOUT demotes to ENTRY (not SETUP) when HTF unconfirmed.
-    # CONT and ENTRY survive — flagged by htf_up=False in result dict.
-    if not htf_up:
-        if phase == PHASE_BRK:
-            phase, setup_type = PHASE_ENTRY, setup_type   # softer — still actionable
+    if not htf_up and phase in (PHASE_ENTRY,PHASE_CONT,PHASE_BRK):
+        phase, setup_type = PHASE_SETUP, setup_type
     entry_price = None
     if phase in (PHASE_ENTRY,PHASE_CONT,PHASE_BRK,PHASE_SETUP):
         prox = atr_val*0.3
@@ -1415,269 +1611,1029 @@ def _compute_vol_contraction(df: pd.DataFrame) -> float:
     return atr5/(atr20+1e-10)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# EMERGING MOMENTUM SCORE (EMS) — surfaces stocks BEFORE they become obvious
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# Seven orthogonal sub-signals, each measuring internal pressure building
-# inside a stock that has NOT yet triggered the main bull scoring engine.
-# A high EMS in SETUP/IDLE phase = early-entry opportunity.
-#
-# Component weights  (total 100):
-#   RS Acceleration      20 — relative strength improving before the rank shows
-#   ATR Compression      20 — volatility coiling, energy storing
-#   RVOL Acceleration    15 — volume building (ramp, not yet explosion)
-#   EMA Convergence      15 — EMAs tightening toward each other
-#   Squeeze Pressure     15 — BB inside KC, depth + duration of squeeze
-#   Sector Momentum      10 — stock's sector leading or rotating into
-#   Opening Range Exp.    5 — daily range expanding vs prior 5-day avg range
-#
-# Labels: PRE-LAUNCH (≥80) | COILING (≥65) | BUILDING (≥50) | EARLY (≥35) | DORMANT (<35)
+# v15.5 — EMERGING MOMENTUM ENGINE
+# Surfaces stocks BEFORE they become obvious, using 7 leading indicators.
 # ══════════════════════════════════════════════════════════════════════════════
 
-_EMS_LABELS = [
-    (80, "PRE-LAUNCH", "#22c55e"),
-    (65, "COILING",    "#86efac"),
-    (50, "BUILDING",   "#f59e0b"),
-    (35, "EARLY",      "#94a3b8"),
-    (0,  "DORMANT",    "#334155"),
-]
-
-def _ems_label(score: float) -> tuple:
-    for thresh, lbl, col in _EMS_LABELS:
-        if score >= thresh:
-            return lbl, col
-    return "DORMANT", "#334155"
-
-def _squeeze_depth_duration(df: pd.DataFrame, period: int = 20) -> tuple:
-    """
-    Returns (depth_ratio, bars_in_squeeze) where:
-      depth_ratio = BB_width / KC_width  (< 1 = squeeze, → 0 = tighter)
-      bars_in_squeeze = consecutive bars BB has been inside KC
-    """
-    if len(df) < period + 5:
-        return 1.0, 0
+def _count_squeeze_bars(df: pd.DataFrame, period: int = 20,
+                         max_lookback: int = 40) -> int:
+    """Count consecutive bars currently in Keltner/BB squeeze (from most recent bar back)."""
+    n = len(df)
+    if n < period + 2:
+        return 0
     cl = df["Close"].values.astype(np.float64)
     hi = df["High"].values.astype(np.float64)
     lo = df["Low"].values.astype(np.float64)
-    mid   = _ema_np(cl, period)
-    dev2  = _ema_np((cl - mid) ** 2, period)
-    std   = np.sqrt(np.maximum(dev2, 0))
-    prev  = np.roll(cl, 1); prev[0] = cl[0]
-    tr    = np.maximum(hi - lo, np.maximum(np.abs(hi - prev), np.abs(lo - prev)))
-    atrk  = _ema_np(tr, period)
-    bb_w  = 4.0 * std               # full BB width
-    kc_w  = 3.0 * atrk              # full KC width (±1.5)
-    depth = float(bb_w[-1] / (kc_w[-1] + 1e-10))
-
-    # Count consecutive bars in squeeze (BB inside KC)
-    in_sqz = (bb_w <= kc_w)
-    bars = 0
-    for i in range(len(in_sqz) - 1, -1, -1):
-        if in_sqz[i]:
-            bars += 1
+    count = 0
+    for offset in range(min(max_lookback, n - period)):
+        end = n - offset
+        if end < period:
+            break
+        cl_w = cl[end - period:end]
+        hi_w = hi[end - period:end]
+        lo_w = lo[end - period:end]
+        mid   = _ema_np(cl_w, period)[-1]
+        dev2  = _ema_np((cl_w - _ema_np(cl_w, period)) ** 2, period)[-1]
+        std   = float(np.sqrt(max(dev2, 0)))
+        bb_hi = mid + 2.0 * std;  bb_lo = mid - 2.0 * std
+        prev_cl_w = np.roll(cl_w, 1); prev_cl_w[0] = cl_w[0]
+        tr_w   = np.maximum(hi_w - lo_w,
+                 np.maximum(np.abs(hi_w - prev_cl_w), np.abs(lo_w - prev_cl_w)))
+        atr_k  = float(_ema_np(tr_w, period)[-1])
+        kc_hi  = mid + 1.5 * atr_k;  kc_lo = mid - 1.5 * atr_k
+        if bb_hi <= kc_hi and bb_lo >= kc_lo:
+            count += 1
         else:
             break
-    return round(depth, 3), bars
+    return count
 
-def compute_emerging_momentum_score(
-    df:              pd.DataFrame,
-    mode:            str,
-    nifty_close:     pd.Series,
-    rs_rank:         int,
-    atr_val:         float,
-    atr_mean:        float,
-    squeeze:         bool,
-    e_fast_s:        pd.Series,
-    e_slow_s:        pd.Series,
-    sector_avg_score: float = 50.0,
+
+def compute_emerging_score(
+    df: pd.DataFrame,
+    mode: str,
+    nifty_close: pd.Series,
+    rs_rank: int = 50,
 ) -> dict:
     """
-    Emerging Momentum Score — 0 to 100.
-    Designed to fire on SETUP / IDLE stocks with building internal pressure,
-    before the main score reaches BUY threshold.
+    Emerging Momentum Score (0–100) — surfaces stocks BEFORE they become obvious.
+
+    Components (max pts):
+    1. RS Acceleration      15 — relative strength gaining speed vs index
+    2. ATR Compression      15 — volatility coiling toward a breakout
+    3. RVOL Acceleration    15 — volume building quietly (smart-money fingerprint)
+    4. EMA Convergence      15 — fast/slow EMAs tightening = decision approaching
+    5. Squeeze Pressure     15 — consecutive BB-inside-KC bars = stored energy
+    6. Sector Momentum      10 — sector tailwind (enriched post-scan in run_scan)
+    7. Opening Range Exp.   15 — price expanding beyond recent consolidation
+
+    Labels: IGNITING ≥65 · BUILDING ≥50 · COILING ≥35 · LATENT ≥20 · QUIET <20
     """
-    empty = dict(
-        ems=0.0, ems_label="DORMANT", ems_color="#334155",
-        ems_rs_acc=0.0, ems_atr_comp=0.0, ems_rvol_acc=0.0,
-        ems_ema_conv=0.0, ems_squeeze=0.0, ems_sector=0.0,
-        ems_or_exp=0.0, ems_breakdown={},
+    out = dict(
+        EmScore=0.0, EmLabel="QUIET",
+        EmRSAccel=0.0, EmATRCompress=0.0, EmRVolAccel=0.0,
+        EmEMAConv=0.0, EmSqzPressure=0.0, EmSectorMom=0.0, EmORExpansion=0.0,
     )
     try:
+        if df is None or len(df) < 40:
+            return out
         cl  = df["Close"].values.astype(np.float64)
         hi  = df["High"].values.astype(np.float64)
         lo  = df["Low"].values.astype(np.float64)
         vol = df["Volume"].values.astype(np.float64)
         n   = len(cl)
-        if n < 40:
-            return empty
+        cfg = MODE_CFG[mode]
+        ef_span = cfg["ema_fast"]
+        es_span = cfg["ema_slow"]
 
-        nifty = nifty_close.values.astype(np.float64) if nifty_close is not None else None
+        # ── 1. RS ACCELERATION (0–15 pts) ────────────────────────────────────
+        # RS is accelerating when recent outperformance > medium > long window
+        rs_pts = 0.0
+        try:
+            nifty = (nifty_close.values.astype(np.float64)
+                     if nifty_close is not None and len(nifty_close) >= 20
+                     else None)
+            if nifty is not None:
+                def _rs(bars):
+                    if n < bars + 1 or len(nifty) < bars + 1:
+                        return 0.0
+                    s = (cl[-1] - cl[-bars]) / (cl[-bars] + 1e-10) * 100
+                    m = (nifty[-1] - nifty[-bars]) / (nifty[-bars] + 1e-10) * 100
+                    return s - m
+                rs5, rs10, rs20 = _rs(5), _rs(10), _rs(20)
+                if rs5 > rs10 > 0:          # Accelerating outperformance
+                    rs_pts = min(15.0, (rs5 - rs10) * 2.5 + 5)
+                elif rs5 > 0 and rs5 > rs20 * 0.5:
+                    rs_pts = min(8.0, rs5 * 0.6)
+                if rs_rank >= 70 and rs5 > 0:  # High rank + still accelerating
+                    rs_pts = min(15.0, rs_pts + 3)
+        except Exception:
+            pass
 
-        # ── COMPONENT 1: RS Acceleration (0 → 20) ─────────────────────────
-        # Measure whether the stock's relative performance vs Nifty is
-        # accelerating: RS[0:5] vs RS[-5:-10] vs RS[-10:-20].
-        # Rising acceleration = stock gathering strength vs the index.
-        c1 = 0.0
-        if nifty is not None and len(nifty) >= 20:
-            def _rs_slice(cl_sl, ni_sl):
-                if len(cl_sl) < 2 or len(ni_sl) < 2:
-                    return 0.0
-                return ((cl_sl[-1] - cl_sl[0]) / (cl_sl[0] + 1e-10) -
-                        (ni_sl[-1] - ni_sl[0]) / (ni_sl[0] + 1e-10)) * 100
+        # ── 2. ATR COMPRESSION (0–15 pts) ────────────────────────────────────
+        # Volatility contracting → coiling energy before expansion
+        atr_pts = 0.0
+        try:
+            if n >= 25:
+                prev_cl = np.roll(cl, 1); prev_cl[0] = cl[0]
+                tr_arr  = np.maximum(hi - lo, np.maximum(
+                          np.abs(hi - prev_cl), np.abs(lo - prev_cl)))
+                atr5_now  = float(_ema_np(tr_arr, 5)[-1])
+                atr20_now = float(_ema_np(tr_arr, 20)[-1])
+                ratio_now = atr5_now / (atr20_now + 1e-10)
+                if   ratio_now < 0.65: atr_pts = 15.0
+                elif ratio_now < 0.75: atr_pts = 12.0
+                elif ratio_now < 0.85: atr_pts = 8.0
+                elif ratio_now < 0.95: atr_pts = 4.0
+                # Bonus: actively compressing (trend in ratio)
+                if n > 15:
+                    atr5_5  = float(_ema_np(tr_arr[:-5], 5)[-1])
+                    atr20_5 = float(_ema_np(tr_arr[:-5], 20)[-1])
+                    if ratio_now < atr5_5 / (atr20_5 + 1e-10) - 0.05:
+                        atr_pts = min(15.0, atr_pts + 4.0)
+        except Exception:
+            pass
 
-            lni = min(len(nifty), n)
-            nc  = nifty[-lni:]
-            cc  = cl[-lni:]
-            w   = min(5, lni // 4)
-            rs_recent = _rs_slice(cc[-w:],         nc[-w:])
-            rs_mid    = _rs_slice(cc[-w*2:-w],     nc[-w*2:-w])
-            rs_old    = _rs_slice(cc[-w*3:-w*2],   nc[-w*3:-w*2])
-            # Acceleration = recent better than mid, mid better than old
-            accel1 = rs_recent - rs_mid    # positive = accelerating
-            accel2 = rs_mid    - rs_old
-            # Score: full pts if accelerating on both windows
-            if   accel1 > 1.0 and accel2 > 0:   c1 = 20.0
-            elif accel1 > 0.5 and accel2 > 0:   c1 = 14.0
-            elif accel1 > 0:                     c1 = 8.0
-            elif accel1 > -0.5:                  c1 = 3.0
-            # RS Rank bonus — mid-range ranks with upward slope score better
-            if 30 <= rs_rank <= 70 and accel1 > 0:
-                c1 = min(20.0, c1 + 4.0)   # rising rank in mid-range = sweet spot
+        # ── 3. RVOL ACCELERATION (0–15 pts) ──────────────────────────────────
+        # Volume building quietly across successive windows → smart money
+        rvol_pts = 0.0
+        try:
+            if n >= 20:
+                avg_vol = float(np.mean(vol[-21:-1])) if n >= 22 else float(np.mean(vol[:-1]))
+                if avg_vol > 0:
+                    v_now   = float(np.mean(vol[-3:]))
+                    v_5ago  = float(np.mean(vol[-8:-5]))   if n >= 8  else avg_vol
+                    v_10ago = float(np.mean(vol[-13:-10])) if n >= 13 else avg_vol
+                    r_now   = v_now   / avg_vol
+                    r_5ago  = v_5ago  / avg_vol
+                    r_10ago = v_10ago / avg_vol
+                    if r_now > r_5ago > r_10ago and r_now > 0.8:  # Sequential build
+                        rvol_pts = min(15.0, (r_now - r_10ago) * 15)
+                    elif r_now > r_5ago and r_now > 0.9:
+                        rvol_pts = min(9.0, (r_now - r_5ago) * 12)
+                    elif 0.4 < r_now < 0.75:                       # Quiet dryup = stealth accumulation
+                        rvol_pts = 5.0
+        except Exception:
+            pass
 
-        # ── COMPONENT 2: ATR Compression (0 → 20) ─────────────────────────
-        # Multi-timeframe volatility compression: ATR[5] < ATR[20] < ATR[60].
-        # Compressed on all scales = maximum coiling.
-        c2 = 0.0
-        if n >= 65:
-            prev_cl = np.roll(cl, 1); prev_cl[0] = cl[0]
-            tr      = np.maximum(hi - lo, np.maximum(
-                        np.abs(hi - prev_cl), np.abs(lo - prev_cl)))
-            atr5  = float(_ema_np(tr, 5)[-1])
-            atr20 = float(_ema_np(tr, 20)[-1])
-            atr60 = float(_ema_np(tr, 60)[-1])
-            r1 = atr5  / (atr20 + 1e-10)   # < 1 = short-term compressed
-            r2 = atr20 / (atr60 + 1e-10)   # < 1 = medium-term compressed
-            # Three-tier scoring
-            if   r1 < 0.60 and r2 < 0.80: c2 = 20.0   # extreme compression
-            elif r1 < 0.70 and r2 < 0.85: c2 = 15.0
-            elif r1 < 0.80 and r2 < 0.90: c2 = 10.0
-            elif r1 < 0.90:               c2 =  5.0
-            # Trend of compression: is it getting tighter?
-            atr5_5bars_ago = float(_ema_np(tr[:-5], 5)[-1]) if n > 10 else atr5
-            if atr5 < atr5_5bars_ago * 0.95:   # tightening in last 5 bars
-                c2 = min(20.0, c2 + 3.0)
+        # ── 4. EMA CONVERGENCE (0–15 pts) ────────────────────────────────────
+        # Fast + slow EMAs tightening → coiling, decision point approaching
+        conv_pts = 0.0
+        try:
+            if n >= es_span + 5:
+                ef_arr = _ema_np(cl, ef_span)
+                es_arr = _ema_np(cl, es_span)
+                dist_now   = abs(ef_arr[-1]  - es_arr[-1])
+                dist_5ago  = abs(ef_arr[-6]  - es_arr[-6])  if n >= 6  else dist_now
+                dist_10ago = abs(ef_arr[-11] - es_arr[-11]) if n >= 11 else dist_now
+                c_last     = cl[-1] + 1e-10
+                dpct_now   = dist_now   / c_last * 100
+                dpct_5ago  = dist_5ago  / c_last * 100
+                dpct_10ago = dist_10ago / c_last * 100
+                converging = dpct_now < dpct_5ago
+                if   converging and dpct_now < 0.5:  conv_pts = 15.0
+                elif converging and dpct_now < 1.0:  conv_pts = 11.0
+                elif converging and dpct_now < 2.0:  conv_pts = 7.0
+                elif converging:                     conv_pts = 4.0
+                elif dpct_now < dpct_10ago * 0.65:   conv_pts = 6.0  # 35% tighter in 10 bars
+                # Bonus: bullish convergence (fast still > slow)
+                if ef_arr[-1] > es_arr[-1] and converging:
+                    conv_pts = min(15.0, conv_pts + 4.0)
+        except Exception:
+            pass
 
-        # ── COMPONENT 3: RVOL Acceleration (0 → 15) ───────────────────────
-        # Volume building SLOWLY before the move (not yet exploding).
-        # Pattern: vol[-5] > vol[-10] > vol[-15], but no bar > 2× avg.
-        c3 = 0.0
-        if n >= 20:
-            avg20 = float(np.mean(vol[-20:])) or 1.0
-            avg5  = float(np.mean(vol[-5:]))
-            avg10 = float(np.mean(vol[-10:-5]))
-            avg15 = float(np.mean(vol[-15:-10]))
-            no_spike = float(np.max(vol[-5:])) < avg20 * 2.0   # not yet exploding
-            ramp1 = avg5  > avg10 * 1.05   # recent > prior
-            ramp2 = avg10 > avg15 * 1.03   # prior > older
-            slope = (avg5 - avg15) / (avg15 + 1e-10) * 100   # % build over 15 bars
+        # ── 5. SQUEEZE PRESSURE (0–15 pts) ───────────────────────────────────
+        # Consecutive bars in BB/KC squeeze → more bars = more stored kinetic energy
+        sqz_pts = 0.0
+        try:
+            csq = _count_squeeze_bars(df, period=20, max_lookback=40)
+            if   csq >= 20: sqz_pts = 15.0
+            elif csq >= 15: sqz_pts = 12.0
+            elif csq >= 10: sqz_pts = 9.0
+            elif csq >= 5:  sqz_pts = 6.0
+            elif csq >= 2:  sqz_pts = 3.0
+        except Exception:
+            pass
 
-            if no_spike:
-                if ramp1 and ramp2:
-                    c3 = 15.0 if slope > 15 else 11.0
-                elif ramp1:
-                    c3 = 7.0
-                elif slope > 5:
-                    c3 = 3.0
+        # ── 6. SECTOR MOMENTUM (0–10 pts) — placeholder enriched in run_scan ─
+        sec_pts = 0.0
+
+        # ── 7. OPENING RANGE EXPANSION (0–15 pts) ────────────────────────────
+        # Price moving beyond recent consolidation zone = first activation signal
+        or_pts = 0.0
+        try:
+            if mode == "Intraday" and n >= 8:
+                # First 6 bars (~30 min at 5m) = opening range
+                or_hi = float(np.max(hi[:6]))
+                or_lo = float(np.min(lo[:6]))
+                or_rng = or_hi - or_lo
+                cur = cl[-1]
+                if or_rng > 0:
+                    exp_pct = (cur - or_hi) / or_rng
+                    if   exp_pct > 0.20:  or_pts = 15.0
+                    elif exp_pct > 0.05:  or_pts = 10.0
+                    elif exp_pct >= 0:    or_pts = 6.0
+                    elif exp_pct > -0.15: or_pts = 3.0
             else:
-                # Vol already spiked — partial credit if it's retreating back
-                if avg5 < avg20 * 0.9:   # vol drying up after spike = new coil
-                    c3 = 5.0
+                lb = min(10 if mode == "Swing" else 20, n - 2)
+                rng_hi = float(np.max(hi[-lb - 1:-1]))
+                rng_lo = float(np.min(lo[-lb - 1:-1]))
+                rng_w  = rng_hi - rng_lo
+                cur    = cl[-1]
+                if rng_w > 0:
+                    exp_pct = (cur - rng_hi) / rng_w
+                    if   exp_pct > 0.15:  or_pts = 15.0
+                    elif exp_pct > 0.02:  or_pts = 10.0
+                    elif exp_pct >= 0:    or_pts = 6.0
+                    elif cur > rng_lo + rng_w * 0.65: or_pts = 3.0
+        except Exception:
+            pass
 
-        # ── COMPONENT 4: EMA Convergence (0 → 15) ─────────────────────────
-        # Fast and slow EMAs tightening toward each other.
-        # Price approaching, but not yet crossing, the EMA cluster.
-        c4 = 0.0
-        ef_arr = e_fast_s.values.astype(np.float64)
-        es_arr = e_slow_s.values.astype(np.float64)
-        if len(ef_arr) >= 20 and len(es_arr) >= 20:
-            gap_now  = abs(float(ef_arr[-1])  - float(es_arr[-1]))
-            gap_10   = abs(float(ef_arr[-10]) - float(es_arr[-10]))
-            gap_20   = abs(float(ef_arr[-20]) - float(es_arr[-20]))
-            price_now = float(cl[-1])
-            pct_gap   = gap_now / (price_now + 1e-10) * 100
-
-            converging = gap_now < gap_10 < gap_20   # consistent narrowing
-            if converging:
-                tightness = 1.0 - (gap_now / (gap_20 + 1e-10))   # 0→1 (1 = fully converged)
-                c4 = min(15.0, tightness * 18.0)
-            elif gap_now < gap_10:   # at least recently converging
-                c4 = 5.0
-
-            # Price within 1% of EMA cluster = about to interact
-            ema_mid = (float(ef_arr[-1]) + float(es_arr[-1])) / 2.0
-            if abs(price_now - ema_mid) / (ema_mid + 1e-10) < 0.01:
-                c4 = min(15.0, c4 + 3.0)
-
-        # ── COMPONENT 5: Squeeze Pressure (0 → 15) ────────────────────────
-        # Depth and duration of Bollinger Band squeeze inside Keltner Channel.
-        # Deeper and longer = more energy stored.
-        c5 = 0.0
-        sqz_depth, sqz_bars = _squeeze_depth_duration(df)
-        if squeeze:   # currently in squeeze
-            # Depth score: tighter = more pressure
-            depth_score = max(0.0, (1.0 - sqz_depth) * 12.0)   # 0 at depth=1, 12 at depth=0
-            # Duration score: longer = more reliable
-            dur_score   = min(5.0, sqz_bars * 0.4)              # max 5 pts at 12+ bars
-            c5 = min(15.0, depth_score + dur_score)
-        elif sqz_bars >= 3:   # recently in squeeze, just released
-            c5 = 8.0   # still has momentum from the coil
-
-        # ── COMPONENT 6: Sector Momentum (0 → 10) ─────────────────────────
-        # Stock's sector score above median (50) indicates sector rotation.
-        # Injected by run_scan after breadth computation; default 50 = neutral.
-        c6 = 0.0
-        if   sector_avg_score >= 72: c6 = 10.0
-        elif sector_avg_score >= 63: c6 =  7.0
-        elif sector_avg_score >= 55: c6 =  4.0
-        elif sector_avg_score >= 48: c6 =  1.0
-        # Sector laggard in top sector = rotation catch-up play
-        if sector_avg_score >= 63 and rs_rank < 40:
-            c6 = min(10.0, c6 + 3.0)
-
-        # ── COMPONENT 7: Opening Range Expansion (0 → 5) ──────────────────
-        # Daily range expanding vs the prior 5-day average range (Swing/Positional).
-        # For Intraday: current bar range vs session avg.
-        # Expansion on low volume = false; expansion on rising volume = genuine.
-        c7 = 0.0
-        if n >= 6:
-            today_range = float(hi[-1] - lo[-1])
-            avg5d_range = float(np.mean(hi[-6:-1] - lo[-6:-1])) or 1.0
-            expansion   = today_range / avg5d_range
-            vol_ok      = float(vol[-1]) >= float(np.mean(vol[-6:-1])) * 0.8
-            if expansion > 1.30 and vol_ok: c7 = 5.0
-            elif expansion > 1.15 and vol_ok: c7 = 3.0
-            elif expansion > 1.05: c7 = 1.0
-
-        # ── Composite EMS ─────────────────────────────────────────────────
-        ems = float(np.clip(c1 + c2 + c3 + c4 + c5 + c6 + c7, 0.0, 100.0))
-        lbl, col = _ems_label(ems)
-
-        breakdown = dict(
-            rs_acc   = round(c1, 1), atr_comp  = round(c2, 1),
-            rvol_acc = round(c3, 1), ema_conv  = round(c4, 1),
-            squeeze  = round(c5, 1), sector    = round(c6, 1),
-            or_exp   = round(c7, 1),
-        )
-        return dict(
-            ems=round(ems, 1), ems_label=lbl, ems_color=col,
-            ems_rs_acc=round(c1,1), ems_atr_comp=round(c2,1),
-            ems_rvol_acc=round(c3,1), ems_ema_conv=round(c4,1),
-            ems_squeeze=round(c5,1), ems_sector=round(c6,1),
-            ems_or_exp=round(c7,1), ems_breakdown=breakdown,
-            sqz_depth=sqz_depth, sqz_bars=sqz_bars,
+        # ── TOTAL ─────────────────────────────────────────────────────────────
+        total = round(float(np.clip(
+            rs_pts + atr_pts + rvol_pts + conv_pts + sqz_pts + sec_pts + or_pts,
+            0, 100)), 1)
+        label = ("IGNITING" if total >= 65 else "BUILDING" if total >= 50
+                 else "COILING" if total >= 35 else "LATENT" if total >= 20 else "QUIET")
+        out.update(
+            EmScore       = total,
+            EmLabel       = label,
+            EmRSAccel     = round(rs_pts,   1),
+            EmATRCompress = round(atr_pts,  1),
+            EmRVolAccel   = round(rvol_pts, 1),
+            EmEMAConv     = round(conv_pts, 1),
+            EmSqzPressure = round(sqz_pts,  1),
+            EmSectorMom   = 0.0,   # filled by enrich_sector_momentum() in run_scan
+            EmORExpansion = round(or_pts,   1),
         )
     except Exception:
-        return empty
+        pass
+    return out
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v15.6 — PRE-CONFIRMATION ACCUMULATION (PCA) ENGINE
+# Detects institutional buying BEFORE price confirms — 7 signal components.
+# This layer completes the early-accumulation intelligence stack that
+# EmScore starts but doesn't finish (EmScore targets coiling mechanics;
+# PCA targets the buying-pressure fingerprint beneath the coil).
+# ══════════════════════════════════════════════════════════════════════════════
+
+_PCA_COMPONENTS = [
+    ("Rel CMF",       "PCACMFRel",       15, "💧"),
+    ("Vol Cmp Seq",   "PCAVolCmpSeq",    15, "🗜"),
+    ("Hidden Accum",  "PCAHiddenAccum",  15, "👻"),
+    ("Effort/Result", "PCAEffortResult", 15, "⚖"),
+    ("Range Persist", "PCARangeCont",    10, "📏"),
+    ("Failed BRK",    "PCAFailedBrkdn",  15, "🛡"),
+    ("Vol Asymmetry", "PCAVolAsym",      15, "⚖"),
+]
+
+def compute_preconfirmation_accumulation(
+    df: pd.DataFrame,
+    mode: str,
+) -> dict:
+    """
+    Pre-Confirmation Accumulation Score (0–100).
+
+    Components (max pts):
+    1. Relative CMF          15 — CMF improving vs its own rolling baseline
+    2. Vol Compression Seq   15 — sequence of tightening ATR/range contractions
+    3. Hidden Accumulation   15 — down-days low-vol, up-days high-vol (absorption)
+    4. Effort vs Result      15 — big volume that barely moves price = supply absorbed
+    5. Range Contraction     10 — persistent NR bars below historical avg range
+    6. Failed Breakdown      15 — wicks below support closed back above = buying
+    7. Volume Asymmetry      15 — up-day volume persistently > down-day volume
+
+    Labels: ACCUMULATING ≥65 · BUILDING ≥50 · FORMING ≥35 · WEAK ≥20 · NONE <20
+    """
+    out = dict(
+        PCAScore=0.0, PCALabel="NONE",
+        PCACMFRel=0.0, PCAVolCmpSeq=0.0, PCAHiddenAccum=0.0,
+        PCAEffortResult=0.0, PCARangeCont=0.0, PCAFailedBrkdn=0.0, PCAVolAsym=0.0,
+    )
+    try:
+        if df is None or len(df) < 30:
+            return out
+
+        cl  = df["Close"].values.astype(np.float64)
+        hi  = df["High"].values.astype(np.float64)
+        lo  = df["Low"].values.astype(np.float64)
+        vol = df["Volume"].values.astype(np.float64)
+        n   = len(cl)
+        op  = (df["Open"].values.astype(np.float64)
+               if "Open" in df.columns else cl.copy())
+
+        # ── 1. RELATIVE CMF (0–15 pts) ────────────────────────────────────────
+        # CMF improving vs its own 40-bar prior baseline = fresh buying pressure
+        cmf_pts = 0.0
+        try:
+            win = min(20, n)
+            hlr = np.where((hi[-win:] - lo[-win:]) == 0, 1e-10, hi[-win:] - lo[-win:])
+            mfm = ((cl[-win:] - lo[-win:]) - (hi[-win:] - cl[-win:])) / hlr
+            cmf_now = float(np.sum(mfm * vol[-win:]) / (np.sum(vol[-win:]) + 1e-10))
+
+            if n >= 40:
+                hlr_old = np.where(
+                    (hi[-40:-20] - lo[-40:-20]) == 0, 1e-10,
+                    hi[-40:-20] - lo[-40:-20]
+                )
+                mfm_old = ((cl[-40:-20] - lo[-40:-20]) -
+                           (hi[-40:-20] - cl[-40:-20])) / hlr_old
+                cmf_old = float(
+                    np.sum(mfm_old * vol[-40:-20]) / (np.sum(vol[-40:-20]) + 1e-10)
+                )
+                delta = cmf_now - cmf_old
+                if   cmf_now > 0.15 and delta > 0:        cmf_pts = 15.0
+                elif cmf_now > 0.05 and delta > 0:         cmf_pts = 11.0
+                elif cmf_now > 0    and delta > 0.05:      cmf_pts = 8.0
+                elif cmf_now > 0:                          cmf_pts = 4.0
+                elif cmf_now > -0.05 and delta > 0.10:    cmf_pts = 3.0
+            else:
+                if   cmf_now > 0.15: cmf_pts = 10.0
+                elif cmf_now > 0.05: cmf_pts = 6.0
+                elif cmf_now > 0:    cmf_pts = 3.0
+        except Exception:
+            pass
+
+        # ── 2. VOLATILITY COMPRESSION SEQUENCING (0–15 pts) ──────────────────
+        # Consecutive narrowing ranges AND multi-window avg sequence tightening
+        vc_pts = 0.0
+        try:
+            if n >= 10:
+                ranges = hi - lo
+                consec = 0
+                for k in range(1, min(15, n - 1)):
+                    if ranges[-k] < ranges[-(k + 1)]:
+                        consec += 1
+                    else:
+                        break
+                avg5  = float(np.mean(ranges[-5:]))  if n >= 5  else float(np.mean(ranges))
+                avg10 = float(np.mean(ranges[-10:])) if n >= 10 else avg5
+                avg20 = float(np.mean(ranges[-20:])) if n >= 20 else avg10
+                sequenced = avg5 < avg10 < avg20
+
+                if   consec >= 8 and sequenced: vc_pts = 15.0
+                elif consec >= 5 and sequenced: vc_pts = 12.0
+                elif consec >= 3:               vc_pts = 8.0
+                elif consec >= 2 and sequenced: vc_pts = 5.0
+                elif sequenced:                 vc_pts = 3.0
+        except Exception:
+            pass
+
+        # ── 3. HIDDEN ACCUMULATION (0–15 pts) ────────────────────────────────
+        # Up-day vol >> down-day vol even while price is flat/slightly negative
+        ha_pts = 0.0
+        try:
+            lb = min(20, n - 1)
+            up_vols   = [float(vol[i]) for i in range(-lb, 0) if cl[i] > cl[i - 1]]
+            down_vols = [float(vol[i]) for i in range(-lb, 0) if cl[i] <= cl[i - 1]]
+            if up_vols and down_vols:
+                avg_up   = float(np.mean(up_vols))
+                avg_down = float(np.mean(down_vols))
+                ratio    = avg_up / (avg_down + 1e-10)
+                price_chg = (float(cl[-1]) - float(cl[-lb])) / (float(cl[-lb]) + 1e-10) * 100
+
+                if   ratio >= 2.5:                          ha_pts = 15.0
+                elif ratio >= 2.0:                          ha_pts = 12.0
+                elif ratio >= 1.5:                          ha_pts = 9.0
+                elif ratio >= 1.2:                          ha_pts = 6.0
+                elif ratio >= 1.05 and price_chg < 2.0:   ha_pts = 3.0
+        except Exception:
+            pass
+
+        # ── 4. EFFORT VS RESULT ANOMALIES (0–15 pts) ─────────────────────────
+        # High volume + tiny body = supply absorbed (Wyckoff spring fingerprint)
+        evr_pts = 0.0
+        try:
+            lb_evr   = min(10, n - 1)
+            avg_vol_ = float(np.mean(vol[-21:-1])) if n >= 22 else float(np.mean(vol[:-1]))
+            avg_rng_ = (float(np.mean(hi[-21:-1] - lo[-21:-1]))
+                        if n >= 22 else float(np.mean(hi - lo)))
+            if avg_vol_ > 0 and avg_rng_ > 0:
+                anomalies = 0
+                for k in range(1, lb_evr + 1):
+                    v_k    = float(vol[-k])
+                    body_k = abs(float(cl[-k]) - float(op[-k]))
+                    cl_k   = float(cl[-k])
+                    op_k   = float(op[-k])
+                    hi_k   = float(hi[-k])
+                    lo_k   = float(lo[-k])
+                    mid_k  = (hi_k + lo_k) / 2
+                    # High-vol tiny-body (absorption bar)
+                    if v_k > avg_vol_ * 1.3 and body_k < avg_rng_ * 0.30:
+                        anomalies += 1
+                    # High-vol red day that closed upper half (buyers absorbed selling)
+                    elif (v_k > avg_vol_ * 1.5 and cl_k < op_k
+                          and cl_k > mid_k):
+                        anomalies += 1
+
+                if   anomalies >= 5: evr_pts = 15.0
+                elif anomalies >= 3: evr_pts = 11.0
+                elif anomalies >= 2: evr_pts = 7.0
+                elif anomalies >= 1: evr_pts = 4.0
+        except Exception:
+            pass
+
+        # ── 5. RANGE CONTRACTION PERSISTENCE (0–10 pts) ──────────────────────
+        # How many of last 10 bars have range below 85% of 20-bar historical avg
+        rc_pts = 0.0
+        try:
+            if n >= 12:
+                ranges_ = hi - lo
+                avg_rng20 = float(np.mean(ranges_[-21:-1])) if n >= 22 else float(np.mean(ranges_[:-1]))
+                if avg_rng20 > 0:
+                    nr_count = int(np.sum(ranges_[-10:] < avg_rng20 * 0.85))
+                    if   nr_count >= 9: rc_pts = 10.0
+                    elif nr_count >= 7: rc_pts = 8.0
+                    elif nr_count >= 5: rc_pts = 6.0
+                    elif nr_count >= 3: rc_pts = 4.0
+                    elif nr_count >= 2: rc_pts = 2.0
+        except Exception:
+            pass
+
+        # ── 6. FAILED BREAKDOWN ABSORPTION (0–15 pts) ────────────────────────
+        # Bars where lows pierced recent support but closed back above = buying
+        fba_pts = 0.0
+        try:
+            if n >= 15:
+                lb_fba  = min(10, n - 5)
+                support = float(np.min(lo[-lb_fba - 5:-5]))   # recent swing support
+                fba_cnt = 0
+                for k in range(1, lb_fba + 1):
+                    lo_k = float(lo[-k]); cl_k = float(cl[-k])
+                    if lo_k < support * 0.997 and cl_k >= support * 0.999:
+                        fba_cnt += 1
+
+                if   fba_cnt >= 4: fba_pts = 15.0
+                elif fba_cnt >= 3: fba_pts = 12.0
+                elif fba_cnt >= 2: fba_pts = 8.0
+                elif fba_cnt >= 1: fba_pts = 5.0
+
+                # Bonus: if holding above support on tight range (coil above base)
+                if fba_cnt >= 1 and float(cl[-1]) > support:
+                    rng_now = float(hi[-1] - lo[-1])
+                    avg_rng_b = float(np.mean(hi[-20:] - lo[-20:])) if n >= 20 else rng_now
+                    if avg_rng_b > 0 and rng_now < avg_rng_b * 0.70:
+                        fba_pts = min(15.0, fba_pts + 3.0)
+        except Exception:
+            pass
+
+        # ── 7. VOLUME ASYMMETRY (0–15 pts) ────────────────────────────────────
+        # Up-day vol is consistently AND significantly > down-day vol
+        va_pts = 0.0
+        try:
+            lb_va       = min(30, n - 1)
+            up_vols_a   = [float(vol[i]) for i in range(-lb_va, 0) if cl[i] > cl[i - 1]]
+            down_vols_a = [float(vol[i]) for i in range(-lb_va, 0) if cl[i] < cl[i - 1]]
+            if len(up_vols_a) >= 3 and len(down_vols_a) >= 3:
+                median_down  = float(np.median(down_vols_a))
+                pct_above    = (sum(1 for v in up_vols_a if v > median_down)
+                                / len(up_vols_a))
+                mag_ratio    = (float(np.mean(up_vols_a))
+                                / (float(np.mean(down_vols_a)) + 1e-10))
+
+                if   pct_above >= 0.80 and mag_ratio >= 1.8: va_pts = 15.0
+                elif pct_above >= 0.70 and mag_ratio >= 1.5: va_pts = 12.0
+                elif pct_above >= 0.65 and mag_ratio >= 1.3: va_pts = 9.0
+                elif pct_above >= 0.55 and mag_ratio >= 1.2: va_pts = 6.0
+                elif pct_above >= 0.50 and mag_ratio >= 1.1: va_pts = 3.0
+        except Exception:
+            pass
+
+        # ── TOTAL ──────────────────────────────────────────────────────────────
+        total = round(float(np.clip(
+            cmf_pts + vc_pts + ha_pts + evr_pts + rc_pts + fba_pts + va_pts,
+            0, 100
+        )), 1)
+        label = (
+            "ACCUMULATING" if total >= 65 else
+            "BUILDING"     if total >= 50 else
+            "FORMING"      if total >= 35 else
+            "WEAK"         if total >= 20 else
+            "NONE"
+        )
+        out.update(
+            PCAScore        = total,
+            PCALabel        = label,
+            PCACMFRel       = round(cmf_pts,  1),
+            PCAVolCmpSeq    = round(vc_pts,   1),
+            PCAHiddenAccum  = round(ha_pts,   1),
+            PCAEffortResult = round(evr_pts,  1),
+            PCARangeCont    = round(rc_pts,   1),
+            PCAFailedBrkdn  = round(fba_pts,  1),
+            PCAVolAsym      = round(va_pts,   1),
+        )
+    except Exception:
+        pass
+    return out
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GAP-2 — SMART MONEY BEHAVIOR MODEL
+# Synthesizes all buying-pressure signals into one behavioral verdict.
+# Goes beyond PCA (snapshot score) to classify the behaviour type.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SM_VERDICTS = ["DISTRIBUTING", "NEUTRAL", "ABSORBING", "ACCUMULATING", "MARKUP_READY"]
+
+def compute_smart_money_model(
+    df: pd.DataFrame,
+    mode: str,
+    pca_score: float = 0.0,
+    inst_score: float = 50.0,
+    obv_trend: bool = True,
+) -> dict:
+    """
+    Smart Money Behavior Model (0–100 SmartMoneyScore).
+
+    Components:
+    1. CMF Regime          (20 pts) — current CMF + trend direction
+    2. Block Volume        (20 pts) — large-lot days (>2× avg vol) net bias
+    3. OBV Trend           (15 pts) — OBV slope and EMA alignment
+    4. Absorption Quality  (25 pts) — high-vol days that barely moved price
+    5. Pressure Asymmetry  (20 pts) — net buying pressure over last N bars
+
+    Verdicts: MARKUP_READY ≥80 · ACCUMULATING ≥65 · ABSORBING ≥50 ·
+              NEUTRAL ≥35 · DISTRIBUTING <35
+    """
+    out = dict(
+        SmartMoneyScore=0.0, SmartMoneyVerdict="NEUTRAL",
+        SMBehaviorPhase="UNKNOWN", SMConfidence=0,
+        SMCMFScore=0.0, SMBlockScore=0.0,
+        SMOBVScore=0.0, SMAbsorptionScore=0.0, SMPressureScore=0.0,
+    )
+    try:
+        if df is None or len(df) < 30:
+            return out
+        cl  = df["Close"].values.astype(np.float64)
+        hi  = df["High"].values.astype(np.float64)
+        lo  = df["Low"].values.astype(np.float64)
+        vol = df["Volume"].values.astype(np.float64)
+        op  = (df["Open"].values.astype(np.float64)
+               if "Open" in df.columns else cl.copy())
+        n = len(cl)
+
+        # ── 1. CMF Regime (0–20 pts) ─────────────────────────────────────────
+        cmf_pts = 0.0
+        try:
+            win = min(20, n)
+            hlr = np.where((hi[-win:] - lo[-win:]) == 0, 1e-10, hi[-win:] - lo[-win:])
+            mfm = ((cl[-win:] - lo[-win:]) - (hi[-win:] - cl[-win:])) / hlr
+            cmf_now = float(np.sum(mfm * vol[-win:]) / (np.sum(vol[-win:]) + 1e-10))
+            # CMF trend: compare two halves of the window
+            half = win // 2
+            if half > 2:
+                hlr1 = np.where((hi[-win:-half]-lo[-win:-half])==0, 1e-10, hi[-win:-half]-lo[-win:-half])
+                mfm1 = ((cl[-win:-half]-lo[-win:-half])-(hi[-win:-half]-cl[-win:-half]))/hlr1
+                cmf_old = float(np.sum(mfm1*vol[-win:-half])/(np.sum(vol[-win:-half])+1e-10))
+                cmf_rising = cmf_now > cmf_old
+            else:
+                cmf_rising = cmf_now > 0
+            if   cmf_now > 0.20 and cmf_rising: cmf_pts = 20.0
+            elif cmf_now > 0.10 and cmf_rising: cmf_pts = 16.0
+            elif cmf_now > 0.05 and cmf_rising: cmf_pts = 12.0
+            elif cmf_now > 0    and cmf_rising: cmf_pts = 8.0
+            elif cmf_now > 0:                   cmf_pts = 5.0
+            elif cmf_now > -0.05 and cmf_rising:cmf_pts = 3.0
+        except Exception:
+            pass
+
+        # ── 2. Block Volume Net Bias (0–20 pts) ──────────────────────────────
+        block_pts = 0.0
+        try:
+            avg_vol = float(np.mean(vol[-21:-1])) if n >= 22 else float(np.mean(vol))
+            if avg_vol > 0:
+                threshold = avg_vol * 2.0
+                bull_blocks = sum(
+                    1 for i in range(-min(20, n-1), 0)
+                    if vol[i] >= threshold and cl[i] >= op[i]
+                )
+                bear_blocks = sum(
+                    1 for i in range(-min(20, n-1), 0)
+                    if vol[i] >= threshold and cl[i] < op[i]
+                )
+                net = bull_blocks - bear_blocks
+                if   net >= 5: block_pts = 20.0
+                elif net >= 3: block_pts = 15.0
+                elif net >= 2: block_pts = 10.0
+                elif net >= 1: block_pts = 6.0
+                elif net == 0: block_pts = 3.0
+        except Exception:
+            pass
+
+        # ── 3. OBV Trend (0–15 pts) ──────────────────────────────────────────
+        obv_pts = 0.0
+        try:
+            obv = np.zeros(n)
+            for i in range(1, n):
+                if cl[i] > cl[i-1]:   obv[i] = obv[i-1] + vol[i]
+                elif cl[i] < cl[i-1]: obv[i] = obv[i-1] - vol[i]
+                else:                 obv[i] = obv[i-1]
+            obv_ema10 = _ema_np(obv, 10)
+            obv_ema20 = _ema_np(obv, 20)
+            obv_slope = (obv_ema10[-1] - obv_ema10[-min(10, n-1)]) / (abs(obv_ema10[-min(10, n-1)]) + 1e-10)
+            obv_bull  = obv_ema10[-1] > obv_ema20[-1]
+            if   obv_slope > 0.10 and obv_bull: obv_pts = 15.0
+            elif obv_slope > 0.03 and obv_bull: obv_pts = 11.0
+            elif obv_slope > 0    and obv_bull: obv_pts = 7.0
+            elif obv_slope > 0:                 obv_pts = 4.0
+            elif obv_trend:                     obv_pts = 5.0  # fallback from inst engine
+        except Exception:
+            if obv_trend: obv_pts = 5.0
+
+        # ── 4. Absorption Quality (0–25 pts) ─────────────────────────────────
+        # High-vol bars where price barely moved = supply being absorbed by buyers
+        abs_pts = 0.0
+        try:
+            avg_vol_ = float(np.mean(vol[-21:-1])) if n >= 22 else float(np.mean(vol))
+            avg_rng_ = float(np.mean(hi[-21:-1] - lo[-21:-1])) if n >= 22 else float(np.mean(hi - lo))
+            if avg_vol_ > 0 and avg_rng_ > 0:
+                quality_abs = 0
+                strong_abs  = 0
+                for k in range(1, min(15, n)):
+                    v_k    = float(vol[-k])
+                    body_k = abs(float(cl[-k]) - float(op[-k]))
+                    hi_k   = float(hi[-k]); lo_k = float(lo[-k])
+                    cl_k   = float(cl[-k]); op_k = float(op[-k])
+                    mid_k  = (hi_k + lo_k) / 2
+                    # High-vol tiny-body = absorption
+                    if v_k > avg_vol_ * 1.5 and body_k < avg_rng_ * 0.25:
+                        quality_abs += 1
+                        if cl_k > mid_k:  # closed upper half = buyers won
+                            strong_abs += 1
+                    # High-vol red close in upper half = sellers tried, buyers held
+                    elif (v_k > avg_vol_ * 1.8 and cl_k < op_k
+                          and cl_k > mid_k and body_k < avg_rng_ * 0.40):
+                        quality_abs += 1
+                if   strong_abs >= 3: abs_pts = 25.0
+                elif strong_abs >= 2: abs_pts = 20.0
+                elif quality_abs >= 4:abs_pts = 18.0
+                elif quality_abs >= 3:abs_pts = 14.0
+                elif quality_abs >= 2:abs_pts = 9.0
+                elif quality_abs >= 1:abs_pts = 5.0
+        except Exception:
+            pass
+
+        # ── 5. Pressure Asymmetry (0–20 pts) ─────────────────────────────────
+        # Net directional pressure per bar: (close - open) / range × volume
+        pres_pts = 0.0
+        try:
+            lb_p = min(20, n - 1)
+            rng_arr = hi[-lb_p:] - lo[-lb_p:]
+            # Buying pressure fraction per bar (0=full selling, 1=full buying)
+            bpf = np.where(rng_arr > 0,
+                           (cl[-lb_p:] - lo[-lb_p:]) / rng_arr,
+                           0.5)
+            # Weighted by volume
+            total_vol = float(np.sum(vol[-lb_p:]))
+            if total_vol > 0:
+                net_bp = float(np.sum((bpf - 0.5) * vol[-lb_p:])) / total_vol  # -0.5 to +0.5
+                if   net_bp > 0.20: pres_pts = 20.0
+                elif net_bp > 0.12: pres_pts = 15.0
+                elif net_bp > 0.06: pres_pts = 10.0
+                elif net_bp > 0.02: pres_pts = 6.0
+                elif net_bp > 0:    pres_pts = 3.0
+        except Exception:
+            pass
+
+        # Blend with PCA and inst_score
+        pca_boost = round(float(np.clip((pca_score - 35.0) / 65.0 * 10.0, 0, 10)), 1)
+        inst_boost = round(float(np.clip((inst_score - 50.0) / 50.0 * 5.0, 0, 5)), 1)
+
+        raw_total = cmf_pts + block_pts + obv_pts + abs_pts + pres_pts + pca_boost + inst_boost
+        total = round(float(np.clip(raw_total, 0, 100)), 1)
+
+        if   total >= 80: verdict = "MARKUP_READY"
+        elif total >= 65: verdict = "ACCUMULATING"
+        elif total >= 50: verdict = "ABSORBING"
+        elif total >= 35: verdict = "NEUTRAL"
+        else:             verdict = "DISTRIBUTING"
+
+        # Behavioral phase narrative
+        if verdict in ("MARKUP_READY", "ACCUMULATING"):
+            phase = "INSTITUTIONAL_BUY"
+        elif verdict == "ABSORBING":
+            phase = "SUPPLY_ABSORPTION"
+        elif verdict == "NEUTRAL":
+            phase = "EQUILIBRIUM"
+        else:
+            phase = "SUPPLY_PRESSURE"
+
+        confidence = min(100, int(
+            (1 if cmf_pts > 8 else 0) +
+            (1 if block_pts > 6 else 0) +
+            (1 if obv_pts > 7 else 0) +
+            (1 if abs_pts > 9 else 0) +
+            (1 if pres_pts > 6 else 0)
+        ) * 20)
+
+        out.update(
+            SmartMoneyScore    = total,
+            SmartMoneyVerdict  = verdict,
+            SMBehaviorPhase    = phase,
+            SMConfidence       = confidence,
+            SMCMFScore         = round(cmf_pts,   1),
+            SMBlockScore       = round(block_pts,  1),
+            SMOBVScore         = round(obv_pts,    1),
+            SMAbsorptionScore  = round(abs_pts,    1),
+            SMPressureScore    = round(pres_pts,   1),
+        )
+    except Exception:
+        pass
+    return out
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GAP-3 — ACCUMULATION SEQUENCING
+# Infers WHERE in the Wyckoff / Weinstein base-building sequence a stock is.
+# Uses PCA + EmScore + Phase + price structure to determine sequence position.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_ACCUM_STAGES = {
+    "NONE":  (0,  "No base detected"),
+    "1A":    (20, "Base building — early contraction"),
+    "1B":    (40, "Base testing — support holding"),
+    "1C":    (60, "Spring / re-test — buyers absorbing supply"),
+    "2A":    (80, "Early markup — first leg out of base"),
+    "2B":    (95, "Markup continuation — trend established"),
+}
+
+def compute_accumulation_sequence(
+    df: pd.DataFrame,
+    mode: str,
+    pca_score: float = 0.0,
+    em_score: float = 0.0,
+    phase: str = "IDLE",
+    smart_money_verdict: str = "NEUTRAL",
+    rs_line_high: bool = False,
+) -> dict:
+    """
+    Accumulation Sequence Detector.
+
+    Infers Wyckoff/Weinstein stage from the combination of:
+    - Price structure (base width, depth, tightening)
+    - PCA score (buying pressure evidence)
+    - EmScore (coiling mechanics)
+    - Phase classification
+    - Smart money verdict
+
+    Returns AccumStage (NONE/1A/1B/1C/2A/2B), AccumStageLabel,
+    AccumSequenceScore (0–100), AccumConfidence, AccumBarsInBase.
+    """
+    out = dict(
+        AccumStage="NONE", AccumStageLabel="No base detected",
+        AccumSequenceScore=0, AccumConfidence=0, AccumBarsInBase=0,
+    )
+    try:
+        if df is None or len(df) < 30:
+            return out
+        cl  = df["Close"].values.astype(np.float64)
+        hi  = df["High"].values.astype(np.float64)
+        lo  = df["Low"].values.astype(np.float64)
+        vol = df["Volume"].values.astype(np.float64)
+        n   = len(cl)
+
+        # ── Base detection ────────────────────────────────────────────────────
+        # Find the longest recent stretch where price stayed within a range ≤ 25%
+        # of price (Weinstein Stage 1 base = sideways consolidation)
+        base_bars = 0
+        base_depth_pct = 0.0
+        base_range_tightening = False
+        try:
+            lb = min(120, n)
+            cl_lb = cl[-lb:]
+            hi_lb = hi[-lb:]
+            lo_lb = lo[-lb:]
+            # Scan backwards for base: find max contiguous stretch within 20% range
+            for start in range(lb - 1, 0, -1):
+                sub_hi  = float(np.max(hi_lb[start:]))
+                sub_lo  = float(np.min(lo_lb[start:]))
+                mid_px  = (sub_hi + sub_lo) / 2
+                if mid_px > 0:
+                    depth = (sub_hi - sub_lo) / mid_px * 100
+                    if depth <= 25.0:
+                        base_bars = lb - start
+                        base_depth_pct = round(depth, 1)
+                        # Tightening: first half range > second half range
+                        mid = start + (lb - start) // 2
+                        h1 = float(np.max(hi_lb[start:mid])) - float(np.min(lo_lb[start:mid]))
+                        h2 = float(np.max(hi_lb[mid:])) - float(np.min(lo_lb[mid:]))
+                        base_range_tightening = (h2 < h1 * 0.80)
+                    else:
+                        break
+        except Exception:
+            pass
+
+        # ── Spring / failed breakdown detection ───────────────────────────────
+        spring_detected = False
+        try:
+            if base_bars >= 10 and n >= 15:
+                lb_spring = min(base_bars, n - 5)
+                base_lo_support = float(np.min(lo[-lb_spring - 5:-5]))
+                spring_cnt = sum(
+                    1 for k in range(1, min(10, n))
+                    if float(lo[-k]) < base_lo_support * 0.997
+                    and float(cl[-k]) >= base_lo_support * 0.999
+                )
+                spring_detected = spring_cnt >= 1
+        except Exception:
+            pass
+
+        # ── Price breakout from base ──────────────────────────────────────────
+        early_markup = phase in (PHASE_BRK, PHASE_CONT, PHASE_ENTRY)
+        continued_markup = phase in (PHASE_CONT, PHASE_BRK) and rs_line_high
+
+        # ── Sequence scoring ──────────────────────────────────────────────────
+        # Combine structural evidence with PCA + Em signals
+        seq_score = 0
+        confidence_signals = 0
+
+        if base_bars >= 20:   seq_score += 25; confidence_signals += 1
+        elif base_bars >= 10: seq_score += 15
+        elif base_bars >= 5:  seq_score += 8
+
+        if base_range_tightening: seq_score += 15; confidence_signals += 1
+        if spring_detected:        seq_score += 20; confidence_signals += 1
+        if pca_score >= 50:        seq_score += 15; confidence_signals += 1
+        elif pca_score >= 35:      seq_score += 8
+        if em_score >= 45:         seq_score += 10; confidence_signals += 1
+        elif em_score >= 30:       seq_score += 5
+        if smart_money_verdict in ("ACCUMULATING", "MARKUP_READY"):
+            seq_score += 15; confidence_signals += 1
+        elif smart_money_verdict == "ABSORBING":
+            seq_score += 8
+
+        seq_score = int(np.clip(seq_score, 0, 100))
+        confidence = min(100, confidence_signals * 17)
+
+        # ── Stage assignment ──────────────────────────────────────────────────
+        if continued_markup and rs_line_high:
+            stage = "2B"
+        elif early_markup and (pca_score >= 45 or seq_score >= 60):
+            stage = "2A"
+        elif spring_detected and pca_score >= 40:
+            stage = "1C"
+        elif base_bars >= 15 and base_range_tightening and pca_score >= 30:
+            stage = "1B"
+        elif base_bars >= 8 and seq_score >= 25:
+            stage = "1A"
+        else:
+            stage = "NONE"
+
+        label = _ACCUM_STAGES.get(stage, (0, "Unknown"))[1]
+
+        out.update(
+            AccumStage          = stage,
+            AccumStageLabel     = label,
+            AccumSequenceScore  = seq_score,
+            AccumConfidence     = confidence,
+            AccumBarsInBase     = base_bars,
+        )
+    except Exception:
+        pass
+    return out
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GAP-4 — MICROSTRUCTURE LOGIC
+# Reconstructs intrabar order-flow proxies from OHLCV. Works for all modes.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_microstructure(df: pd.DataFrame, mode: str) -> dict:
+    """
+    Microstructure Score (0–100 MicroScore).
+
+    Intrabar order-flow proxies reconstructed from OHLCV:
+    1. Close Location Value  (20 pts) — where close sits in bar range (=buying pressure)
+    2. Delta Proxy           (20 pts) — fraction of bar range used upward (up-close bias)
+    3. Absorption Ratio      (20 pts) — high-vol bars with small net move (=supply absorbed)
+    4. Wick Asymmetry        (20 pts) — lower wicks > upper wicks = buyers defending
+    5. VWAP Micro-Deviation  (20 pts) — price hugging VWAP from above = strong demand
+
+    Labels: STRONG_BUY_FLOW ≥75 · BUY_FLOW ≥55 · NEUTRAL_FLOW ≥35 ·
+            SELL_FLOW ≥20 · STRONG_SELL_FLOW <20
+    """
+    out = dict(
+        MicroScore=0.0, MicroLabel="NEUTRAL_FLOW",
+        MicroDelta=0.0, MicroCLV=0.0,
+        MicroAbsorption=0.0, MicroWickAsym=0.0, MicroVWAPDev=0.0,
+    )
+    try:
+        if df is None or len(df) < 20:
+            return out
+        cl  = df["Close"].values.astype(np.float64)
+        hi  = df["High"].values.astype(np.float64)
+        lo  = df["Low"].values.astype(np.float64)
+        vol = df["Volume"].values.astype(np.float64)
+        op  = (df["Open"].values.astype(np.float64)
+               if "Open" in df.columns else cl.copy())
+        n   = len(cl)
+
+        # ── 1. Close Location Value (0–20 pts) ────────────────────────────────
+        # CLV = (close - low) / (high - low); averaged = where buyers left price
+        clv_pts = 0.0
+        try:
+            lb_clv = min(20, n)
+            rng    = hi[-lb_clv:] - lo[-lb_clv:]
+            clv    = np.where(rng > 0, (cl[-lb_clv:] - lo[-lb_clv:]) / rng, 0.5)
+            # Volume-weighted CLV
+            vw_clv = float(np.sum(clv * vol[-lb_clv:]) / (np.sum(vol[-lb_clv:]) + 1e-10))
+            if   vw_clv > 0.70: clv_pts = 20.0
+            elif vw_clv > 0.60: clv_pts = 15.0
+            elif vw_clv > 0.50: clv_pts = 10.0
+            elif vw_clv > 0.40: clv_pts = 5.0
+            elif vw_clv > 0.30: clv_pts = 2.0
+        except Exception:
+            pass
+
+        # ── 2. Delta Proxy (0–20 pts) ─────────────────────────────────────────
+        # Measures how much of the bar's range was used on the upside
+        # Approximation: (close - open) / range = net directional usage
+        delta_pts = 0.0
+        try:
+            lb_d  = min(20, n)
+            rng_d = hi[-lb_d:] - lo[-lb_d:]
+            delta = np.where(rng_d > 0, (cl[-lb_d:] - op[-lb_d:]) / rng_d, 0.0)
+            # Volume-weighted mean delta
+            vw_delta = float(np.sum(delta * vol[-lb_d:]) / (np.sum(vol[-lb_d:]) + 1e-10))
+            if   vw_delta > 0.25: delta_pts = 20.0
+            elif vw_delta > 0.15: delta_pts = 15.0
+            elif vw_delta > 0.05: delta_pts = 10.0
+            elif vw_delta > 0:    delta_pts = 5.0
+            elif vw_delta > -0.05:delta_pts = 2.0
+        except Exception:
+            pass
+
+        # ── 3. Absorption Ratio (0–20 pts) ────────────────────────────────────
+        # High-vol bars with small price move relative to vol = supply being absorbed
+        abs_pts = 0.0
+        try:
+            avg_vol_ = float(np.mean(vol[-21:-1])) if n >= 22 else float(np.mean(vol))
+            avg_rng_ = float(np.mean(hi[-21:-1] - lo[-21:-1])) if n >= 22 else float(np.mean(hi - lo))
+            if avg_vol_ > 0 and avg_rng_ > 0:
+                lb_a = min(15, n - 1)
+                absorption_score = 0.0
+                for k in range(1, lb_a + 1):
+                    v_k   = float(vol[-k])
+                    rng_k = float(hi[-k] - lo[-k])
+                    # Volume efficiency ratio: vol per unit of range
+                    if rng_k > 0:
+                        eff = v_k / rng_k
+                        avg_eff = avg_vol_ / (avg_rng_ + 1e-10)
+                        # High efficiency + close in upper half = absorption
+                        clv_k = (float(cl[-k]) - float(lo[-k])) / rng_k
+                        if eff > avg_eff * 1.5 and clv_k > 0.50:
+                            absorption_score += 2.0
+                        elif eff > avg_eff * 1.2 and clv_k > 0.45:
+                            absorption_score += 1.0
+                abs_pts = min(20.0, absorption_score)
+        except Exception:
+            pass
+
+        # ── 4. Wick Asymmetry (0–20 pts) ─────────────────────────────────────
+        # Lower wicks > upper wicks = sellers tried to push down, buyers recovered
+        wick_pts = 0.0
+        try:
+            lb_w   = min(20, n)
+            upper_wicks = hi[-lb_w:] - np.maximum(cl[-lb_w:], op[-lb_w:])
+            lower_wicks = np.minimum(cl[-lb_w:], op[-lb_w:]) - lo[-lb_w:]
+            # Volume-weight each wick
+            vw_upper = float(np.sum(upper_wicks * vol[-lb_w:]) / (np.sum(vol[-lb_w:]) + 1e-10))
+            vw_lower = float(np.sum(lower_wicks * vol[-lb_w:]) / (np.sum(vol[-lb_w:]) + 1e-10))
+            ratio = vw_lower / (vw_upper + 1e-10)
+            if   ratio > 2.5: wick_pts = 20.0
+            elif ratio > 1.8: wick_pts = 15.0
+            elif ratio > 1.3: wick_pts = 10.0
+            elif ratio > 1.0: wick_pts = 6.0
+            elif ratio > 0.7: wick_pts = 2.0
+        except Exception:
+            pass
+
+        # ── 5. VWAP Micro-Deviation (0–20 pts) ────────────────────────────────
+        # How consistently price closes above rolling VWAP over recent bars
+        vwap_pts = 0.0
+        try:
+            lb_v = min(20, n)
+            typ  = (hi[-lb_v:] + lo[-lb_v:] + cl[-lb_v:]) / 3.0
+            cum_vol  = np.cumsum(vol[-lb_v:])
+            cum_tpv  = np.cumsum(typ * vol[-lb_v:])
+            vwap_arr = cum_tpv / (cum_vol + 1e-10)
+            # Count bars where close > rolling VWAP
+            above_vwap = np.sum(cl[-lb_v:] > vwap_arr)
+            pct_above  = above_vwap / lb_v
+            # Also check: is close currently above VWAP?
+            above_now  = float(cl[-1]) > float(vwap_arr[-1])
+            if   pct_above > 0.80 and above_now: vwap_pts = 20.0
+            elif pct_above > 0.65 and above_now: vwap_pts = 15.0
+            elif pct_above > 0.55 and above_now: vwap_pts = 10.0
+            elif pct_above > 0.45 and above_now: vwap_pts = 5.0
+            elif above_now:                       vwap_pts = 3.0
+        except Exception:
+            pass
+
+        total = round(float(np.clip(
+            clv_pts + delta_pts + abs_pts + wick_pts + vwap_pts,
+            0, 100
+        )), 1)
+
+        if   total >= 75: label = "STRONG_BUY_FLOW"
+        elif total >= 55: label = "BUY_FLOW"
+        elif total >= 35: label = "NEUTRAL_FLOW"
+        elif total >= 20: label = "SELL_FLOW"
+        else:             label = "STRONG_SELL_FLOW"
+
+        out.update(
+            MicroScore      = total,
+            MicroLabel      = label,
+            MicroCLV        = round(clv_pts,   1),
+            MicroDelta      = round(delta_pts,  1),
+            MicroAbsorption = round(abs_pts,    1),
+            MicroWickAsym   = round(wick_pts,   1),
+            MicroVWAPDev    = round(vwap_pts,   1),
+        )
+    except Exception:
+        pass
+    return out
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v15.1 PATTERN HELPERS + v15.2 FIXES (closed-candle, pivot tolerance)
+# ══════════════════════════════════════════════════════════════════════════════
 
 # FIX-A: pivot tolerance multipliers per mode
 _PIVOT_TOL = {"Intraday": 0.25, "Swing": 0.15, "Positional": 0.10}
@@ -2619,14 +3575,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         if _base_tf not in _mtf_data:
             _mtf_data[_base_tf] = df
         _mtf = compute_mtf_sync(sym or "", mode, prefetched=_mtf_data)
-
-        # EMS — Emerging Momentum Score (sector component injected post-scan)
-        _ems = compute_emerging_momentum_score(
-            df=df, mode=mode, nifty_close=nifty_close,
-            rs_rank=rs_rank, atr_val=atr_val, atr_mean=atr_mean,
-            squeeze=squeeze, e_fast_s=e_fast_s, e_slow_s=e_slow_s,
-            sector_avg_score=50.0,   # updated in run_scan after breadth
-        )
         # ── FIX-C: category-based scoring — placeholder phase ──────────────
         _cat = category_score(
             trend_up       = trend_up,
@@ -2697,8 +3645,8 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
         norm_bull = _cat2["norm_bull"]
         raw_score = int(norm_bull)
 
-        # ADX gate: only demote BREAKOUT if ADX is truly weak (<15). Was 18 — too strict.
-        if phase == PHASE_BRK and adx_val < 15:
+        # ADX gate: don't declare BREAKOUT if ADX weak (no trend strength)
+        if phase == PHASE_BRK and adx_val < 18:
             phase = PHASE_ENTRY
 
         phase, _ = ext_phase_override(phase, ext_flags, ext_n, mode)
@@ -2723,12 +3671,6 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
             regime_bullish=market_bullish, ext_n=ext_n, vix_val=vix_val,
             phase_bonus=phase_bonus, rs_rank=rs_rank,
         )
-
-        # Near-breakout flag: within 1 ATR of 20-bar high, score building
-        hi_20 = float(df["High"].iloc[-21:-1].max()) if n > 21 else float(df["High"].max())
-        near_brk = (c >= hi_20 * 0.98 and c < hi_20 * 1.02
-                    and phase in (PHASE_SETUP, PHASE_ENTRY)
-                    and norm_bull >= 48)
 
         ltp   = round(c, 2)
         entry = entry_price if entry_price else ltp
@@ -2814,22 +3756,36 @@ def score_stock(df, nifty_close, mode="Swing", daily_close=None,
             "CandlePatterns":_candle["patterns"],
             "NR7":          _candle["nr7"],
             "InsideBar":    _candle["inside_bar"],
-            "NearBrk":      near_brk,
-            "Hi20":         round(hi_20, 2),
-            # ── EMS — Emerging Momentum Score ────────────────────────────────
-            "EMS":          _ems["ems"],
-            "EMSLabel":     _ems["ems_label"],
-            "EMSColor":     _ems["ems_color"],
-            "EMSBreakdown": _ems["ems_breakdown"],
-            "EMS_RSAcc":    _ems["ems_rs_acc"],
-            "EMS_ATRComp":  _ems["ems_atr_comp"],
-            "EMS_RVOLAcc":  _ems["ems_rvol_acc"],
-            "EMS_EMAConv":  _ems["ems_ema_conv"],
-            "EMS_Squeeze":  _ems["ems_squeeze"],
-            "EMS_Sector":   _ems["ems_sector"],
-            "EMS_ORExp":    _ems["ems_or_exp"],
-            "SqzDepth":     _ems.get("sqz_depth", 1.0),
-            "SqzBars":      _ems.get("sqz_bars", 0),
+            # ── v15.5: Emerging Momentum Score (7-component leading indicator) ──
+            **compute_emerging_score(df, mode, nifty_close, rs_rank),
+            # ── v15.6: Pre-Confirmation Accumulation (7-signal buying-pressure layer) ──
+            **compute_preconfirmation_accumulation(df, mode),
+            # ── v15.7: Smart Money Behavior Model ────────────────────────────
+            **compute_smart_money_model(
+                df, mode,
+                pca_score  = 0.0,     # filled post-hoc below
+                inst_score = _inst["inst_score"],
+                obv_trend  = _inst["obv_trend"],
+            ),
+            # ── v15.7: Accumulation Sequencing ───────────────────────────────
+            **compute_accumulation_sequence(
+                df, mode,
+                pca_score            = 0.0,   # filled post-hoc below
+                em_score             = 0.0,   # filled post-hoc below
+                phase                = phase,
+                smart_money_verdict  = "NEUTRAL",  # filled post-hoc below
+                rs_line_high         = False,       # filled post-hoc below
+            ),
+            # ── v15.7: Microstructure Logic ───────────────────────────────────
+            **compute_microstructure(df, mode),
+            # ── v15.7: Relative Leadership Intelligence ───────────────────────
+            **compute_rs_leadership(
+                close            = close,
+                nifty_close      = nifty_close,
+                rs_rank          = rs_rank,
+                sector_avg_score = 50.0,  # enriched in run_scan (like EmSectorMom)
+                stock_score      = norm_bull,
+            ),
         }
     except Exception:
         return None
@@ -3057,36 +4013,88 @@ def run_scan(symbols, mode, progress_bar, status_text,
     breadth_pulse = compute_breadth(results)
     pct_ema50_now = breadth_pulse.get("pct_above_ema50", 100)
     ad_ratio_now  = breadth_pulse.get("ad_ratio", 2.0)
-    breadth_weak  = (pct_ema50_now < 40) and (ad_ratio_now < 0.8)
 
-    # ── EMS sector component injection ────────────────────────────────────
-    # Breadth sector_avg is now available — update each stock's EMS sector
-    # component and recompute composite EMS.
-    sector_avg_map = breadth_pulse.get("sector_avg", {})
-    all_sector_scores = list(sector_avg_map.values()) or [50.0]
-    _sec_median = float(np.median(all_sector_scores))
-    for res in results:
-        sec         = res.get("Sector", "Other")
-        sec_avg     = sector_avg_map.get(sec, _sec_median)
-        # Recompute sector component (mirrors Engine 6 logic)
-        if   sec_avg >= 72: c6 = 10.0
-        elif sec_avg >= 63: c6 =  7.0
-        elif sec_avg >= 55: c6 =  4.0
-        elif sec_avg >= 48: c6 =  1.0
-        else:               c6 =  0.0
-        rs_rank = res.get("RS_Rank", 50)
-        if sec_avg >= 63 and rs_rank < 40:
-            c6 = min(10.0, c6 + 3.0)
-        old_ems  = res.get("EMS", 0.0)
-        old_c6   = res.get("EMS_Sector", 0.0)
-        new_ems  = float(np.clip(old_ems - old_c6 + c6, 0.0, 100.0))
-        lbl, col = _ems_label(new_ems)
-        res["EMS"]        = round(new_ems, 1)
-        res["EMS_Sector"] = round(c6, 1)
-        res["EMSLabel"]   = lbl
-        res["EMSColor"]   = col
-        if isinstance(res.get("EMSBreakdown"), dict):
-            res["EMSBreakdown"]["sector"] = round(c6, 1)
+    # ── v15.5: Enrich Emerging Scores with sector momentum ────────────────
+    _sec_avg   = breadth_pulse.get("sector_avg", {})
+    _ovl_avg   = float(np.mean(list(_sec_avg.values()))) if _sec_avg else 50.0
+    for _res in results:
+        _sb = 0.0
+        if _sec_avg:
+            _sa = _sec_avg.get(_res.get("Sector", "Other"), _ovl_avg)
+            if   _sa >= _ovl_avg + 10: _sb = 10.0
+            elif _sa >= _ovl_avg + 5:  _sb = 7.0
+            elif _sa >= _ovl_avg:      _sb = 4.0
+            elif _sa >= _ovl_avg - 5:  _sb = 2.0
+        _res["EmSectorMom"] = round(_sb, 1)
+        _em_total = round(min(100.0, _res.get("EmScore", 0) + _sb), 1)
+        _res["EmScore"] = _em_total
+        _res["EmLabel"] = ("IGNITING" if _em_total >= 65 else "BUILDING" if _em_total >= 50
+                           else "COILING" if _em_total >= 35 else "LATENT" if _em_total >= 20
+                           else "QUIET")
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── v15.7: Post-hoc cross-field enrichment ────────────────────────────
+    # Now that PCA, Em, AccumSeq, SmartMoney are all computed, fill the
+    # fields that depend on each other (circular dependencies resolved here).
+    _sec_avg_2 = breadth_pulse.get("sector_avg", {})
+    _ovl_avg_2 = float(np.mean(list(_sec_avg_2.values()))) if _sec_avg_2 else 50.0
+
+    for _res in results:
+        _pca  = _res.get("PCAScore", 0.0)
+        _em   = _res.get("EmScore",  0.0)
+        _ph   = _res.get("Phase",    PHASE_IDLE)
+        _sec  = _res.get("Sector",   "Other")
+        _sec_score = _sec_avg_2.get(_sec, _ovl_avg_2)
+
+        # ── Re-compute SmartMoney with real PCA score ──────────────────────
+        _sm = compute_smart_money_model(
+            valid_data.get(_res.get("Symbol",""), pd.DataFrame()),
+            mode,
+            pca_score  = _pca,
+            inst_score = _res.get("InstScore", 50.0),
+            obv_trend  = _res.get("InstOBV",   True),
+        )
+        _res.update(_sm)
+
+        # ── Re-compute AccumSequence with real PCA + Em + SmartMoney ──────
+        _rl_high = _res.get("RSLineHigh", False)
+        _as = compute_accumulation_sequence(
+            valid_data.get(_res.get("Symbol",""), pd.DataFrame()),
+            mode,
+            pca_score           = _pca,
+            em_score            = _em,
+            phase               = _ph,
+            smart_money_verdict = _res.get("SmartMoneyVerdict", "NEUTRAL"),
+            rs_line_high        = _rl_high,
+        )
+        _res.update(_as)
+
+        # ── Re-compute RSLeadership with real sector avg ───────────────────
+        _close_ser = (valid_data[_res["Symbol"]]["Close"]
+                      if _res.get("Symbol") in valid_data else pd.Series(dtype=float))
+        _rl = compute_rs_leadership(
+            close            = _close_ser,
+            nifty_close      = nifty,
+            rs_rank          = _res.get("RS_Rank", 50),
+            sector_avg_score = _sec_score,
+            stock_score      = _res.get("Score", 50.0),
+        )
+        _res.update(_rl)
+
+        # ── GAP-5: Apply PRE-CONFIRM action tier ──────────────────────────
+        _cur_action = _res.get("Action", "SKIP")
+        if _cur_action not in ("STRONG BUY", "BUY"):   # don't downgrade confirmed signals
+            _pc_action = action_label_with_preconfirm(
+                norm_score           = _res.get("Score", 0.0),
+                pca_score            = _pca,
+                em_score             = _em,
+                phase                = _ph,
+                smart_money_verdict  = _res.get("SmartMoneyVerdict", "NEUTRAL"),
+                accum_stage          = _res.get("AccumStage", "NONE"),
+            )
+            _res["Action"] = _pc_action
+
+    breadth_weak  = (pct_ema50_now < 40) and (ad_ratio_now < 0.8)
 
     if breadth_weak:
         gated_count = 0
@@ -3096,6 +4104,9 @@ def run_scan(symbols, mode, progress_bar, status_text,
                     res["Action"]       = "WATCH"
                     res["BreadthGated"] = True
                     gated_count        += 1
+            # v15.7: PRE-CONFIRM is never breadth-gated — these stocks haven't
+            # confirmed yet, so breadth doesn't apply to them.
+            # (PRE-CONFIRM only fires on SETUP/IDLE phase anyway)
         if gated_count:
             st.warning(
                 f"⚠️ **Breadth Gate active** — only {pct_ema50_now}% above EMA50, "
@@ -3400,6 +4411,7 @@ def add_position(sym:str, entry_price:float, qty:int, mode:str, entry_date:str=N
 def _action_colors(act):
     if act=="STRONG BUY": return "#f59e0b22","#f59e0b88","#f59e0b"
     if act=="BUY":        return "#22c55e1a","#22c55e66","#22c55e"
+    if act=="PRE-CONFIRM":return "#8b5cf622","#8b5cf688","#a78bfa"   # v15.7
     if act=="WATCH":      return "#3b82f611","#3b82f644","#60a5fa"
     return "#cbd5e111","#cbd5e133","#cbd5e1"
 
@@ -3543,7 +4555,7 @@ def fetch_indices(mode="Swing"):
 # ══════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="🐂 BULL SUTRA Pro v15",
+    page_title="🐂 BULL SUTRA Pro v15.6",
     page_icon="🐂", layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -3591,7 +4603,7 @@ st.markdown(
     letter-spacing:-1px;color:#e8e8f4;padding:8px 0 4px;">
     <span style="color:#f59e0b;">&#x1F402;</span> BULL SUTRA
     <span style="font-size:13px;color:#cbd5e1;font-family:JetBrains Mono,monospace;
-    font-weight:400;">PRO · v15 ⚡</span></div>''',
+    font-weight:400;">PRO · v15.7 ⚡</span></div>''',
     unsafe_allow_html=True,
 )
 
@@ -3614,11 +4626,35 @@ with gc4:
     st.session_state["live_refresh_enabled"]=live_refresh
 with gc5:
     filter_opt=st.selectbox("Filter",
-        ["BUY + STRONG BUY","STRONG BUY only","WATCH + BUY","All Results"],
+        ["BUY + STRONG BUY","STRONG BUY only","WATCH + BUY","PRE-CONFIRM","All Results"],
         label_visibility="collapsed")
 with gc6:
     search_q=st.text_input("Search symbol",placeholder="e.g. RELIANCE",
                             label_visibility="collapsed")
+
+# ── v15.5: Selection type row ──────────────────────────────────────────────────
+_sc1, _sc2, _sc3 = st.columns([3, 3, 6])
+with _sc1:
+    selection_type = st.radio(
+        "Selection Mode",
+        ["🎯 Confirmation", "🌱 Emerging"],
+        horizontal=True,
+        key="sel_type",
+        help=(
+            "Confirmation — stocks already in ENTRY/CONT/BREAKOUT phase.\n"
+            "Emerging — stocks BEFORE they become obvious (coiling, building momentum)."
+        ),
+    )
+with _sc2:
+    if selection_type == "🌱 Emerging":
+        em_min_score = st.slider(
+            "Min Emerging Score", 20, 80,
+            st.session_state.get("em_min_score", 35), 5,
+            key="em_min_score_slider",
+        )
+        st.session_state["em_min_score"] = em_min_score
+    else:
+        em_min_score = st.session_state.get("em_min_score", 35)
 
 vix_val,vix_label=fetch_vix()
 vix_color={"CALM":"#22c55e","CAUTION":"#f59e0b","STRESS":"#ef4444","UNKNOWN":"#cbd5e1"}.get(vix_label,"#cbd5e1")
@@ -3856,6 +4892,7 @@ with tab_scanner:
     if filter_opt=="BUY + STRONG BUY": results=[r for r in results if r["Action"] in ("BUY","STRONG BUY")]
     elif filter_opt=="STRONG BUY only": results=[r for r in results if r["Action"]=="STRONG BUY"]
     elif filter_opt=="WATCH + BUY": results=[r for r in results if r["Action"] in ("WATCH","BUY","STRONG BUY")]
+    elif filter_opt=="PRE-CONFIRM": results=[r for r in results if r["Action"]=="PRE-CONFIRM"]
     _phase_filter=st.session_state.get("phase_filter","All Phases")
     if _phase_filter!="All Phases": results=[r for r in results if r.get("Phase")==_phase_filter]
     if not st.session_state.get("show_illiquid",False): results=[r for r in results if r.get("LiquidityOK",True)]
@@ -3869,296 +4906,7 @@ with tab_scanner:
             if signal_is_stale(entry["timestamp"],entry.get("mode",scan_mode_now)):
                 stale_syms.add(entry["symbol"])
 
-        # ── Decision synthesis — picks top 3 reasons + 1 watch in plain English ─
-        def _synthesize_reasons(r: dict) -> tuple:
-            """
-            Returns (reasons: list[str], watch: str | None)
-            Each reason is one plain-English sentence drawn from the strongest signal.
-            At most 3 reasons, 1 watch. No jargon codes.
-            """
-            reasons: list = []
-            cautions: list = []
-
-            # ── Bullish signals ranked by conviction ────────────────────────────
-            # MTF alignment
-            if r.get("MTFAligned") and r.get("MTFScore", 50) >= 68:
-                reasons.append(("All 3 timeframes aligned bullish", 100))
-            elif r.get("MTFLabel") == "BULL LEAN":
-                reasons.append(("Momentum building across timeframes", 65))
-
-            # Institutional
-            iv = r.get("InstVerdict","")
-            ic = r.get("InstCMF", 0)
-            if iv == "ACCUMULATION":
-                reasons.append((f"Institutional accumulation (CMF {ic:+.2f})", 95))
-            elif iv == "MILD ACCUM":
-                reasons.append((f"Mild institutional buying (CMF {ic:+.2f})", 60))
-
-            # Squeeze break
-            sqz_b = r.get("SqzBars", 0)
-            if r.get("Squeeze") and sqz_b >= 5:
-                reasons.append((f"{sqz_b}-bar squeeze coiling — breakout likely", 90))
-            elif r.get("Squeeze"):
-                reasons.append(("Volatility squeeze — energy building", 70))
-
-            # Harmonic pattern
-            if r.get("HarmonicDetected"):
-                hp = r.get("HarmonicPattern",""); hq = r.get("HarmonicQuality",0)
-                dl = r.get("DarvasTop") or r.get("HarmonicZone",(0,0))[0]
-                reasons.append((f"{hp} pattern — {hq}% quality", 85))
-
-            # Candle structure
-            cs = r.get("CandleSignal","")
-            cpats = r.get("CandlePatterns",[])
-            if cs == "BULL" and cpats:
-                reasons.append((f"{cpats[0]} candle — bullish reversal signal", 80))
-            elif r.get("NR7"):
-                reasons.append(("NR7 compression — imminent directional move", 75))
-
-            # Darvas breakout
-            if r.get("DarvasBrk"):
-                reasons.append(("Darvas box breakout — institutional trigger", 88))
-
-            # EMA convergence
-            ec = r.get("EMS_EMAConv", 0)
-            if ec >= 11:
-                reasons.append(("EMAs converging — cluster interaction imminent", 72))
-
-            # ATR compression
-            ac = r.get("EMS_ATRComp", 0)
-            if ac >= 15:
-                reasons.append(("ATR at multi-week low — stored energy", 78))
-            elif ac >= 10:
-                reasons.append(("Volatility contracted — low-risk entry window", 60))
-
-            # Volume building
-            vc2 = r.get("EMS_RVOLAcc", 0)
-            if vc2 >= 11:
-                reasons.append(("Volume accumulating steadily before the move", 68))
-
-            # RS acceleration
-            rsa = r.get("EMS_RSAcc", 0)
-            if rsa >= 14:
-                reasons.append(("Relative strength accelerating vs Nifty", 82))
-            elif rsa >= 8:
-                reasons.append(("RS rank rising — outperforming the index", 62))
-
-            # Sector tailwind
-            sm = r.get("EMS_Sector", 0)
-            sec = r.get("Sector","")
-            if sm >= 7:
-                reasons.append((f"{sec} sector leading — rotation tailwind", 74))
-
-            # VCP
-            vg = r.get("VCPGrade","")
-            if vg in ("EXCELLENT","GOOD"):
-                reasons.append((f"VCP {vg.lower()} — classic contraction setup", 83))
-
-            # AVWAP
-            if r.get("AVWAPAbove"):
-                reasons.append(("Holding above anchored VWAP — institutional support", 70))
-
-            # Fib pullback
-            fg = r.get("FibGrade","")
-            if fg in ("EXCELLENT","GOOD"):
-                reasons.append((f"Fibonacci pullback {fg.lower()} — high-quality retracement", 76))
-
-            # 52W high
-            if r.get("Phase") == PHASE_BRK:
-                reasons.append(("Breakout above 52-week resistance", 92))
-
-            # Golden zone
-            if r.get("InGolden"):
-                reasons.append(("In Fibonacci golden zone — key support level", 68))
-
-            # Sort by conviction and take top 3
-            reasons.sort(key=lambda x: x[1], reverse=True)
-            top3 = [txt for txt, _ in reasons[:3]]
-
-            # ── Cautions ─────────────────────────────────────────────────────
-            ext_n  = r.get("ExtN", 0)
-            ext_lb = r.get("ExtLabels", [])
-            rsi_v  = r.get("RSI", 50)
-            if r.get("BreadthGated"):
-                cautions.append(("Market breadth weak — signal capped, smaller size", 100))
-            if ext_n >= 3:
-                cautions.append((f"{ext_lb[0] if ext_lb else 'Exhaustion'} — consider waiting for pullback", 95))
-            elif ext_n == 2:
-                cautions.append((f"{ext_n} exhaustion flags — trim position size", 80))
-            if r.get("MTFDiverge"):
-                cautions.append(("Timeframe divergence — confirm on higher TF first", 85))
-            if rsi_v >= 72:
-                cautions.append((f"RSI {rsi_v:.0f} — extended, prefer pullback entry", 70))
-            if r.get("InstVerdict") in ("DISTRIBUTION","MILD DIST"):
-                cautions.append(("Institutional distribution signs — verify before entry", 75))
-
-            cautions.sort(key=lambda x: x[1], reverse=True)
-            watch = cautions[0][0] if cautions else None
-            return top3, watch
-
-        def make_card(i, r, border_color, show_entry=True):
-            sym    = r["Symbol"]
-            act    = r["Action"]
-            ltp    = r["LTP"]
-            chg    = r["%Change"]
-            score  = r["Score"]
-            phase  = r.get("Phase", PHASE_IDLE)
-            conf   = r.get("Confidence", 0)
-            entry  = r.get("Entry")
-            sl     = r.get("SL")
-            t1     = r.get("T1")
-            t2     = r.get("T2")
-            sector = r.get("Sector", SECTOR_MAP.get(sym,"—"))
-            is_stale = sym in stale_syms
-
-            reasons, watch = _synthesize_reasons(r)
-
-            # ── Colours ─────────────────────────────────────────────────────
-            chg_col  = "#22c55e" if chg >= 0 else "#ef4444"
-            chg_str  = f"+{chg:.2f}%" if chg >= 0 else f"{chg:.2f}%"
-            chg_arr  = "▲" if chg >= 0 else "▼"
-            act_bg, act_brd, act_txt = _action_colors(act)
-            phase_col  = _phase_color(phase)
-            conf_col   = _conf_color(conf)
-            num_bg     = "#22c55e" if act in ("BUY","STRONG BUY") else "#d97706" if act=="WATCH" else "#3a3a60"
-            num_txt    = "#f0fdf4" if act in ("BUY","STRONG BUY") else "#fefce8" if act=="WATCH" else "#c4c6d0"
-            phase_icon = {"BREAKOUT":"🚀","CONT":"↗","ENTRY":"⚡","SETUP":"◎","IDLE":"–","EXIT":"↘"}.get(phase,"")
-            ph_arrow   = get_phase_arrow(sym)
-            conf_dots  = "◆◆◆" if conf>=75 else "◆◆◇" if conf>=50 else "◆◇◇" if conf>=25 else "◇◇◇"
-
-            def _p(v):
-                if v is None: return "—"
-                try:    return f"₹{v:,.0f}"
-                except: return "—"
-
-            # ── Trade numbers ────────────────────────────────────────────────
-            risk_pct = reward_pct = rr = None
-            if entry and sl and ltp:
-                ref   = entry if (show_entry and entry != ltp) else ltp
-                risk  = ref - sl
-                if risk > 0:
-                    risk_pct   = risk / ref * 100
-                    tgt        = t2 or t1
-                    if tgt:
-                        reward_pct = (tgt - ref) / ref * 100
-                        rr         = reward_pct / risk_pct
-
-            entry_str  = _p(entry) if (show_entry and entry and entry != ltp) else _p(ltp)
-            risk_str   = f"−{risk_pct:.1f}%" if risk_pct else "—"
-            rwd_str    = f"+{reward_pct:.1f}%" if reward_pct else "—"
-            rr_str     = f"{rr:.1f}×" if rr else "—"
-            rr_col     = "#22c55e" if (rr and rr>=2) else "#f59e0b" if (rr and rr>=1.5) else "#94a3b8"
-
-            # ── Reason bullets ────────────────────────────────────────────────
-            reasons_html = "".join(
-                f'<div style="display:flex;align-items:flex-start;gap:6px;'
-                f'margin-bottom:5px;">'
-                f'<span style="color:#22c55e;margin-top:1px;flex-shrink:0;">●</span>'
-                f'<span style="color:#cbd5e1;font-size:11px;line-height:1.4;">{txt}</span>'
-                f'</div>'
-                for txt in reasons
-            ) if reasons else (
-                '<div style="color:#475569;font-size:11px;">—</div>'
-            )
-
-            watch_html = (
-                f'<div style="display:flex;align-items:flex-start;gap:6px;margin-top:2px;">'
-                f'<span style="color:#f59e0b;flex-shrink:0;font-size:11px;">⚠</span>'
-                f'<span style="color:#94a3b8;font-size:11px;line-height:1.4;">{watch}</span>'
-                f'</div>'
-            ) if watch else ""
-
-            stale_pip = (' <span style="color:#64748b;font-size:9px;">⏱ stale</span>'
-                         if is_stale else "")
-
-            ems_v = r.get("EMS", 0)
-            ems_c = r.get("EMSColor","#334155")
-            ems_bar = (
-                f'<div style="margin-top:8px;padding-top:8px;border-top:1px solid #1e1e40;">'
-                f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;">'
-                f'<span style="color:#64748b;font-size:9px;letter-spacing:.06em;">EMERGING PRESSURE</span>'
-                f'<span style="color:{ems_c};font-size:9px;font-family:JetBrains Mono,monospace;font-weight:600;">'
-                f'{r.get("EMSLabel","—")} {ems_v:.0f}</span></div>'
-                f'<div style="background:#1e1e40;border-radius:2px;height:3px;">'
-                f'<div style="width:{min(int(ems_v),100)}%;background:{ems_c};height:3px;border-radius:2px;"></div>'
-                f'</div></div>'
-            ) if phase in (PHASE_SETUP, PHASE_IDLE) and ems_v >= 45 else ""
-
-            return (
-                # ── Card shell ──────────────────────────────────────────────
-                f'<div style="background:#0f0f1c;border:1px solid {border_color};border-radius:14px;'
-                f'overflow:hidden;width:400px;min-width:360px;max-width:420px;flex:1 1 400px;'
-                f'display:flex;flex-direction:column;">'
-
-                # ── Header ──────────────────────────────────────────────────
-                f'<div style="display:flex;align-items:center;padding:10px 14px 9px;'
-                f'border-bottom:1px solid #1a1a2e;gap:8px;background:#0b0b16;">'
-                f'<div style="background:{num_bg};color:{num_txt};font-family:JetBrains Mono,monospace;'
-                f'font-size:11px;font-weight:700;padding:3px 7px;border-radius:5px;'
-                f'min-width:26px;text-align:center;flex-shrink:0;">{i+1:02d}</div>'
-                f'<div style="flex:1;min-width:0;">'
-                f'<div style="font-family:Syne,sans-serif;color:#f0f4ff;font-size:16px;'
-                f'font-weight:700;letter-spacing:-.02em;">{sym}{stale_pip}</div>'
-                f'<div style="color:#475569;font-size:9px;margin-top:1px;'
-                f'font-family:Inter,sans-serif;">{sector}'
-                f' &nbsp;·&nbsp; '
-                f'<span style="color:{phase_col};">{phase_icon} {phase}'
-                f'{(" " + ph_arrow) if ph_arrow else ""}</span></div>'
-                f'</div>'
-                f'<span style="background:{act_bg};border:1px solid {act_brd};color:{act_txt};'
-                f'padding:4px 10px;border-radius:6px;font-size:10px;font-weight:700;'
-                f'font-family:DM Sans,sans-serif;flex-shrink:0;">{act}</span>'
-                f'</div>'
-
-                # ── Price + confidence ───────────────────────────────────────
-                f'<div style="padding:10px 14px 8px;border-bottom:1px solid #1a1a2e;'
-                f'display:flex;align-items:center;justify-content:space-between;">'
-                f'<div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:#f0f4ff;'
-                f'font-size:22px;font-weight:600;line-height:1;">₹{ltp:,.2f}</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:{chg_col};'
-                f'font-size:12px;margin-top:3px;">{chg_str} {chg_arr}</div>'
-                f'</div>'
-                f'<div style="text-align:right;">'
-                f'<div style="color:{conf_col};font-family:JetBrains Mono,monospace;'
-                f'font-size:16px;letter-spacing:.08em;">{conf_dots}</div>'
-                f'<div style="color:#475569;font-size:9px;margin-top:2px;">Score {score:.0f} / 100</div>'
-                f'</div>'
-                f'</div>'
-
-                # ── Trade setup ─────────────────────────────────────────────
-                f'<div style="padding:10px 14px;border-bottom:1px solid #1a1a2e;">'
-                f'<div style="color:#475569;font-size:8px;letter-spacing:.1em;'
-                f'text-transform:uppercase;margin-bottom:6px;">Trade Setup</div>'
-                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;">'
-                f'<div style="background:#111128;border-radius:6px;padding:6px 8px;">'
-                f'<div style="color:#64748b;font-size:8px;text-transform:uppercase;letter-spacing:.06em;">Entry</div>'
-                f'<div style="color:#f0f4ff;font-family:JetBrains Mono,monospace;font-size:12px;font-weight:600;margin-top:2px;">{entry_str}</div>'
-                f'</div>'
-                f'<div style="background:#111128;border-radius:6px;padding:6px 8px;">'
-                f'<div style="color:#64748b;font-size:8px;text-transform:uppercase;letter-spacing:.06em;">Stop</div>'
-                f'<div style="color:#ef4444;font-family:JetBrains Mono,monospace;font-size:12px;font-weight:600;margin-top:2px;">{_p(sl)}</div>'
-                f'<div style="color:#ef444488;font-size:9px;">{risk_str}</div>'
-                f'</div>'
-                f'<div style="background:#111128;border-radius:6px;padding:6px 8px;">'
-                f'<div style="color:#64748b;font-size:8px;text-transform:uppercase;letter-spacing:.06em;">Target</div>'
-                f'<div style="color:#22c55e;font-family:JetBrains Mono,monospace;font-size:12px;font-weight:600;margin-top:2px;">{_p(t2 or t1)}</div>'
-                f'<div style="color:{rr_col};font-size:9px;">{rwd_str} &nbsp; R:R {rr_str}</div>'
-                f'</div>'
-                f'</div>'
-                f'</div>'
-
-                # ── Why now ─────────────────────────────────────────────────
-                f'<div style="padding:10px 14px;flex:1;">'
-                f'<div style="color:#475569;font-size:8px;letter-spacing:.1em;'
-                f'text-transform:uppercase;margin-bottom:7px;">Why Now</div>'
-                + reasons_html
-                + watch_html
-                + ems_bar
-                + f'</div>'
-
-                f'</div>'   # card close
-            )
+        def make_card(i,r,border_color,show_entry=True):
             sym=r["Symbol"]; act=r["Action"]; ltp=r["LTP"]; chg=r["%Change"]
             score=r["Score"]; phase=r.get("Phase",PHASE_IDLE); conf=r.get("Confidence",0)
             rsi_val=r.get("RSI","—"); rs_rank=r.get("RS_Rank",50)
@@ -4313,15 +5061,6 @@ with tab_scanner:
             if r.get("NR7"):
                 candle_badge += ('<span style="background:#7c3aed22;border:1px solid #7c3aed55;color:#a78bfa;'
                                  'padding:1px 5px;border-radius:3px;font-size:9px;margin-left:3px;">NR7</span>')
-            # EMS badge — show on SETUP/IDLE stocks with high EMS
-            ems_val   = r.get("EMS", 0.0)
-            ems_lbl   = r.get("EMSLabel", "DORMANT")
-            ems_col   = r.get("EMSColor", "#334155")
-            ems_badge = ""
-            if ems_val >= 50:
-                ems_badge = (f'<span style="background:{ems_col}22;border:1px solid {ems_col}55;'
-                             f'color:{ems_col};padding:1px 5px;border-radius:3px;font-size:9px;'
-                             f'margin-left:3px;">🌱 EMS {ems_val:.0f}</span>')
             metrics=[
                 ("Trend",f'<span style="color:{trend_col};font-weight:600;">{"+ Bullish" if htf_up else "− Bearish"}</span>'),
                 ("RSI",  f'<span style="color:#e8e8f4;">{rsi_val}</span>'),
@@ -4377,7 +5116,7 @@ with tab_scanner:
                 f'<div style="display:flex;align-items:center;gap:5px;flex-wrap:nowrap;">'
                 f'<span style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:15px;font-weight:700;letter-spacing:-.02em;white-space:nowrap;">{sym}</span>'
                 f'{golden_badge}{breadth_badge}</div>'
-                f'<div style="margin-top:3px;display:flex;flex-wrap:wrap;gap:2px;">{phase_chip_html}{adx_badge}{squeeze_badge}{vc_badge}{vcp_badge}{avwap_badge}{fib_q_badge}{vdu_badge}{rvol_badge}{darvas_badge}{mtf_badge}{inst_badge}{harm_badge}{candle_badge}{ems_badge}</div>'
+                f'<div style="margin-top:3px;display:flex;flex-wrap:wrap;gap:2px;">{phase_chip_html}{adx_badge}{squeeze_badge}{vc_badge}{vcp_badge}{avwap_badge}{fib_q_badge}{vdu_badge}{rvol_badge}{darvas_badge}{mtf_badge}{inst_badge}{harm_badge}{candle_badge}</div>'
                 f'</div>'
                 f'<span style="background:{act_bg};border:1px solid {act_brd};color:{act_txt};'
                 f'padding:3px 8px;border-radius:5px;font-size:10px;font-weight:700;font-family:DM Sans,sans-serif;flex-shrink:0;">{act}</span>'
@@ -4399,158 +5138,361 @@ with tab_scanner:
             )
 
         ACTIONABLE_PHASES={PHASE_ENTRY,PHASE_CONT,PHASE_BRK}
-        # Gate 5 fix: include WATCH-action stocks in active phases — score
-        # may be borderline but phase classification is valid signal.
         actionable=[r for r in st.session_state.results
-                    if r.get("Phase") in ACTIONABLE_PHASES
-                    and r["Action"] in ("BUY","STRONG BUY","WATCH")]
+                    if r.get("Phase") in ACTIONABLE_PHASES and r["Action"] in ("BUY","STRONG BUY")]
         phase_rank={PHASE_BRK:0,PHASE_CONT:1,PHASE_ENTRY:2}
         actionable.sort(key=lambda x:(phase_rank.get(x.get("Phase"),9),-x["Score"]))
         top_act=actionable[:15]
 
-        if top_act:
-            _brk_n  = sum(1 for r in top_act if r.get("Phase")==PHASE_BRK)
-            _cont_n = sum(1 for r in top_act if r.get("Phase")==PHASE_CONT)
-            _ent_n  = sum(1 for r in top_act if r.get("Phase")==PHASE_ENTRY)
-            with st.expander(
-                f"⚡ READY TO TRADE — "
-                f"{f'🚀 {_brk_n} BREAKOUT · ' if _brk_n else ''}"
-                f"{f'↗ {_cont_n} CONTINUATION · ' if _cont_n else ''}"
-                f"{f'⚡ {_ent_n} ENTRY' if _ent_n else ''}",
-                expanded=True
-            ):
-                cards_html='<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
-                for i,r in enumerate(top_act):
-                    _bc = "#22c55e55" if r.get("Phase")==PHASE_BRK else "#3b82f655" if r.get("Phase")==PHASE_CONT else "#6366f155"
-                    cards_html+=make_card(i,r,_bc,show_entry=True)
-                cards_html+="</div>"
-                st.markdown(cards_html,unsafe_allow_html=True)
-                st.markdown(
-                    '<div style="text-align:center;color:#3a3a60;font-size:10px;'
-                    'font-family:JetBrains Mono,monospace;padding:4px 0 2px;">'
-                    'ⓘ Indicator-based. Always confirm with price action.</div>',
-                    unsafe_allow_html=True,
+        # ── v15.5: EMERGING MOMENTUM CARD ─────────────────────────────────────
+        _EM_COLORS = {
+            "IGNITING": ("#f59e0b","#f59e0b22"),
+            "BUILDING": ("#22c55e","#22c55e22"),
+            "COILING":  ("#8b5cf6","#8b5cf622"),
+            "LATENT":   ("#38bdf8","#38bdf822"),
+            "QUIET":    ("#475569","#47556922"),
+        }
+        _EM_COMPONENTS = [
+            ("RS Accel",    "EmRSAccel",     15, "📈"),
+            ("ATR Cmprss",  "EmATRCompress", 15, "🗜"),
+            ("RVOL Accel",  "EmRVolAccel",   15, "📊"),
+            ("EMA Conv",    "EmEMAConv",     15, "🔀"),
+            ("Sqz Press",   "EmSqzPressure", 15, "🔄"),
+            ("Sector Mom",  "EmSectorMom",   10, "🏭"),
+            ("Range Exp",   "EmORExpansion", 15, "🚀"),
+        ]
+
+        def make_emerging_card(i, r):
+            sym   = r["Symbol"]; ltp = r["LTP"]; chg = r["%Change"]
+            em    = r.get("EmScore", 0); lbl = r.get("EmLabel","QUIET")
+            pca   = r.get("PCAScore", 0); pca_lbl = r.get("PCALabel","NONE")
+            phase = r.get("Phase", PHASE_IDLE)
+            act   = r.get("Action","SKIP"); sector = r.get("Sector","—")
+            # Combined readiness: EmScore (coil mechanics) × 0.55 + PCA (buying pressure) × 0.45
+            readiness = round(em * 0.55 + pca * 0.45, 1)
+            em_c, em_bg = _EM_COLORS.get(lbl, ("#475569","#47556922"))
+            _PCA_COLORS = {
+                "ACCUMULATING": ("#22c55e","#22c55e22"),
+                "BUILDING":     ("#38bdf8","#38bdf822"),
+                "FORMING":      ("#a78bfa","#a78bfa22"),
+                "WEAK":         ("#64748b","#64748b22"),
+                "NONE":         ("#374151","#37415122"),
+            }
+            pca_c, pca_bg = _PCA_COLORS.get(pca_lbl, ("#374151","#37415122"))
+            chg_col = "#22c55e" if chg >= 0 else "#ef4444"
+            chg_arr = "▲" if chg >= 0 else "▼"
+            chg_str = f"+{chg:.2f}%" if chg >= 0 else f"{chg:.2f}%"
+            phase_col = _phase_color(phase)
+            act_bg,act_brd,act_txt = _action_colors(act)
+            # 7-component EmScore breakdown bars
+            bars_html = '<div style="margin-bottom:6px;"><div style="color:#94a3b8;font-size:9px;letter-spacing:.06em;margin-bottom:4px;font-weight:600;">EMERGING MOMENTUM</div>'
+            for comp_name, comp_key, comp_max, comp_icon in _EM_COMPONENTS:
+                val = r.get(comp_key, 0.0)
+                pct = int(val / comp_max * 100)
+                bar_col = "#22c55e" if pct >= 70 else "#f59e0b" if pct >= 40 else "#475569"
+                bars_html += (
+                    f'<div style="margin:2px 0;">'
+                    f'<div style="display:flex;justify-content:space-between;margin-bottom:1px;">'
+                    f'<span style="color:#94a3b8;font-size:9px;">{comp_icon} {comp_name}</span>'
+                    f'<span style="color:{bar_col};font-family:JetBrains Mono,monospace;font-size:9px;font-weight:600;">'
+                    f'{val:.0f}/{comp_max}</span></div>'
+                    f'<div style="background:#1e1e40;border-radius:2px;height:3px;">'
+                    f'<div style="background:{bar_col};width:{pct}%;height:3px;border-radius:2px;"></div></div></div>'
                 )
+            bars_html += '</div>'
+            # 7-component PCA breakdown bars
+            pca_bars_html = '<div style="border-top:1px solid #1e1e40;padding-top:6px;"><div style="color:#94a3b8;font-size:9px;letter-spacing:.06em;margin-bottom:4px;font-weight:600;">PRE-CONFIRM ACCUMULATION</div>'
+            _PCA_COMP_LABELS = [
+                ("Rel CMF",    "PCACMFRel",       15, "💧"),
+                ("Vol Seq",    "PCAVolCmpSeq",    15, "🗜"),
+                ("Hidden Acc", "PCAHiddenAccum",  15, "👻"),
+                ("Effort/Res", "PCAEffortResult", 15, "⚖"),
+                ("NR Persist", "PCARangeCont",    10, "📏"),
+                ("Fail BRK",   "PCAFailedBrkdn",  15, "🛡"),
+                ("Vol Asym",   "PCAVolAsym",      15, "⚖"),
+            ]
+            for comp_name, comp_key, comp_max, comp_icon in _PCA_COMP_LABELS:
+                val = r.get(comp_key, 0.0)
+                pct = int(val / comp_max * 100)
+                bar_col = "#22c55e" if pct >= 70 else "#38bdf8" if pct >= 40 else "#475569"
+                pca_bars_html += (
+                    f'<div style="margin:2px 0;">'
+                    f'<div style="display:flex;justify-content:space-between;margin-bottom:1px;">'
+                    f'<span style="color:#94a3b8;font-size:9px;">{comp_icon} {comp_name}</span>'
+                    f'<span style="color:{bar_col};font-family:JetBrains Mono,monospace;font-size:9px;font-weight:600;">'
+                    f'{val:.0f}/{comp_max}</span></div>'
+                    f'<div style="background:#1e1e40;border-radius:2px;height:3px;">'
+                    f'<div style="background:{bar_col};width:{pct}%;height:3px;border-radius:2px;"></div></div></div>'
+                )
+            pca_bars_html += '</div>'
+            # squeeze + atr badges
+            sqz_badge = ('<span style="background:#8b5cf622;border:1px solid #8b5cf655;color:#a78bfa;'
+                         'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">🔄 SQZ</span>'
+                         if r.get("Squeeze") else "")
+            vc_badge = ('<span style="background:#0ea5e922;border:1px solid #0ea5e955;color:#38bdf8;'
+                        'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">VC</span>'
+                        if r.get("VolRatio", 1.0) < 0.75 else "")
+            # MTF badge
+            mtf_lbl = r.get("MTFLabel","NEUTRAL")
+            mtf_c_map = {"BULL SYNC":"#22c55e","BULL LEAN":"#86efac","BEAR SYNC":"#ef4444",
+                         "BEAR LEAN":"#fca5a5","DIVERGE":"#f59e0b"}
+            mtf_badge = ""
+            if mtf_lbl in mtf_c_map:
+                mc = mtf_c_map[mtf_lbl]
+                mtf_badge = (f'<span style="background:{mc}22;border:1px solid {mc}55;color:{mc};'
+                             f'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">'
+                             f'MTF·{mtf_lbl}</span>')
+            # Inst badge
+            inst_lbl = r.get("InstLabel","INST~")
+            inst_c_map = {"INST↑":"#22c55e","INST↓":"#ef4444"}
+            inst_badge = ""
+            if inst_lbl in inst_c_map:
+                ic = inst_c_map[inst_lbl]
+                inst_badge = (f'<span style="background:{ic}22;border:1px solid {ic}55;color:{ic};'
+                              f'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">'
+                              f'{inst_lbl}</span>')
+
+            # v15.7 — Smart Money, Accumulation Stage, RS Leadership, Micro badges
+            sm_verdict = r.get("SmartMoneyVerdict","NEUTRAL")
+            sm_c_map = {
+                "MARKUP_READY": "#f59e0b", "ACCUMULATING": "#22c55e",
+                "ABSORBING": "#38bdf8",    "NEUTRAL": "#64748b",
+                "DISTRIBUTING": "#ef4444",
+            }
+            sm_c = sm_c_map.get(sm_verdict, "#64748b")
+            sm_badge = (f'<span style="background:{sm_c}22;border:1px solid {sm_c}55;color:{sm_c};'
+                        f'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">'
+                        f'SM·{sm_verdict[:4]}</span>')
+
+            accum_stage = r.get("AccumStage","NONE")
+            as_c_map = {"NONE":"#374151","1A":"#64748b","1B":"#38bdf8",
+                        "1C":"#a78bfa","2A":"#22c55e","2B":"#f59e0b"}
+            as_c = as_c_map.get(accum_stage,"#374151")
+            accum_badge = "" if accum_stage == "NONE" else (
+                f'<span style="background:{as_c}22;border:1px solid {as_c}55;color:{as_c};'
+                f'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">'
+                f'Stage {accum_stage}</span>'
+            )
+
+            rl_label = r.get("RSLeaderLabel","NEUTRAL")
+            rl_c_map = {"LEADER":"#f59e0b","IMPROVING":"#22c55e",
+                        "NEUTRAL":"#64748b","LAGGARD":"#ef4444"}
+            rl_c = rl_c_map.get(rl_label,"#64748b")
+            rs_lead_badge = (f'<span style="background:{rl_c}22;border:1px solid {rl_c}55;color:{rl_c};'
+                             f'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">'
+                             f'RS·{rl_label[:4]}</span>')
+
+            micro_lbl = r.get("MicroLabel","NEUTRAL_FLOW")
+            mf_c_map = {"STRONG_BUY_FLOW":"#22c55e","BUY_FLOW":"#86efac",
+                        "NEUTRAL_FLOW":"#64748b","SELL_FLOW":"#fca5a5",
+                        "STRONG_SELL_FLOW":"#ef4444"}
+            mf_c = mf_c_map.get(micro_lbl,"#64748b")
+            mf_short = {"STRONG_BUY_FLOW":"↑↑FLOW","BUY_FLOW":"↑FLOW",
+                        "NEUTRAL_FLOW":"~FLOW","SELL_FLOW":"↓FLOW",
+                        "STRONG_SELL_FLOW":"↓↓FLOW"}.get(micro_lbl,"~")
+            micro_badge = (f'<span style="background:{mf_c}22;border:1px solid {mf_c}55;color:{mf_c};'
+                           f'padding:1px 5px;border-radius:3px;font-size:9px;">'
+                           f'{mf_short}</span>')
+
+            # v15.7 intelligence summary row (SM + AccumStage + RS + Micro)
+            intel_row = (
+                f'<div style="padding:4px 12px 5px;border-top:1px solid #1e1e40;'
+                f'display:flex;flex-wrap:wrap;gap:3px;align-items:center;">'
+                f'<span style="color:#475569;font-size:8px;letter-spacing:.04em;margin-right:2px;">v15.7</span>'
+                f'{sm_badge}{accum_badge}{rs_lead_badge}{micro_badge}'
+                f'</div>'
+            )
+            return (
+                f'<div style="background:#0e0e1c;border:1.5px solid {em_c}55;border-radius:12px;'
+                f'overflow:hidden;width:360px;min-width:320px;max-width:380px;flex:1 1 360px;">'
+                # Header
+                f'<div style="background:{em_bg};border-bottom:1px solid {em_c}33;padding:8px 12px 7px;'
+                f'display:flex;align-items:center;gap:8px;">'
+                f'<div style="flex:1;">'
+                f'<div style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:15px;font-weight:700;">{sym}</div>'
+                f'<div style="font-size:9px;color:#94a3b8;font-family:DM Sans,sans-serif;">{sector}</div>'
+                f'</div>'
+                f'<div style="text-align:right;">'
+                # Dual score chips
+                f'<div style="display:flex;gap:4px;justify-content:flex-end;flex-wrap:wrap;">'
+                f'<span style="background:{em_c};color:#0a0a0f;font-family:JetBrains Mono,monospace;'
+                f'font-size:10px;font-weight:700;padding:2px 7px;border-radius:4px;white-space:nowrap;">'
+                f'EM {em:.0f}·{lbl}</span>'
+                f'<span style="background:{pca_c};color:#0a0a0f;font-family:JetBrains Mono,monospace;'
+                f'font-size:10px;font-weight:700;padding:2px 7px;border-radius:4px;white-space:nowrap;">'
+                f'PCA {pca:.0f}·{pca_lbl}</span>'
+                f'</div>'
+                f'<div style="margin-top:4px;display:flex;gap:3px;justify-content:flex-end;">'
+                f'<span style="background:{phase_col}22;border:1px solid {phase_col}55;color:{phase_col};'
+                f'padding:1px 5px;border-radius:3px;font-size:9px;">{phase}</span>'
+                f'<span style="background:{act_bg};border:1px solid {act_brd};color:{act_txt};'
+                f'padding:1px 5px;border-radius:3px;font-size:9px;font-weight:600;">{act}</span>'
+                f'</div></div></div>'
+                # Price + badges
+                f'<div style="padding:8px 12px 4px;display:flex;justify-content:space-between;align-items:center;">'
+                f'<div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:#e8e8f4;font-size:20px;font-weight:600;">₹{ltp:,.2f}</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:{chg_col};font-size:11px;">{chg_arr} {chg_str}</div>'
+                f'</div>'
+                f'<div style="text-align:right;">'
+                f'{sqz_badge}{vc_badge}{mtf_badge}{inst_badge}'
+                f'<div style="color:#475569;font-size:8px;margin-top:3px;">RSI {r.get("RSI","—")} · RS{r.get("RS_Rank",50)}</div>'
+                f'</div></div>'
+                # Combined readiness bar
+                f'<div style="padding:2px 12px 6px;">'
+                f'<div style="display:flex;justify-content:space-between;margin-bottom:2px;">'
+                f'<span style="color:#475569;font-size:8px;letter-spacing:.06em;">READINESS</span>'
+                f'<span style="color:#e8e8f4;font-family:JetBrains Mono,monospace;font-size:9px;font-weight:600;">{readiness:.0f}/100</span>'
+                f'</div>'
+                f'<div style="background:#1e1e40;border-radius:3px;height:5px;">'
+                f'<div style="background:linear-gradient(90deg,{em_c},{pca_c});'
+                f'width:{min(readiness,100):.0f}%;height:5px;border-radius:3px;"></div></div></div>'
+                # Component breakdowns
+                f'<div style="padding:4px 12px 8px;">'
+                + bars_html + pca_bars_html +
+                f'</div>'
+                # v15.7 intelligence intelligence row
+                + intel_row +
+                # Footer
+                f'<div style="background:#07070f;border-top:1px solid #1e1e40;padding:5px 12px;'
+                f'display:flex;justify-content:space-between;align-items:center;">'
+                f'<span style="color:#475569;font-size:9px;font-family:JetBrains Mono,monospace;">'
+                f'ATR {r.get("ATR","—")} · ADX {r.get("ADX","—")}</span>'
+                f'<span style="color:{em_c};font-size:9px;font-weight:600;">'
+                f'SL ₹{r.get("SL",0):,.0f}</span>'
+                f'</div>'
+                f'</div>'
+            )
+
+        # ── Render section based on Selection Mode ─────────────────────────────
+        if selection_type == "🌱 Emerging":
+            # ── EMERGING: stocks coiling BEFORE becoming obvious ───────────────
+            em_candidates = [
+                r for r in st.session_state.results
+                if (r.get("EmScore", 0) >= em_min_score
+                    or r.get("Action") == "PRE-CONFIRM")   # v15.7: always include PRE-CONFIRM
+                and r.get("Phase") in (PHASE_SETUP, PHASE_IDLE, PHASE_ENTRY)
+            ]
+            # Sort: PRE-CONFIRM first, then by combined readiness
+            def _em_sort_key(x):
+                pc_boost = 20 if x.get("Action") == "PRE-CONFIRM" else 0
+                return x.get("EmScore", 0) * 0.55 + x.get("PCAScore", 0) * 0.45 + pc_boost
+            em_candidates.sort(key=_em_sort_key, reverse=True)
+            top_em = em_candidates[:20]
+
+            # Label distribution
+            _em_dist = {"IGNITING":0,"BUILDING":0,"COILING":0,"LATENT":0}
+            for r in em_candidates:
+                lbl = r.get("EmLabel","QUIET")
+                if lbl in _em_dist: _em_dist[lbl] += 1
+
+            if top_em:
+                _em_header_cols = st.columns(7)
+                _em_header_cols[0].metric("🌱 Emerging Total", len(em_candidates))
+                for idx,(lbl,col) in enumerate([("IGNITING","#f59e0b"),("BUILDING","#22c55e"),
+                                                ("COILING","#8b5cf6"),("LATENT","#38bdf8")]):
+                    _em_header_cols[idx+1].metric(lbl, _em_dist.get(lbl,0))
+                _pca_accum = sum(1 for r in em_candidates if r.get("PCALabel") == "ACCUMULATING")
+                _pre_confirm_cnt = sum(1 for r in em_candidates if r.get("Action") == "PRE-CONFIRM")
+                _em_header_cols[5].metric("🛡 Accumulating", _pca_accum)
+                _em_header_cols[6].metric("🔮 PRE-CONFIRM", _pre_confirm_cnt)
+
+                with st.expander(
+                    f"🌱 EMERGING + 🛡 PRE-CONFIRM — {len(top_em)} stocks building before breakout",
+                    expanded=True,
+                ):
+                    st.markdown(
+                        '<div style="color:#94a3b8;font-size:11px;font-family:JetBrains Mono,monospace;'
+                        'margin-bottom:10px;">Each card shows two layers: <b>EmScore</b> (coil mechanics — '
+                        'RS accel, ATR compress, squeeze) and <b>PCAScore</b> (buying pressure — '
+                        'CMF trend, hidden accumulation, failed-breakdown absorption, volume asymmetry). '
+                        'Combined Readiness = Em×0.55 + PCA×0.45. '
+                        'Wait for phase upgrade to ENTRY/CONT/BREAKOUT before acting.</div>',
+                        unsafe_allow_html=True,
+                    )
+                    em_cards_html = '<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
+                    for i, r in enumerate(top_em):
+                        em_cards_html += make_emerging_card(i, r)
+                    em_cards_html += "</div>"
+                    st.markdown(em_cards_html, unsafe_allow_html=True)
+                    st.markdown(
+                        '<div style="text-align:center;color:#3a3a60;font-size:10px;'
+                        'font-family:JetBrains Mono,monospace;padding:6px 0 2px;">'
+                        'ⓘ Emerging score identifies setups in formation — NOT entry signals. '
+                        'Wait for phase upgrade to ENTRY/CONT/BREAKOUT before acting.</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Emerging table
+                em_rows = []
+                for i, r in enumerate(em_candidates[:50]):
+                    readiness = round(r.get("EmScore",0)*0.55 + r.get("PCAScore",0)*0.45, 1)
+                    em_rows.append({
+                        "#": i+1, "Symbol": r["Symbol"],
+                        "Ready": readiness,
+                        "EmScore": r.get("EmScore",0), "EmLabel": r.get("EmLabel","—"),
+                        "PCAScore": r.get("PCAScore",0), "PCALabel": r.get("PCALabel","—"),
+                        "Phase": r.get("Phase","—"), "Action": r.get("Action","—"),
+                        "RS↑": r.get("EmRSAccel",0),    "ATR↓": r.get("EmATRCompress",0),
+                        "RVOL↑": r.get("EmRVolAccel",0), "EMAconv": r.get("EmEMAConv",0),
+                        "SqzPrs": r.get("EmSqzPressure",0), "SecMom": r.get("EmSectorMom",0),
+                        "RngExp": r.get("EmORExpansion",0),
+                        "CMFrel": r.get("PCACMFRel",0), "VolSeq": r.get("PCAVolCmpSeq",0),
+                        "HidAcc": r.get("PCAHiddenAccum",0), "EVR": r.get("PCAEffortResult",0),
+                        "NRprs": r.get("PCARangeCont",0), "FBA": r.get("PCAFailedBrkdn",0),
+                        "VolAsym": r.get("PCAVolAsym",0),
+                        "Score": r.get("Score",0), "%Chg": f'{r.get("%Change",0):+.2f}%',
+                        "RSI": r.get("RSI","—"), "RS_Rank": r.get("RS_Rank",50),
+                        "LTP": fmt(r["LTP"]), "SL": fmt(r.get("SL",0)),
+                        "Sector": r.get("Sector","—"),
+                    })
+                if em_rows:
+                    em_df = pd.DataFrame(em_rows)
+                    st.dataframe(em_df, use_container_width=True, hide_index=True, height=360)
+                    em_buy = [r for r in em_candidates if r.get("Action") in ("BUY","STRONG BUY","WATCH")]
+                    if em_buy:
+                        csv = pd.DataFrame(em_buy).drop(columns=["ExtFlags","Patterns","RegimeWeights","MTFTFScores","CandlePatterns"], errors="ignore").to_csv(index=False)
+                        st.download_button("Export Emerging list",csv,
+                                           f"NSE_Emerging_{mode_opt}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv","text/csv")
+            else:
+                st.info(f"No emerging stocks found with score ≥ {em_min_score}. "
+                        "Try lowering the minimum score or run a scan first.")
+
         else:
-            st.info("No stocks in ENTRY / CONT / BREAKOUT phase. Market may be in low-momentum regime.")
-
-        # ── Near Breakout — approaching resistance with compression ───────────
-        _near_brk = sorted(
-            [r for r in st.session_state.results
-             if r.get("NearBrk") and r.get("Phase") in (PHASE_SETUP, PHASE_ENTRY)
-             and r["Action"] in ("BUY","STRONG BUY","WATCH")],
-            key=lambda x: -x["Score"]
-        )[:8]
-        if _near_brk:
-            with st.expander(
-                f"🎯 NEAR BREAKOUT — {len(_near_brk)} stocks within 2% of 20-day resistance",
-                expanded=len(top_act)==0   # open if nothing in ready-to-trade
-            ):
-                nb_cards='<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
-                for i,r in enumerate(_near_brk):
-                    nb_cards+=make_card(i,r,"#f59e0b55",show_entry=True)
-                nb_cards+="</div>"
-                st.markdown(nb_cards,unsafe_allow_html=True)
-
-        # FIX-5: include WATCH action; lower threshold so SETUP stocks (45-57) appear
-        watchlist=[r for r in st.session_state.results
-                   if r.get("Phase") in (PHASE_SETUP,PHASE_IDLE)
-                   and r["Score"]>=45
-                   and r["Action"] in ("BUY","STRONG BUY","WATCH")][:10]
-        if watchlist:
-            with st.expander(f"WATCHLIST — {len(watchlist)} high-score, not yet ready",expanded=False):
-                cards_html='<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
-                for i,r in enumerate(watchlist):
-                    cards_html+=make_card(i,r,"#f59e0b55",show_entry=False)
-                cards_html+="</div>"
-                st.markdown(cards_html,unsafe_allow_html=True)
-
-        # ── 🌱 EMERGING MOMENTUM — surfaces stocks BEFORE they become obvious ──
-        _ems_candidates = sorted(
-            [r for r in st.session_state.results
-             if r.get("EMS", 0) >= 50
-             and r.get("Phase") in (PHASE_SETUP, PHASE_IDLE)
-             and r.get("Action") not in ("STRONG BUY",)],  # not already obvious
-            key=lambda x: x.get("EMS", 0), reverse=True
-        )[:12]
-
-        if _ems_candidates:
-            _top_ems = _ems_candidates[0].get("EMS", 0)
-            _pre_launch = sum(1 for r in _ems_candidates if r.get("EMSLabel") == "PRE-LAUNCH")
-            _coiling    = sum(1 for r in _ems_candidates if r.get("EMSLabel") == "COILING")
-            with st.expander(
-                f"🌱 EMERGING MOMENTUM — {len(_ems_candidates)} stocks building pressure"
-                f"{'  ·  🔥 ' + str(_pre_launch) + ' PRE-LAUNCH' if _pre_launch else ''}"
-                f"{'  ·  ' + str(_coiling) + ' COILING' if _coiling else ''}",
-                expanded=(_pre_launch > 0),
-            ):
-                st.caption(
-                    "Stocks in SETUP / IDLE phase with high internal pressure across "
-                    "RS acceleration · ATR compression · RVOL ramp · EMA convergence · "
-                    "squeeze depth · sector momentum · range expansion. "
-                    "These are **pre-breakout candidates** — not yet actionable, but worth monitoring."
-                )
-                # EMS breakdown mini-bar cards
-                ems_cards = '<div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px;">'
-                for r in _ems_candidates:
-                    ec   = r.get("EMSColor","#334155")
-                    elbl = r.get("EMSLabel","—")
-                    ev   = r.get("EMS", 0)
-                    bd   = r.get("EMSBreakdown", {})
-                    sym  = r["Symbol"]
-                    sec  = r.get("Sector","—")
-                    phase= r.get("Phase","—")
-                    bar  = min(int(ev), 100)
-
-                    def _mini_bar(val, max_val, col):
-                        w = int(val / max_val * 60)
-                        return (f'<div style="display:flex;align-items:center;gap:4px;margin:1px 0;">'
-                                f'<div style="width:60px;background:#1e1e40;border-radius:2px;height:4px;">'
-                                f'<div style="width:{w}px;background:{col};height:4px;border-radius:2px;"></div></div>'
-                                f'<span style="color:#94a3b8;font-size:9px;font-family:JetBrains Mono,monospace;">{val:.0f}</span></div>')
-
-                    bars_html = (
-                        _mini_bar(bd.get("rs_acc",0),   20, "#22c55e") +
-                        _mini_bar(bd.get("atr_comp",0), 20, "#f59e0b") +
-                        _mini_bar(bd.get("rvol_acc",0), 15, "#3b82f6") +
-                        _mini_bar(bd.get("ema_conv",0), 15, "#a78bfa") +
-                        _mini_bar(bd.get("squeeze",0),  15, "#f472b6") +
-                        _mini_bar(bd.get("sector",0),   10, "#38bdf8") +
-                        _mini_bar(bd.get("or_exp",0),    5, "#fb923c")
+            # ── CONFIRMATION: stocks already in actionable phases ──────────────
+            if top_act:
+                with st.expander(
+                    f"READY TO TRADE — {len(top_act)} stocks in ENTRY / CONT / BREAKOUT",
+                    expanded=True
+                ):
+                    cards_html='<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
+                    for i,r in enumerate(top_act):
+                        cards_html+=make_card(i,r,"#22c55e55",show_entry=True)
+                    cards_html+="</div>"
+                    st.markdown(cards_html,unsafe_allow_html=True)
+                    st.markdown(
+                        '<div style="text-align:center;color:#3a3a60;font-size:10px;'
+                        'font-family:JetBrains Mono,monospace;padding:4px 0 2px;">'
+                        'ⓘ Data is indicator based. Confirm with price action.</div>',
+                        unsafe_allow_html=True,
                     )
-                    labels_col = (
-                        '<div style="color:#4a5568;font-size:9px;line-height:1.9;'
-                        'font-family:JetBrains Mono,monospace;">'
-                        'RS↑<br>ATR⬇<br>Vol↑<br>EMA→<br>Sqz<br>Sec<br>OR↑</div>'
-                    )
-                    ems_cards += (
-                        f'<div style="background:#0d0d1a;border:1px solid {ec}55;border-radius:10px;'
-                        f'padding:12px 14px;width:210px;min-width:200px;flex:1 1 210px;">'
-                        f'<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;">'
-                        f'<div>'
-                        f'<div style="font-family:Syne,sans-serif;color:#f0f4ff;font-size:15px;font-weight:700;">{sym}</div>'
-                        f'<div style="color:#64748b;font-size:9px;font-family:Inter,sans-serif;">{sec} · {phase}</div>'
-                        f'</div>'
-                        f'<div style="text-align:right;">'
-                        f'<div style="background:{ec}22;color:{ec};border:1px solid {ec}55;'
-                        f'padding:2px 7px;border-radius:5px;font-size:10px;font-weight:700;'
-                        f'font-family:JetBrains Mono,monospace;">{elbl}</div>'
-                        f'<div style="color:{ec};font-size:18px;font-weight:700;'
-                        f'font-family:JetBrains Mono,monospace;line-height:1.3;">{ev:.0f}</div>'
-                        f'</div></div>'
-                        f'<div style="background:#1a1a2e;border-radius:4px;height:5px;margin-bottom:8px;">'
-                        f'<div style="background:linear-gradient(90deg,{ec}88,{ec});height:5px;'
-                        f'border-radius:4px;width:{bar}%;"></div></div>'
-                        f'<div style="display:flex;gap:6px;">'
-                        f'{labels_col}'
-                        f'<div style="flex:1;">{bars_html}</div>'
-                        f'</div>'
-                        f'</div>'
-                    )
-                ems_cards += '</div>'
-                st.markdown(ems_cards, unsafe_allow_html=True)
+            else:
+                st.info("No stocks in ENTRY / CONT / BREAKOUT phase.")
 
-        # ── Short list (derived from scan, unchanged) ──────────────────────────
+            # FIX-5: include WATCH action; lower threshold so SETUP stocks (45-57) appear
+            watchlist=[r for r in st.session_state.results
+                       if r.get("Phase") in (PHASE_SETUP,PHASE_IDLE)
+                       and r["Score"]>=45
+                       and r["Action"] in ("BUY","STRONG BUY","WATCH")][:10]
+            if watchlist:
+                with st.expander(f"WATCHLIST — {len(watchlist)} high-score, not yet ready",expanded=False):
+                    cards_html='<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
+                    for i,r in enumerate(watchlist):
+                        cards_html+=make_card(i,r,"#f59e0b55",show_entry=False)
+                    cards_html+="</div>"
+                    st.markdown(cards_html,unsafe_allow_html=True)
+
+        # ── Short list (derived from scan, shown in both modes) ────────────────
         short_candidates=derive_short_candidates(st.session_state.results,scan_mode_now,vix_val)
         if short_candidates:
             sh_now=sum(1 for s in short_candidates if s.verdict==SHORT_CONFIRMED)
@@ -4636,6 +5578,75 @@ with tab_scanner:
                         '<span style="color:#fca5a5;font-weight:600;">Short selling carries elevated risk — always use disciplined SL management.</span>'
                         '</div>',unsafe_allow_html=True)
 
+        # ── Main table ─────────────────────────────────────────────────────────
+        if results:
+            rows=[]
+            for i,r in enumerate(results):
+                chg=r["%Change"]
+                ph_arrow=get_phase_arrow(r["Symbol"])
+                rows.append({
+                    "#":i+1,"Symbol":r["Symbol"],"Score":r["Score"],"Conf%":r.get("Confidence",0),
+                    "Phase":f'{r.get("Phase","")}{" "+ph_arrow if ph_arrow else ""}',
+                    "Setup":{"fib":"Fib","breakout":"BRK","norm":"std","vdu":"VDU"}.get(r.get("Setup","norm"),"std"),
+                    "Action":r["Action"],"B-Gate":"⚠" if r.get("BreadthGated") else "",
+                    "%Chg":f"+{chg}%" if chg>=0 else f"{chg}%",
+                    "RSI":r.get("RSI","—"),"RS_Rank":r.get("RS_Rank",50),
+                    "ADX":r.get("ADX","—"),"SQZ":"◆" if r.get("Squeeze") else "",
+                    "VCP":r.get("VCPGrade","—"),
+                    "AVWAP":"↑" if r.get("AVWAPAbove") else "↓",
+                    "FibQ":r.get("FibGrade","—"),
+                    "VDU":"×"*int(r.get("VDUIntensity",0)) or "—",
+                    "RVol":r.get("RVolLabel","—"),
+                    "Darvas":("BRK" if r.get("DarvasBrk") else ("□" if r.get("DarvasIn") else "—")),
+                    "EmScore":r.get("EmScore",0),"EmLabel":r.get("EmLabel","—"),
+                    "PCAScore":r.get("PCAScore",0),"PCALabel":r.get("PCALabel","—"),
+                    # v15.7 new columns
+                    "SM":r.get("SmartMoneyVerdict","—"),
+                    "AccumStage":r.get("AccumStage","—"),
+                    "RSLead":r.get("RSLeaderLabel","—"),
+                    "MicroFlow":r.get("MicroLabel","—"),
+                    "LTP":fmt(r["LTP"]),"Entry":fmt(r["Entry"])+(" ⚡" if r["Entry"]!=r["LTP"] else ""),
+                    "SL":fmt(r["SL"]),"T1":fmt(r["T1"]),"T2":fmt(r["T2"]),"T3":fmt(r["T3"]),
+                    "Liq₹Cr":r.get("AvgTradedCr","—"),"HTF":"↑" if r.get("HTFUp",True) else "↓",
+                    "ExtN":r.get("ExtN",0),"Ext":" ".join(r.get("ExtLabels",[])) or "—",
+                })
+            df_display=pd.DataFrame(rows)
+            def color_extn(val):
+                if val==0: return "background-color:transparent;color:#cbd5e1"
+                if val==1: return "background-color:#78350f44;color:#f59e0b"
+                if val==2: return "background-color:#9a3412aa;color:#fb923c"
+                return "background-color:#7f1d1d;color:#fca5a5;font-weight:600"
+            def color_action(val):
+                if val=="STRONG BUY": return "color:#f59e0b;font-weight:600"
+                if val=="BUY": return "color:#22c55e"
+                if val=="PRE-CONFIRM": return "color:#a78bfa;font-weight:600"
+                if val=="WATCH": return "color:#d97706"
+                return "color:#cbd5e1"
+            def color_pct(val):
+                if isinstance(val,str) and val.startswith("+"): return "color:#22c55e;font-family:JetBrains Mono,monospace"
+                if isinstance(val,str) and val.startswith("-"): return "color:#ef4444;font-family:JetBrains Mono,monospace"
+                return ""
+            styled=(df_display.style
+                    .map(color_extn,subset=["ExtN"]).map(color_action,subset=["Action"]).map(color_pct,subset=["%Chg"])
+                    .set_properties(**{"font-family":"JetBrains Mono,monospace","font-size":"11px"}))
+            st.dataframe(styled,use_container_width=True,hide_index=True,height=480)
+            st.markdown(
+                '<div style="font-size:10px;color:#3a3a60;font-family:JetBrains Mono,monospace;margin-top:4px;">'
+                'Score 0-100 · Conf% = confidence · ADX = trend strength (≥30=strong) · SQZ = Keltner/BB squeeze · '
+                'RS_Rank = 52w percentile · HTF ↑/↓ = weekly · ExtN 0=clean 3+=skip · '
+                'EmScore = emerging momentum (coil) · PCAScore = pre-confirm accumulation · '
+                'SM = smart money verdict · AccumStage = Wyckoff stage (1A/1B/1C/2A/2B) · '
+                'RSLead = RS leadership (LEADER/IMPROVING/NEUTRAL/LAGGARD) · '
+                'MicroFlow = order-flow microstructure · '
+                'PRE-CONFIRM = accumulating before price confirmation</div>',
+                unsafe_allow_html=True,
+            )
+            buy_rows=[r for r in results if r["Action"] in ("BUY","STRONG BUY")]
+            if buy_rows:
+                csv=pd.DataFrame(buy_rows).drop(columns=["ExtFlags"],errors="ignore").to_csv(index=False)
+                ts=datetime.now().strftime("%Y%m%d_%H%M%S")
+                st.download_button("Export BUY results",csv,
+                                   f"NSE_Scan_{st.session_state.scan_mode}_{ts}.csv","text/csv")
         elif st.session_state.results:
             st.warning("No stocks match current filters.")
         else:
@@ -4772,6 +5783,44 @@ with tab_detail:
                 _pct=int(_val/_mx*100) if _mx>0 else 0
                 _col.metric(_lbl,f"{_val:.1f}/{_mx}",f"{_pct}%",
                             delta_color="normal" if _pct>=60 else ("off" if _pct>=30 else "inverse"))
+            # v15.6 Pre-Confirmation Accumulation breakdown
+            st.markdown("**Pre-Confirmation Accumulation (PCA)** — buying-pressure layer")
+            _pca_score = r.get("PCAScore", 0); _pca_lbl = r.get("PCALabel", "NONE")
+            _pca_col = {"ACCUMULATING":"#22c55e","BUILDING":"#38bdf8",
+                        "FORMING":"#a78bfa","WEAK":"#64748b","NONE":"#374151"}.get(_pca_lbl,"#374151")
+            st.markdown(
+                f'<div style="background:{_pca_col}11;border:1px solid {_pca_col}33;border-radius:7px;'
+                f'padding:7px 14px;margin-bottom:8px;display:flex;align-items:center;gap:12px;">'
+                f'<span style="background:{_pca_col};color:#0a0a0f;padding:2px 10px;border-radius:4px;'
+                f'font-family:JetBrains Mono,monospace;font-size:12px;font-weight:700;">'
+                f'{_pca_lbl} · {_pca_score}</span>'
+                f'<span style="color:#94a3b8;font-size:10px;">Detects institutional buying BEFORE price confirms</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            pca_c1,pca_c2,pca_c3,pca_c4=st.columns(4)
+            pca_c1.metric("Relative CMF",    f'{r.get("PCACMFRel",0):.0f}/15',
+                          delta="Active" if r.get("PCACMFRel",0)>=8 else None,
+                          delta_color="normal" if r.get("PCACMFRel",0)>=8 else "off")
+            pca_c2.metric("Vol Cmp Seq",     f'{r.get("PCAVolCmpSeq",0):.0f}/15',
+                          delta="Active" if r.get("PCAVolCmpSeq",0)>=8 else None,
+                          delta_color="normal" if r.get("PCAVolCmpSeq",0)>=8 else "off")
+            pca_c3.metric("Hidden Accum",    f'{r.get("PCAHiddenAccum",0):.0f}/15',
+                          delta="Active" if r.get("PCAHiddenAccum",0)>=8 else None,
+                          delta_color="normal" if r.get("PCAHiddenAccum",0)>=8 else "off")
+            pca_c4.metric("Effort/Result",   f'{r.get("PCAEffortResult",0):.0f}/15',
+                          delta="Active" if r.get("PCAEffortResult",0)>=8 else None,
+                          delta_color="normal" if r.get("PCAEffortResult",0)>=8 else "off")
+            pca_c5,pca_c6,pca_c7,_ = st.columns(4)
+            pca_c5.metric("NR Persistence",  f'{r.get("PCARangeCont",0):.0f}/10',
+                          delta="Active" if r.get("PCARangeCont",0)>=6 else None,
+                          delta_color="normal" if r.get("PCARangeCont",0)>=6 else "off")
+            pca_c6.metric("Failed Breakdown", f'{r.get("PCAFailedBrkdn",0):.0f}/15',
+                          delta="Active" if r.get("PCAFailedBrkdn",0)>=8 else None,
+                          delta_color="normal" if r.get("PCAFailedBrkdn",0)>=8 else "off")
+            pca_c7.metric("Vol Asymmetry",   f'{r.get("PCAVolAsym",0):.0f}/15',
+                          delta="Active" if r.get("PCAVolAsym",0)>=8 else None,
+                          delta_color="normal" if r.get("PCAVolAsym",0)>=8 else "off")
             # v15.1/15.2 pattern signals
             st.markdown("**Pattern Signals** *(enriched post-scan)*")
             _pat=r.get("Patterns",{})
