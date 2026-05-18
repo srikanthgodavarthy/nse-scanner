@@ -4722,29 +4722,8 @@ with gc6:
     search_q=st.text_input("Search symbol",placeholder="e.g. RELIANCE",
                             label_visibility="collapsed")
 
-# ── v15.5: Selection type row ──────────────────────────────────────────────────
-_sc1, _sc2, _sc3 = st.columns([3, 3, 6])
-with _sc1:
-    selection_type = st.radio(
-        "Selection Mode",
-        ["🎯 Confirmation", "🌱 Emerging"],
-        horizontal=True,
-        key="sel_type",
-        help=(
-            "Confirmation — stocks already in ENTRY/CONT/BREAKOUT phase.\n"
-            "Emerging — stocks BEFORE they become obvious (coiling, building momentum)."
-        ),
-    )
-with _sc2:
-    if selection_type == "🌱 Emerging":
-        em_min_score = st.slider(
-            "Min Emerging Score", 20, 80,
-            st.session_state.get("em_min_score", 35), 5,
-            key="em_min_score_slider",
-        )
-        st.session_state["em_min_score"] = em_min_score
-    else:
-        em_min_score = st.session_state.get("em_min_score", 35)
+# ── v15.8: Unified view — no mode toggle, both sections always shown ───────────
+em_min_score = st.session_state.get("em_min_score", 35)
 
 vix_val,vix_label=fetch_vix()
 vix_color={"CALM":"#22c55e","CAUTION":"#f59e0b","STRESS":"#ef4444","UNKNOWN":"#cbd5e1"}.get(vix_label,"#cbd5e1")
@@ -5097,6 +5076,259 @@ with tab_scanner:
             if ed: return f"Results {ed} — binary risk"
             return None
 
+        # ══════════════════════════════════════════════════════════════════════
+        # PHASE-AWARE INTELLIGENCE SYSTEM (v15.7+)
+        # Design: shared core (Price · % chg · Action · Phase · SL) +
+        #         dynamic intelligence section swapped per lifecycle group.
+        # ══════════════════════════════════════════════════════════════════════
+
+        def _resolve_ui_group(r):
+            """Map a result record to one of the six lifecycle UI groups."""
+            phase   = r.get("Phase", PHASE_IDLE)
+            action  = r.get("Action", "SKIP")
+            ext_n   = r.get("ExtN", 0)
+            short_s = r.get("ShortScore", 0)
+            em_s    = r.get("EmScore", 0)
+            pca_s   = r.get("PCAScore", 0)
+            accum   = r.get("AccumStage", "NONE")
+            score   = r.get("Score", 0)
+
+            if short_s >= SHORT_SCORE_SIGNAL:
+                return "SHORT_SELL"
+            if ext_n >= 2:
+                return "EXTENDED_RISKY"
+            if action == "STRONG BUY" and phase in (PHASE_ENTRY, PHASE_CONT, PHASE_BRK):
+                return "STRONG_BUY"
+            if phase in (PHASE_ENTRY, PHASE_CONT, PHASE_BRK) and action in ("BUY", "PRE-CONFIRM"):
+                return "BREAKOUT_READY"
+            if em_s >= 35 and phase in (PHASE_IDLE, PHASE_SETUP, PHASE_ENTRY):
+                return "EMERGING_MOMENTUM"
+            if pca_s >= 30 or accum in ("1A", "1B", "1C", "2A"):
+                return "ACCUMULATING"
+            return "ACCUMULATING"
+
+        # ── Group meta: label + accent color ──────────────────────────────────
+        _UI_GROUP_META = {
+            "ACCUMULATING":      ("🛡 Accumulating",     "#38bdf8"),
+            "EMERGING_MOMENTUM": ("🌱 Emerging Momentum", "#a78bfa"),
+            "BREAKOUT_READY":    ("⚡ Breakout Ready",    "#f59e0b"),
+            "STRONG_BUY":        ("🚀 Strong Buy",        "#22c55e"),
+            "EXTENDED_RISKY":    ("⚠ Extended/Risky",    "#ef4444"),
+            "SHORT_SELL":        ("🔻 Short Sell",        "#cc2244"),
+        }
+
+        def _phase_intel_cell(label, value, color, dim=False):
+            """Render a single intelligence cell with consistent styling."""
+            bg  = f"{color}18" if not dim else "#37415118"
+            brd = f"{color}40" if not dim else "#37415130"
+            vc  = f"{color}cc" if not dim else "#47556966"
+            return (
+                f'<div style="background:{bg};border:1px solid {brd};border-radius:6px;'
+                f'padding:5px 7px;min-width:0;">'
+                f'<div style="color:#475569;font-size:7.5px;letter-spacing:.05em;'
+                f'text-transform:uppercase;margin-bottom:2px;">{label}</div>'
+                f'<div style="color:{vc};font-family:JetBrains Mono,monospace;'
+                f'font-size:10px;font-weight:700;white-space:nowrap;overflow:hidden;'
+                f'text-overflow:ellipsis;">{value}</div>'
+                f'</div>'
+            )
+
+        def _score_bar_mini(score, max_score, color):
+            """Tiny horizontal score bar."""
+            pct = min(int(score / max(max_score, 1) * 100), 100)
+            return (
+                f'<div style="height:3px;border-radius:2px;background:#1e2a3a;margin-top:3px;">'
+                f'<div style="height:3px;border-radius:2px;background:{color};width:{pct}%;"></div>'
+                f'</div>'
+            )
+
+        def _build_phase_intel(r, group=None):
+            """
+            Build the phase-specific intelligence grid HTML.
+            Shows ONLY the indicators relevant to the next decision for each lifecycle stage.
+            """
+            if group is None:
+                group = _resolve_ui_group(r)
+            grp_label, grp_color = _UI_GROUP_META.get(group, ("Intelligence", "#64748b"))
+
+            cells_html = ""
+
+            if group == "ACCUMULATING":
+                # ── Accumulating: buying pressure + base-building quality ──────
+                pca_s  = r.get("PCAScore", 0)
+                vol_r  = r.get("VolRatio", 1.0)
+                cmf    = r.get("CMF", r.get("InstCMF", 0))
+                sqz_b  = r.get("SqzBars", 0)
+                fbkd   = r.get("SMAbsorptionScore", r.get("PCAScore", 0)) * 0.3
+                base_b = r.get("AccumBarsInBase", 0)
+                rs_sl  = r.get("RSLineSlope", r.get("EmRSAccel", 0))
+                atr_cm = r.get("EmATRCompress", 0)
+
+                pca_c  = "#22c55e" if pca_s >= 55 else "#38bdf8" if pca_s >= 35 else "#64748b"
+                vol_c  = "#22c55e" if vol_r < 0.65 else "#38bdf8" if vol_r < 0.80 else "#64748b"
+                cmf_c  = "#22c55e" if cmf > 0.05 else "#ef4444" if cmf < -0.05 else "#64748b"
+                rs_c   = "#22c55e" if rs_sl > 0 else "#ef4444" if rs_sl < 0 else "#64748b"
+                atr_c  = "#22c55e" if atr_cm > 8 else "#38bdf8" if atr_cm > 4 else "#64748b"
+                base_c = "#f59e0b" if base_b >= 20 else "#38bdf8" if base_b >= 10 else "#64748b"
+
+                cells_html = (
+                    _phase_intel_cell("PCA Score",   f"{pca_s:.0f}",           pca_c,  dim=pca_s < 25)
+                    + _phase_intel_cell("Vol Cmprss", f"{(1-min(vol_r,1))*100:.0f}% tight", vol_c, dim=vol_r > 0.9)
+                    + _phase_intel_cell("CMF/OBV",   f"{cmf:+.3f}",           cmf_c,  dim=abs(cmf) < 0.02)
+                    + _phase_intel_cell("NR Persist", f"{sqz_b}d sqz" if sqz_b else "—", "#a78bfa", dim=sqz_b < 3)
+                    + _phase_intel_cell("RS Improv",  "Rising" if rs_sl > 0 else "Flat" if rs_sl == 0 else "Falling", rs_c, dim=rs_sl <= 0)
+                    + _phase_intel_cell("Base Dur",   f"{base_b}d" if base_b else "—", base_c, dim=base_b < 5)
+                )
+
+            elif group == "EMERGING_MOMENTUM":
+                # ── Emerging: coil mechanics surfacing before breakout ─────────
+                em_s   = r.get("EmScore", 0)
+                rs_ac  = r.get("EmRSAccel", 0)
+                rv_ac  = r.get("EmRVolAccel", 0)
+                ema_c  = r.get("EmEMAConv", 0)
+                sqz_p  = r.get("EmSqzPressure", 0)
+                sec_m  = r.get("EmSectorMom", 0)
+                rng_e  = r.get("EmORExpansion", 0)
+                rvol   = r.get("RVOL", 1.0)
+
+                em_c   = "#f59e0b" if em_s >= 70 else "#22c55e" if em_s >= 50 else "#38bdf8"
+                rs_c   = "#22c55e" if rs_ac >= 8 else "#38bdf8" if rs_ac >= 4 else "#64748b"
+                rv_c   = "#22c55e" if rv_ac >= 8 else "#38bdf8" if rv_ac >= 4 else "#64748b"
+                ec_c   = "#22c55e" if ema_c >= 8 else "#38bdf8" if ema_c >= 4 else "#64748b"
+                sp_c   = "#a78bfa" if sqz_p >= 8 else "#38bdf8" if sqz_p >= 4 else "#64748b"
+                sm_c   = "#22c55e" if sec_m >= 6 else "#64748b"
+
+                cells_html = (
+                    _phase_intel_cell("EM Score",  f"{em_s:.0f}",           em_c, dim=em_s < 30)
+                    + _phase_intel_cell("RS Accel",  f"+{rs_ac:.0f}",       rs_c, dim=rs_ac < 3)
+                    + _phase_intel_cell("RVOL Accel", f"{rv_ac:.0f}",       rv_c, dim=rv_ac < 3)
+                    + _phase_intel_cell("EMA Conv",  f"{ema_c:.0f}",        ec_c, dim=ema_c < 3)
+                    + _phase_intel_cell("Sqz Press", f"{sqz_p:.0f}",        sp_c, dim=sqz_p < 3)
+                    + _phase_intel_cell("Sec Mom",   f"{sec_m:.0f}",        sm_c, dim=sec_m < 3)
+                )
+
+            elif group == "BREAKOUT_READY":
+                # ── Breakout Ready: proximity + volume + confirmation quality ──
+                ltp    = r.get("LTP", 0)
+                entry  = r.get("Entry") or ltp
+                conf   = r.get("Confidence", 0)
+                mtf_s  = r.get("MTFScore", 50)
+                atr    = r.get("ATR", 0)
+                rvol   = r.get("RVOL", 1.0)
+                htf_up = r.get("HTFUp", True)
+                sl     = r.get("SL") or 0
+                t1     = r.get("T1") or 0
+                rr     = ((t1 - entry) / (entry - sl)) if (entry and sl and t1 and (entry - sl) > 0) else 0
+                prox   = abs(entry - ltp) / ltp * 100 if ltp else 0
+
+                prx_c  = "#22c55e" if prox < 1.5 else "#f59e0b" if prox < 3 else "#64748b"
+                vol_c  = "#22c55e" if rvol >= 1.5 else "#38bdf8" if rvol >= 1.1 else "#64748b"
+                conf_c = "#22c55e" if conf >= 70 else "#f59e0b" if conf >= 50 else "#64748b"
+                mtf_c  = "#22c55e" if mtf_s >= 65 else "#f59e0b" if mtf_s >= 50 else "#ef4444"
+                rr_c   = "#22c55e" if rr >= 2 else "#f59e0b" if rr >= 1.5 else "#64748b"
+                htf_c  = "#22c55e" if htf_up else "#ef4444"
+
+                cells_html = (
+                    _phase_intel_cell("Prox Entry", f"{prox:.1f}% away",    prx_c,  dim=prox > 5)
+                    + _phase_intel_cell("Vol Conf",   f"RVOL {rvol:.1f}x",  vol_c,  dim=rvol < 1.0)
+                    + _phase_intel_cell("Confidence", f"{conf}%",            conf_c, dim=conf < 40)
+                    + _phase_intel_cell("HTF Align",  "Aligned" if htf_up else "Against", htf_c, dim=not htf_up)
+                    + _phase_intel_cell("MTF Score",  f"{mtf_s:.0f}",        mtf_c,  dim=mtf_s < 50)
+                    + _phase_intel_cell("R:R Ratio",  f"{rr:.1f}×" if rr else "—", rr_c, dim=rr < 1)
+                )
+
+            elif group == "STRONG_BUY":
+                # ── Strong Buy: trend quality + breadth + momentum ─────────────
+                score  = r.get("Score", 0)
+                conf   = r.get("Confidence", 0)
+                adx    = r.get("ADX", 0)
+                rs_rk  = r.get("RS_Rank", 50)
+                rvol   = r.get("RVOL", 1.0)
+                gated  = r.get("BreadthGated", False)
+                rsi    = r.get("RSI", 50)
+                mtf_s  = r.get("MTFScore", 50)
+
+                sc_c   = "#f59e0b" if score >= 80 else "#22c55e" if score >= 65 else "#38bdf8"
+                cf_c   = "#22c55e" if conf >= 75 else "#f59e0b" if conf >= 55 else "#64748b"
+                adx_c  = "#22c55e" if adx >= 30 else "#f59e0b" if adx >= 20 else "#64748b"
+                rs_c   = "#22c55e" if rs_rk >= 70 else "#f59e0b" if rs_rk >= 50 else "#64748b"
+                rv_c   = "#22c55e" if rvol >= 1.5 else "#38bdf8" if rvol >= 1.1 else "#64748b"
+                br_c   = "#22c55e" if not gated else "#ef4444"
+
+                cells_html = (
+                    _phase_intel_cell("Score",      f"{score:.0f}",          sc_c, dim=score < 50)
+                    + _phase_intel_cell("Confidence", f"{conf}%",            cf_c, dim=conf < 40)
+                    + _phase_intel_cell("ADX Trend",  f"{adx:.0f}",          adx_c, dim=adx < 18)
+                    + _phase_intel_cell("RS Rank",    f"{rs_rk}",            rs_c, dim=rs_rk < 40)
+                    + _phase_intel_cell("Vol Expan",  f"RVOL {rvol:.1f}x",   rv_c, dim=rvol < 1.0)
+                    + _phase_intel_cell("Breadth",    "Strong" if not gated else "Weak", br_c, dim=gated)
+                )
+
+            elif group == "EXTENDED_RISKY":
+                # ── Extended/Risky: exhaustion signals + caution metrics ───────
+                ext_n   = r.get("ExtN", 0)
+                ext_lb  = r.get("ExtLabels", [])
+                rsi     = r.get("RSI", 50)
+                atr     = r.get("ATR", 0)
+                rvol    = r.get("RVOL", 1.0)
+                ltp     = r.get("LTP", 0)
+                ema200  = r.get("EMA200", ltp)
+                dist_em = abs(ltp - ema200) / ema200 * 100 if ema200 else 0
+
+                ex_c    = "#ef4444" if ext_n >= 3 else "#f59e0b" if ext_n >= 2 else "#64748b"
+                rsi_c   = "#ef4444" if rsi >= 75 else "#f59e0b" if rsi >= 68 else "#64748b"
+                rv_c    = "#ef4444" if rvol >= 2.5 else "#f59e0b" if rvol >= 1.8 else "#64748b"
+                dist_c  = "#ef4444" if dist_em > 20 else "#f59e0b" if dist_em > 12 else "#64748b"
+
+                ext_tag = " · ".join(ext_lb[:2]) if ext_lb else "—"
+                cells_html = (
+                    _phase_intel_cell("Ext Count",  f"{ext_n} flags",         ex_c,   dim=ext_n < 1)
+                    + _phase_intel_cell("Ext Type",   ext_tag[:14],            ex_c,   dim=ext_n < 1)
+                    + _phase_intel_cell("RSI Stretch", f"{rsi:.0f}",           rsi_c,  dim=rsi < 65)
+                    + _phase_intel_cell("Vol Climax",  f"RVOL {rvol:.1f}x",    rv_c,   dim=rvol < 1.5)
+                    + _phase_intel_cell("Dist EMA",    f"{dist_em:.1f}% ext",  dist_c, dim=dist_em < 8)
+                    + _phase_intel_cell("ATR Expan",   f"{atr:.2f}" if atr else "—", "#f59e0b", dim=not atr)
+                )
+
+            elif group == "SHORT_SELL":
+                # ── Short Sell: bearish pressure + weakness confirmation ───────
+                ss_s   = r.get("ShortScore", 0)
+                ss_v   = r.get("ShortVerdict", SHORT_SKIP)
+                rsi    = r.get("RSI", 50)
+                adx    = r.get("ADX", 0)
+                rvol   = r.get("RVOL", 1.0)
+                mtf_s  = r.get("MTFScore", 50)
+                rs_rk  = r.get("RS_Rank", 50)
+                sm_v   = r.get("SmartMoneyVerdict", "NEUTRAL")
+
+                ss_c   = "#cc2244" if ss_s >= 65 else "#f59e0b" if ss_s >= 45 else "#64748b"
+                rsi_c  = "#22c55e" if rsi <= 40 else "#f59e0b" if rsi <= 50 else "#ef4444"
+                rs_c   = "#cc2244" if rs_rk < 30 else "#f59e0b" if rs_rk < 50 else "#64748b"
+                sm_c   = "#cc2244" if sm_v == "DISTRIBUTING" else "#64748b"
+                mtf_c  = "#cc2244" if mtf_s <= 38 else "#f59e0b" if mtf_s <= 48 else "#64748b"
+
+                cells_html = (
+                    _phase_intel_cell("Short Score", f"{ss_s:.0f}",           ss_c, dim=ss_s < 25)
+                    + _phase_intel_cell("Short Sig",   ss_v[:8],              ss_c, dim=ss_s < 25)
+                    + _phase_intel_cell("RSI Weak",    f"{rsi:.0f}",          rsi_c, dim=rsi > 55)
+                    + _phase_intel_cell("RS Rank",     f"{rs_rk}",            rs_c, dim=rs_rk >= 50)
+                    + _phase_intel_cell("MTF Bear",    f"{mtf_s:.0f}",        mtf_c, dim=mtf_s > 50)
+                    + _phase_intel_cell("SM Dist",     sm_v[:8],              sm_c, dim=sm_v != "DISTRIBUTING")
+                )
+
+            return (
+                f'<div style="padding:6px 10px 7px;border-top:1px solid #1e2a3a;">'
+                f'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px;">'
+                f'<div style="color:{grp_color};font-size:7.5px;font-weight:700;'
+                f'letter-spacing:.1em;text-transform:uppercase;">{grp_label}</div>'
+                f'<div style="width:36px;height:2px;border-radius:1px;background:{grp_color}44;">'
+                f'<div style="height:2px;border-radius:1px;background:{grp_color};width:100%;"></div></div>'
+                f'</div>'
+                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;">'
+                + cells_html
+                + f'</div></div>'
+            )
+
         def make_card(i, r, border_color, show_entry=True):
             sym   = r["Symbol"]; act = r["Action"]; ltp = r["LTP"]; chg = r["%Change"]
             score = r["Score"];  phase = r.get("Phase", PHASE_IDLE); conf = r.get("Confidence", 0)
@@ -5174,68 +5406,10 @@ with tab_scanner:
                 ext_html = (f'<div style="padding:4px 12px;background:{eb};border-top:1px solid #1e293b;">'
                             f'<span style="color:{ec};font-size:9px;">{pills}{skip_warn}</span></div>')
 
-            # ── Intelligence grid (same 3×2 as emerging cards) ────────────────
-            sm_verdict = r.get("SmartMoneyVerdict","NEUTRAL")
-            sm_c_map   = {"MARKUP_READY":"#f59e0b","ACCUMULATING":"#22c55e",
-                          "ABSORBING":"#38bdf8","NEUTRAL":"#64748b","DISTRIBUTING":"#ef4444"}
-            sm_c     = sm_c_map.get(sm_verdict,"#64748b")
-            sm_short = {"MARKUP_READY":"MKUP▲","ACCUMULATING":"ACCUM","ABSORBING":"ABSO",
-                        "NEUTRAL":"NEUT","DISTRIBUTING":"DIST▼"}.get(sm_verdict, sm_verdict[:5])
-
-            accum_stage = r.get("AccumStage","NONE")
-            as_c_map = {"NONE":"#374151","1A":"#64748b","1B":"#38bdf8","1C":"#a78bfa","2A":"#22c55e","2B":"#f59e0b"}
-            as_c    = as_c_map.get(accum_stage,"#374151")
-            as_disp = "—" if accum_stage == "NONE" else f"Stage {accum_stage}"
-
-            rl_label = r.get("RSLeaderLabel","NEUTRAL")
-            rl_c_map = {"LEADER":"#f59e0b","IMPROVING":"#22c55e","NEUTRAL":"#64748b","LAGGARD":"#ef4444"}
-            rl_c     = rl_c_map.get(rl_label,"#64748b")
-            rl_short = {"LEADER":"LEADER","IMPROVING":"IMPRV↑","NEUTRAL":"NEUT","LAGGARD":"LAGGARD"}.get(rl_label, rl_label)
-
-            micro_lbl = r.get("MicroLabel","NEUTRAL_FLOW")
-            mf_c_map  = {"STRONG_BUY_FLOW":"#22c55e","BUY_FLOW":"#86efac",
-                         "NEUTRAL_FLOW":"#64748b","SELL_FLOW":"#fca5a5","STRONG_SELL_FLOW":"#ef4444"}
-            mf_c     = mf_c_map.get(micro_lbl,"#64748b")
-            mf_short = {"STRONG_BUY_FLOW":"↑↑ BUY","BUY_FLOW":"↑ BUY",
-                        "NEUTRAL_FLOW":"~ NEUT","SELL_FLOW":"↓ SELL",
-                        "STRONG_SELL_FLOW":"↓↓ SELL"}.get(micro_lbl,"~")
-
-            mtf_lbl   = r.get("MTFLabel","NEUTRAL")
-            mtf_c_map = {"BULL SYNC":"#22c55e","BULL LEAN":"#86efac","BEAR SYNC":"#ef4444",
-                         "BEAR LEAN":"#fca5a5","DIVERGE":"#f59e0b"}
-            mtf_c     = mtf_c_map.get(mtf_lbl,"#475569")
-            mtf_short = {"BULL SYNC":"BULL⚡","BULL LEAN":"BULL~","BEAR SYNC":"BEAR⚡",
-                         "BEAR LEAN":"BEAR~","DIVERGE":"DIVG"}.get(mtf_lbl,"NEUT")
-
-            inst_lbl   = r.get("InstLabel","INST~")
-            inst_c_map = {"INST↑":"#22c55e","INST↓":"#ef4444","INST~":"#475569"}
-            inst_c     = inst_c_map.get(inst_lbl,"#475569")
-            inst_short = {"INST↑":"↑ BUY","INST↓":"↓ SELL","INST~":"~ NEUT"}.get(inst_lbl,"~")
-
-            def _icell(label, value, color, dim=False):
-                bg  = f"{color}18" if not dim else "#37415118"
-                brd = f"{color}40" if not dim else "#37415130"
-                vc  = f"{color}cc" if not dim else "#47556955"
-                return (
-                    f'<div style="background:{bg};border:1px solid {brd};border-radius:6px;padding:4px 6px;min-width:0;">'
-                    f'<div style="color:#475569;font-size:7.5px;letter-spacing:.05em;text-transform:uppercase;margin-bottom:2px;">{label}</div>'
-                    f'<div style="color:{vc};font-family:JetBrains Mono,monospace;font-size:10px;font-weight:700;'
-                    f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{value}</div>'
-                    f'</div>'
-                )
-
-            intel_grid = (
-                f'<div style="padding:5px 8px 6px;border-top:1px solid #1e2a3a;">'
-                f'<div style="color:#334155;font-size:7px;letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px;">Intelligence</div>'
-                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:3px;">'
-                + _icell("Smart $", sm_short,  sm_c,   dim=(sm_verdict=="NEUTRAL"))
-                + _icell("Stage",   as_disp,   as_c,   dim=(accum_stage=="NONE"))
-                + _icell("RS Lead", rl_short,  rl_c,   dim=(rl_label=="NEUTRAL"))
-                + _icell("Flow",    mf_short,  mf_c,   dim=(micro_lbl=="NEUTRAL_FLOW"))
-                + _icell("MTF",     mtf_short, mtf_c,  dim=(mtf_lbl not in mtf_c_map))
-                + _icell("Inst",    inst_short, inst_c, dim=(inst_lbl=="INST~"))
-                + f'</div></div>'
-            )
+            # ── Phase-aware intelligence grid (v15.7+ upgrade) ───────────────
+            # Shows ONLY the indicators relevant to the next decision for this stock's lifecycle stage.
+            ui_group  = _resolve_ui_group(r)
+            intel_grid = _build_phase_intel(r, ui_group)
 
             # ── R:R visual bar ────────────────────────────────────────────────
             rr_bar_pct = min(int((rr / 4) * 100), 100) if rr else 0
@@ -5395,80 +5569,14 @@ with tab_scanner:
                          'padding:1px 5px;border-radius:3px;font-size:9px;margin-right:3px;">VC</span>'
                          if r.get("VolRatio", 1.0) < 0.75 else "")
 
-            # ── Resolve all 6 intelligence signal values + colors ─────────────
-            # Smart Money
-            sm_verdict = r.get("SmartMoneyVerdict","NEUTRAL")
-            sm_c_map   = {"MARKUP_READY":"#f59e0b","ACCUMULATING":"#22c55e",
-                          "ABSORBING":"#38bdf8","NEUTRAL":"#64748b","DISTRIBUTING":"#ef4444"}
-            sm_c       = sm_c_map.get(sm_verdict,"#64748b")
-            sm_short   = {"MARKUP_READY":"MKUP▲","ACCUMULATING":"ACCUM","ABSORBING":"ABSO",
-                          "NEUTRAL":"NEUT","DISTRIBUTING":"DIST▼"}.get(sm_verdict, sm_verdict[:5])
-
-            # Accumulation Stage
-            accum_stage = r.get("AccumStage","NONE")
-            as_c_map    = {"NONE":"#374151","1A":"#64748b","1B":"#38bdf8",
-                           "1C":"#a78bfa","2A":"#22c55e","2B":"#f59e0b"}
-            as_c        = as_c_map.get(accum_stage,"#374151")
-            as_disp     = "—" if accum_stage == "NONE" else f"Stage {accum_stage}"
-
-            # RS Leadership
-            rl_label = r.get("RSLeaderLabel","NEUTRAL")
-            rl_c_map = {"LEADER":"#f59e0b","IMPROVING":"#22c55e","NEUTRAL":"#64748b","LAGGARD":"#ef4444"}
-            rl_c     = rl_c_map.get(rl_label,"#64748b")
-            rl_short = {"LEADER":"LEADER","IMPROVING":"IMPRV↑","NEUTRAL":"NEUT","LAGGARD":"LAGGARD"}.get(rl_label,rl_label)
-
-            # Microstructure Flow
-            micro_lbl = r.get("MicroLabel","NEUTRAL_FLOW")
-            mf_c_map  = {"STRONG_BUY_FLOW":"#22c55e","BUY_FLOW":"#86efac",
-                         "NEUTRAL_FLOW":"#64748b","SELL_FLOW":"#fca5a5","STRONG_SELL_FLOW":"#ef4444"}
-            mf_c      = mf_c_map.get(micro_lbl,"#64748b")
-            mf_short  = {"STRONG_BUY_FLOW":"↑↑ BUY","BUY_FLOW":"↑ BUY",
-                         "NEUTRAL_FLOW":"~ NEUT","SELL_FLOW":"↓ SELL",
-                         "STRONG_SELL_FLOW":"↓↓ SELL"}.get(micro_lbl,"~")
-
-            # MTF Alignment
-            mtf_lbl   = r.get("MTFLabel","NEUTRAL")
-            mtf_c_map = {"BULL SYNC":"#22c55e","BULL LEAN":"#86efac","BEAR SYNC":"#ef4444",
-                         "BEAR LEAN":"#fca5a5","DIVERGE":"#f59e0b"}
-            mtf_c     = mtf_c_map.get(mtf_lbl,"#475569")
-            mtf_short = {"BULL SYNC":"BULL⚡","BULL LEAN":"BULL~","BEAR SYNC":"BEAR⚡",
-                         "BEAR LEAN":"BEAR~","DIVERGE":"DIVG"}.get(mtf_lbl,"NEUT")
-
-            # Institutional Activity
-            inst_lbl   = r.get("InstLabel","INST~")
-            inst_c_map = {"INST↑":"#22c55e","INST↓":"#ef4444","INST~":"#475569"}
-            inst_c     = inst_c_map.get(inst_lbl,"#475569")
-            inst_short = {"INST↑":"↑ BUY","INST↓":"↓ SELL","INST~":"~ NEUT"}.get(inst_lbl,"~")
-
-            # ── Unified 3×2 intelligence grid ─────────────────────────────────
-            def _intel_cell(label, value, color, dim=False):
-                val_opacity = "55" if dim else "cc"
-                bg = f"{color}18" if not dim else "#37415118"
-                brd = f"{color}40" if not dim else "#37415130"
-                return (
-                    f'<div style="background:{bg};border:1px solid {brd};border-radius:6px;'
-                    f'padding:4px 6px;min-width:0;">'
-                    f'<div style="color:#475569;font-size:7.5px;letter-spacing:.05em;'
-                    f'text-transform:uppercase;margin-bottom:2px;">{label}</div>'
-                    f'<div style="color:{color}{val_opacity};font-family:JetBrains Mono,monospace;'
-                    f'font-size:10px;font-weight:700;white-space:nowrap;overflow:hidden;'
-                    f'text-overflow:ellipsis;">{value}</div>'
-                    f'</div>'
-                )
-
-            intel_grid = (
-                f'<div style="padding:6px 10px 7px;border-top:1px solid #1e1e40;">'
-                f'<div style="color:#334155;font-size:7.5px;letter-spacing:.08em;'
-                f'text-transform:uppercase;margin-bottom:5px;">Intelligence</div>'
-                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;">'
-                + _intel_cell("Smart $", sm_short, sm_c, dim=(sm_verdict=="NEUTRAL"))
-                + _intel_cell("Stage",   as_disp,  as_c, dim=(accum_stage=="NONE"))
-                + _intel_cell("RS Lead", rl_short,  rl_c, dim=(rl_label=="NEUTRAL"))
-                + _intel_cell("Flow",    mf_short,  mf_c, dim=(micro_lbl=="NEUTRAL_FLOW"))
-                + _intel_cell("MTF",     mtf_short, mtf_c, dim=(mtf_lbl not in mtf_c_map))
-                + _intel_cell("Inst",    inst_short, inst_c, dim=(inst_lbl=="INST~"))
-                + f'</div></div>'
-            )
+            # ── Phase-aware intelligence grid (v15.7+ upgrade) ───────────────
+            # Emerging cards always use EMERGING_MOMENTUM group unless the stock
+            # has already moved into a more advanced lifecycle stage.
+            em_ui_group = _resolve_ui_group(r)
+            # Override to EMERGING_MOMENTUM if the stock is pre-breakout coiling
+            if em_ui_group not in ("EXTENDED_RISKY", "SHORT_SELL", "STRONG_BUY", "BREAKOUT_READY"):
+                em_ui_group = "EMERGING_MOMENTUM"
+            intel_grid = _build_phase_intel(r, em_ui_group)
 
             # ── Compact 4-cell metrics grid (RSI · RS Rank · ATR · ADX) ───────
             rsi_val = r.get("RSI","—"); rs_rank = r.get("RS_Rank", 50)
@@ -5544,110 +5652,165 @@ with tab_scanner:
                 f'</div>'
             )
 
-        # ── Render section based on Selection Mode ─────────────────────────────
-        if selection_type == "🌱 Emerging":
-            # ── EMERGING: stocks coiling BEFORE becoming obvious ───────────────
-            em_candidates = [
-                r for r in st.session_state.results
-                if (r.get("EmScore", 0) >= em_min_score
-                    or r.get("Action") == "PRE-CONFIRM")   # v15.7: always include PRE-CONFIRM
-                and r.get("Phase") in (PHASE_SETUP, PHASE_IDLE, PHASE_ENTRY)
+        # ══════════════════════════════════════════════════════════════════════
+        # 6-LAYER LIFECYCLE UI  (from design inputs)
+        # Order: Accumulating → Emerging Momentum → Breakout Ready →
+        #        Strong Buy → Extended/Risky → Short Sell
+        # Each layer shows ONLY the indicators relevant to the next decision.
+        # ══════════════════════════════════════════════════════════════════════
+
+        # ── Bucket all results by lifecycle group ──────────────────────────────
+        _all_res = st.session_state.results
+        _buckets = {g: [] for g in ("ACCUMULATING","EMERGING_MOMENTUM",
+                                    "BREAKOUT_READY","STRONG_BUY","EXTENDED_RISKY")}
+        for _r in _all_res:
+            _g = _resolve_ui_group(_r)
+            if _g in _buckets:
+                _buckets[_g].append(_r)
+
+        # Sort each bucket by score descending
+        for _g in _buckets:
+            _buckets[_g].sort(key=lambda x: x.get("Score",0), reverse=True)
+
+        # ── Summary bar: one metric per layer ─────────────────────────────────
+        if _all_res:
+            short_candidates_summary = derive_short_candidates(_all_res, scan_mode_now, vix_val)
+            _sh_cnt = len([s for s in short_candidates_summary
+                           if s.verdict in (SHORT_CONFIRMED, SHORT_SIGNAL)])
+            _lyr_cols = st.columns(6)
+            _lyr_defs = [
+                ("ACCUMULATING",    "🛡 Accumulating",     "#38bdf8"),
+                ("EMERGING_MOMENTUM","🌱 Emerging Mom",     "#a78bfa"),
+                ("BREAKOUT_READY",  "⚡ Breakout Ready",   "#f59e0b"),
+                ("STRONG_BUY",      "🚀 Strong Buy",       "#22c55e"),
+                ("EXTENDED_RISKY",  "⚠ Extended",          "#ef4444"),
+                ("SHORT_SELL",      "🔻 Short Sell",        "#cc2244"),
             ]
-            # Sort: PRE-CONFIRM first, then by combined readiness
-            def _em_sort_key(x):
-                pc_boost = 20 if x.get("Action") == "PRE-CONFIRM" else 0
-                return x.get("EmScore", 0) * 0.55 + x.get("PCAScore", 0) * 0.45 + pc_boost
-            em_candidates.sort(key=_em_sort_key, reverse=True)
-            top_em = em_candidates[:20]
+            for col, (grp, lbl, clr) in zip(_lyr_cols, _lyr_defs):
+                cnt = len(_buckets.get(grp, [])) if grp != "SHORT_SELL" else _sh_cnt
+                col.markdown(
+                    f'<div style="background:{clr}11;border:1px solid {clr}33;border-radius:8px;'
+                    f'padding:8px 10px;text-align:center;">'
+                    f'<div style="color:{clr};font-size:10px;font-weight:700;'
+                    f'letter-spacing:.04em;">{lbl}</div>'
+                    f'<div style="color:{clr};font-family:JetBrains Mono,monospace;'
+                    f'font-size:22px;font-weight:700;line-height:1.2;">{cnt}</div>'
+                    f'</div>', unsafe_allow_html=True
+                )
+            st.markdown('<div style="margin-bottom:14px;"></div>', unsafe_allow_html=True)
 
-            # Label distribution
-            _em_dist = {"IGNITING":0,"BUILDING":0,"COILING":0,"LATENT":0}
-            for r in em_candidates:
-                lbl = r.get("EmLabel","QUIET")
-                if lbl in _em_dist: _em_dist[lbl] += 1
-
-            if top_em:
-                _em_header_cols = st.columns(7)
-                _em_header_cols[0].metric("🌱 Emerging Total", len(em_candidates))
-                for idx,(lbl,col) in enumerate([("IGNITING","#f59e0b"),("BUILDING","#22c55e"),
-                                                ("COILING","#8b5cf6"),("LATENT","#38bdf8")]):
-                    _em_header_cols[idx+1].metric(lbl, _em_dist.get(lbl,0))
-                _pca_accum = sum(1 for r in em_candidates if r.get("PCALabel") == "ACCUMULATING")
-                _pre_confirm_cnt = sum(1 for r in em_candidates if r.get("Action") == "PRE-CONFIRM")
-                _em_header_cols[5].metric("🛡 Accumulating", _pca_accum)
-                _em_header_cols[6].metric("🔮 PRE-CONFIRM", _pre_confirm_cnt)
-
-                with st.expander(
-                    f"🌱 EMERGING + 🛡 PRE-CONFIRM — {len(top_em)} stocks building before breakout",
-                    expanded=True,
-                ):
-                    st.markdown(
-                        '<div style="color:#94a3b8;font-size:11px;font-family:JetBrains Mono,monospace;'
-                        'margin-bottom:10px;">Each card shows two layers: <b>EmScore</b> (coil mechanics — '
-                        'RS accel, ATR compress, squeeze) and <b>PCAScore</b> (buying pressure — '
-                        'CMF trend, hidden accumulation, failed-breakdown absorption, volume asymmetry). '
-                        'Combined Readiness = Em×0.55 + PCA×0.45. '
-                        'Wait for phase upgrade to ENTRY/CONT/BREAKOUT before acting.</div>',
-                        unsafe_allow_html=True,
-                    )
-                    em_cards_html = '<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
-                    for i, r in enumerate(top_em):
-                        em_cards_html += make_emerging_card(i, r)
-                    em_cards_html += "</div>"
-                    st.markdown(em_cards_html, unsafe_allow_html=True)
-                    st.markdown(
-                        '<div style="text-align:center;color:#3a3a60;font-size:10px;'
-                        'font-family:JetBrains Mono,monospace;padding:6px 0 2px;">'
-                        'ⓘ Emerging score identifies setups in formation — NOT entry signals. '
-                        'Wait for phase upgrade to ENTRY/CONT/BREAKOUT before acting.</div>',
-                        unsafe_allow_html=True,
-                    )
+        # ── LAYER 1: ACCUMULATING ─────────────────────────────────────────────
+        _layer1 = _buckets["ACCUMULATING"][:20]
+        with st.expander(
+            f"🛡 ACCUMULATING — {len(_layer1)} stocks building a base · "
+            f"PCA Score · Vol Compression · CMF/OBV · Base Duration",
+            expanded=bool(_layer1)
+        ):
+            if _layer1:
+                _html = '<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
+                for i, r in enumerate(_layer1):
+                    _html += make_emerging_card(i, r)
+                _html += "</div>"
+                st.markdown(_html, unsafe_allow_html=True)
+                st.markdown(
+                    '<div style="color:#3a3a60;font-size:10px;font-family:JetBrains Mono,monospace;'
+                    'padding:5px 0 2px;text-align:center;">ⓘ Base building — watch for volume dry-up '
+                    'and RS improvement before upgrading to Emerging.</div>',
+                    unsafe_allow_html=True)
             else:
-                st.info(f"No emerging stocks found with score ≥ {em_min_score}. "
-                        "Try lowering the minimum score or run a scan first.")
+                st.caption("No stocks in accumulation phase.")
 
-        else:
-            # ── CONFIRMATION: stocks already in actionable phases ──────────────
-            if top_act:
-                with st.expander(
-                    f"READY TO TRADE — {len(top_act)} stocks in ENTRY / CONT / BREAKOUT",
-                    expanded=True
-                ):
-                    cards_html='<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
-                    for i,r in enumerate(top_act):
-                        cards_html+=make_card(i,r,"#22c55e55",show_entry=True)
-                    cards_html+="</div>"
-                    st.markdown(cards_html,unsafe_allow_html=True)
-                    st.markdown(
-                        '<div style="text-align:center;color:#3a3a60;font-size:10px;'
-                        'font-family:JetBrains Mono,monospace;padding:4px 0 2px;">'
-                        'ⓘ Data is indicator based. Confirm with price action.</div>',
-                        unsafe_allow_html=True,
-                    )
+        # ── LAYER 2: EMERGING MOMENTUM ────────────────────────────────────────
+        _layer2 = _buckets["EMERGING_MOMENTUM"][:20]
+        _pre_cnt = sum(1 for r in _layer2 if r.get("Action") == "PRE-CONFIRM")
+        with st.expander(
+            f"🌱 EMERGING MOMENTUM — {len(_layer2)} stocks coiling · "
+            f"{_pre_cnt} PRE-CONFIRM · EM Score · RS Accel · Squeeze",
+            expanded=bool(_layer2)
+        ):
+            if _layer2:
+                _html = '<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
+                for i, r in enumerate(_layer2):
+                    _html += make_emerging_card(i, r)
+                _html += "</div>"
+                st.markdown(_html, unsafe_allow_html=True)
+                st.markdown(
+                    '<div style="color:#3a3a60;font-size:10px;font-family:JetBrains Mono,monospace;'
+                    'padding:5px 0 2px;text-align:center;">ⓘ Momentum building — NOT an entry signal. '
+                    'Wait for phase upgrade to ENTRY / BREAKOUT before acting.</div>',
+                    unsafe_allow_html=True)
             else:
-                st.info("No stocks in ENTRY / CONT / BREAKOUT phase.")
+                st.caption("No stocks with emerging momentum.")
 
-            # FIX-5: include WATCH action; lower threshold so SETUP stocks (45-57) appear
-            watchlist=[r for r in st.session_state.results
-                       if r.get("Phase") in (PHASE_SETUP,PHASE_IDLE)
-                       and r["Score"]>=45
-                       and r["Action"] in ("BUY","STRONG BUY","WATCH")][:10]
-            if watchlist:
-                with st.expander(f"WATCHLIST — {len(watchlist)} high-score, not yet ready",expanded=False):
-                    cards_html='<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
-                    for i,r in enumerate(watchlist):
-                        cards_html+=make_card(i,r,"#f59e0b55",show_entry=False)
-                    cards_html+="</div>"
-                    st.markdown(cards_html,unsafe_allow_html=True)
+        # ── LAYER 3: BREAKOUT READY ───────────────────────────────────────────
+        _layer3 = _buckets["BREAKOUT_READY"][:15]
+        with st.expander(
+            f"⚡ BREAKOUT READY — {len(_layer3)} stocks near trigger · "
+            f"Entry Proximity · Vol Confirm · HTF Align · R:R",
+            expanded=bool(_layer3)
+        ):
+            if _layer3:
+                _html = '<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
+                for i, r in enumerate(_layer3):
+                    _html += make_card(i, r, "#f59e0b55", show_entry=True)
+                _html += "</div>"
+                st.markdown(_html, unsafe_allow_html=True)
+                st.markdown(
+                    '<div style="color:#3a3a60;font-size:10px;font-family:JetBrains Mono,monospace;'
+                    'padding:5px 0 2px;text-align:center;">ⓘ Near entry — confirm with volume and price action.</div>',
+                    unsafe_allow_html=True)
+            else:
+                st.caption("No stocks at breakout threshold.")
 
-        # ── Short list (derived from scan, shown in both modes) ────────────────
-        short_candidates=derive_short_candidates(st.session_state.results,scan_mode_now,vix_val)
+        # ── LAYER 4: STRONG BUY ───────────────────────────────────────────────
+        _layer4 = _buckets["STRONG_BUY"][:15]
+        with st.expander(
+            f"🚀 STRONG BUY — {len(_layer4)} confirmed leaders · "
+            f"Score · ADX Trend · RS Rank · Breadth",
+            expanded=bool(_layer4)
+        ):
+            if _layer4:
+                _html = '<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
+                for i, r in enumerate(_layer4):
+                    _html += make_card(i, r, "#22c55e55", show_entry=True)
+                _html += "</div>"
+                st.markdown(_html, unsafe_allow_html=True)
+                st.markdown(
+                    '<div style="color:#3a3a60;font-size:10px;font-family:JetBrains Mono,monospace;'
+                    'padding:5px 0 2px;text-align:center;">ⓘ Price confirmed — use discipline on position sizing.</div>',
+                    unsafe_allow_html=True)
+            else:
+                st.caption("No strong buy candidates.")
+
+        # ── LAYER 5: EXTENDED / RISKY ─────────────────────────────────────────
+        _layer5 = _buckets["EXTENDED_RISKY"][:12]
+        with st.expander(
+            f"⚠ EXTENDED / RISKY — {len(_layer5)} overextended · "
+            f"Ext Flags · RSI Stretch · Dist from EMA · Climax Volume",
+            expanded=False
+        ):
+            if _layer5:
+                _html = '<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
+                for i, r in enumerate(_layer5):
+                    _html += make_card(i, r, "#ef444455", show_entry=False)
+                _html += "</div>"
+                st.markdown(_html, unsafe_allow_html=True)
+                st.markdown(
+                    '<div style="color:#3a3a60;font-size:10px;font-family:JetBrains Mono,monospace;'
+                    'padding:5px 0 2px;text-align:center;">⚠ Avoid new entries — wait for base to form.</div>',
+                    unsafe_allow_html=True)
+            else:
+                st.caption("No extended stocks found.")
+
+        # ── LAYER 6: SHORT SELL ───────────────────────────────────────────────
+        short_candidates=derive_short_candidates(_all_res, scan_mode_now, vix_val)
         if short_candidates:
             sh_now=sum(1 for s in short_candidates if s.verdict==SHORT_CONFIRMED)
             sh_sig=sum(1 for s in short_candidates if s.verdict==SHORT_SIGNAL)
             sh_watch=sum(1 for s in short_candidates if s.verdict==SHORT_WATCH)
             top_shorts=[s for s in short_candidates if s.verdict in (SHORT_CONFIRMED,SHORT_SIGNAL)][:12]
-            with st.expander(f"🔻 SHORT LIST — {sh_now} SHORT NOW · {sh_sig} SIGNAL · {sh_watch} WATCH",
+            with st.expander(f"🔻 SHORT SELL — {sh_now} SHORT NOW · {sh_sig} SIGNAL · {sh_watch} WATCH · "
+                             f"Short Score · RSI Weak · RS Rank · Distribution",
                              expanded=(sh_now>0)):
                 if top_shorts:
                     sh_cards='<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;">'
